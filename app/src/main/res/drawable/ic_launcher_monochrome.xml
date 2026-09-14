@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 主题图标（Android 13+ Monochrome）：系统会用它做单色主题化渲染 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 日历外形 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M38,30 L42,30 L42,26 L46,26 L46,30 L62,30 L62,26 L66,26 L66,30 L70,30 C72.2,30 74,31.8 74,34 L74,70 C74,72.2 72.2,74 70,74 L38,74 C35.8,74 34,72.2 34,70 L34,34 C34,31.8 35.8,30 38,30 Z M38,38 L38,70 L70,70 L70,38 Z" />
+    <!-- 内部日期格 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M42,52 L54,52 L54,66 L42,66 Z M58,52 L66,52 L66,66 L58,66 Z" />
+    <!-- 顶部挂环 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M42,26 L46,26 L46,31 L42,31 Z M62,26 L66,26 L66,31 L62,31 Z" />
+</vector>

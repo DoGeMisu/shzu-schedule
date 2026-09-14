@@ -80,17 +80,14 @@ public class PermissionHelper {
         return openAppDetails(ctx);
     }
 
-    /** 申请电池优化白名单（后台常驻） */
+    /**
+     * 打开系统的电池优化设置页（后台常驻）
+     *
+     * 注意：不再申请 REQUEST_IGNORE_BATTERY_OPTIMIZATIONS 权限
+     * （该权限会被系统与安全软件标记为"常驻后台"敏感权限），
+     * 改为引导用户到系统设置里手动允许，功能等价且不触发权限告警。
+     */
     public static boolean openBatterySettings(Context ctx) {
-        try {
-            Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                Uri.parse("package:" + ctx.getPackageName()));
-            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            ctx.startActivity(i);
-            return true;
-        } catch (Exception e) {
-            Log.e(TAG, "request ignore battery optimizations failed", e);
-        }
         try {
             Intent i = new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS);
             i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
