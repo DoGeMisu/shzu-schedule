@@ -1,7 +1,9 @@
-package com.shzu.schedule;
+package com.shzu.schedule.reminder;
 
 import android.content.BroadcastReceiver;
 import android.content.Context;
+
+import com.shzu.schedule.ScheduleStore;
 import android.content.Intent;
 import android.util.Log;
 

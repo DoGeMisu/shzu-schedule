@@ -1,4 +1,4 @@
-package com.shzu.schedule;
+package com.shzu.schedule.util;
 
 import android.content.ComponentName;
 import android.content.Context;

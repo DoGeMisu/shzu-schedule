@@ -1,11 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <base-config cleartextTrafficPermitted="true">
+    <!-- 默认策略：禁止明文 HTTP，只信任系统 CA（防止外部站点被降级/中间人） -->
+    <base-config cleartextTrafficPermitted="false">
         <trust-anchors>
             <certificates src="system" />
         </trust-anchors>
     </base-config>
-    <domain-config>
+    <!-- 仅校内域名放宽：教务系统可能用自签名证书或内网明文 -->
+    <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="true">shzu.edu.cn</domain>
         <trust-anchors>
             <certificates src="system" />

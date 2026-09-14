@@ -38,10 +38,17 @@ public class ScheduleStore {
     private static final int DEFAULT_ADVANCE = 15; // 默认提前15分钟
 
     private final SharedPreferences prefs;
+    /** 内存中的完整数据对象：所有读取都走内存，避免每次重新解析 JSON */
+    private JSONObject data = null;
     private long week1Monday = 0;
     private int windowStart = 0, windowEnd = 0, totalWeeks = 0;
     private JSONArray courses = null;
-    private String[] periodTimes = null; // 节次时间表（每行2节课的时间段）
+    private String[] periodTimes = null;      // 节次时间表（每行2节课的时间段）
+    private JSONObject overrides = null;      // 拖动位置覆盖表
+    private java.util.Set<String> reminderKeys = new java.util.HashSet<>();
+    private int advanceMinutes = DEFAULT_ADVANCE;
+    private String theme = "light";
+    private String bgImage = "";
 
     public ScheduleStore(Context ctx) {
         prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
@@ -51,25 +58,49 @@ public class ScheduleStore {
     // ====== 读取 ======
 
     private void load() {
+        // 一次解析，全部字段留在内存（后续读取不再碰磁盘/JSON）
         try {
             String json = prefs.getString(KEY_DATA, null);
-            if (json == null) return;
-            JSONObject obj = new JSONObject(json);
-            // 版本校验：旧版/测试数据自动清除
-            if (obj.optInt("version", 1) < DATA_VERSION) {
-                prefs.edit().remove(KEY_DATA).apply();
-                return;
+            if (json != null) {
+                JSONObject obj = new JSONObject(json);
+                if (obj.optInt("version", 1) >= DATA_VERSION) {
+                    data = obj;
+                    week1Monday = obj.optLong("week1Monday", 0);
+                    windowStart = obj.optInt("windowStart", 0);
+                    windowEnd = obj.optInt("windowEnd", 0);
+                    totalWeeks = obj.optInt("totalWeeks", 0);
+                    courses = obj.optJSONArray("courses");
+                    overrides = obj.optJSONObject("overrides");
+                    JSONArray pt = obj.optJSONArray("periodTimes");
+                    if (pt != null && pt.length() > 0) {
+                        periodTimes = new String[pt.length()];
+                        for (int i = 0; i < pt.length(); i++) periodTimes[i] = pt.optString(i, "");
+                    }
+                } else {
+                    // 版本过期：旧版/测试数据自动清除
+                    prefs.edit().remove(KEY_DATA).apply();
+                }
             }
-            week1Monday = obj.optLong("week1Monday", 0);
-            windowStart = obj.optInt("windowStart", 0);
-            windowEnd = obj.optInt("windowEnd", 0);
-            totalWeeks = obj.optInt("totalWeeks", 0);
-            courses = obj.optJSONArray("courses");
-            JSONArray pt = obj.optJSONArray("periodTimes");
-            if (pt != null && pt.length() > 0) {
-                periodTimes = new String[pt.length()];
-                for (int i = 0; i < pt.length(); i++) periodTimes[i] = pt.optString(i, "");
+        } catch (Exception ignored) {
+        }
+        // 轻量配置项一并读入内存
+        advanceMinutes = prefs.getInt(KEY_ADVANCE, DEFAULT_ADVANCE);
+        theme = prefs.getString(KEY_THEME, "light");
+        bgImage = prefs.getString(KEY_BG, "");
+        try {
+            String rj = prefs.getString(KEY_REMINDERS, null);
+            if (rj != null) {
+                JSONArray arr = new JSONArray(rj);
+                for (int i = 0; i < arr.length(); i++) reminderKeys.add(arr.optString(i, ""));
             }
+        } catch (Exception ignored) {
+        }
+    }
+
+    /** 把内存数据写回磁盘（仅在变更时调用） */
+    private void persist() {
+        try {
+            if (data != null) prefs.edit().putString(KEY_DATA, data.toString()).apply();
         } catch (Exception ignored) {
         }
     }
@@ -89,23 +120,13 @@ public class ScheduleStore {
 
     /** 节次时间表（从教务作息数据获取），如 ["10:00-11:50",...]；未存时返回null */
     public String[] getPeriodTimes() {
-        try {
-            String json = prefs.getString(KEY_DATA, null);
-            if (json == null) return null;
-            JSONObject obj = new JSONObject(json);
-            if (obj.optInt("version", 1) < DATA_VERSION) return null;
-            JSONArray arr = obj.optJSONArray("periodTimes");
-            if (arr == null || arr.length() == 0) return null;
-            String[] out = new String[arr.length()];
-            for (int i = 0; i < arr.length(); i++) out[i] = arr.optString(i, "");
-            return out;
-        } catch (Exception e) {
-            return null;
-        }
+        return periodTimes;
     }
 
     public void clear() {
         prefs.edit().remove(KEY_DATA).apply();
+        data = null;
+        overrides = null;
         week1Monday = 0;
         windowStart = 0;
         windowEnd = 0;
@@ -117,58 +138,43 @@ public class ScheduleStore {
 
     /** 获取全局提前量（分钟），默认15 */
     public int getAdvanceMinutes() {
-        return prefs.getInt(KEY_ADVANCE, DEFAULT_ADVANCE);
+        return advanceMinutes;
     }
 
     /** 设置全局提前量（分钟） */
     public void setAdvanceMinutes(int minutes) {
+        advanceMinutes = minutes;
         prefs.edit().putInt(KEY_ADVANCE, minutes).apply();
     }
 
-    /** 获取已选提醒课程的 key 集合（courseKey 字符串数组），空集返回长度0 */
+    /** 获取已选提醒课程的 key 集合（返回副本，读内存缓存） */
     public java.util.Set<String> getReminderKeys() {
-        String json = prefs.getString(KEY_REMINDERS, null);
-        java.util.Set<String> set = new java.util.HashSet<>();
-        if (json == null) return set;
-        try {
-            JSONArray arr = new JSONArray(json);
-            for (int i = 0; i < arr.length(); i++) set.add(arr.getString(i));
-        } catch (Exception ignored) {}
-        return set;
+        return new java.util.HashSet<>(reminderKeys);
     }
 
     /** 保存提醒课程 key 集合（全量覆盖） */
     public void saveReminderKeys(java.util.Set<String> keys) {
+        reminderKeys = new java.util.HashSet<>(keys);
         JSONArray arr = new JSONArray();
-        for (String k : keys) arr.put(k);
+        for (String k : reminderKeys) arr.put(k);
         prefs.edit().putString(KEY_REMINDERS, arr.toString()).apply();
     }
 
-    /** 判断某课程是否已设提醒 */
+    /** 判断某课程是否已设提醒（纯内存查表） */
     public boolean isReminder(String courseKey) {
-        return getReminderKeys().contains(courseKey);
+        return reminderKeys.contains(courseKey);
     }
 
-    /** 用户拖动产生的位置覆盖表（courseKey → {d,r}），无则返回null */
+    /** 用户拖动产生的位置覆盖表（courseKey → {d,r}），无则返回null；读内存缓存 */
     public JSONObject getOverrides() {
-        try {
-            String json = prefs.getString(KEY_DATA, null);
-            if (json == null) return null;
-            JSONObject obj = new JSONObject(json);
-            if (obj.optInt("version", 1) < DATA_VERSION) return null;
-            return obj.optJSONObject("overrides");
-        } catch (Exception e) {
-            return null;
-        }
+        return overrides;
     }
 
     /** 合并写入位置覆盖：moves = [{k,d,r}]，k为courseKey，d为1..7(周一..周日)，r为1..5(大节) */
     public void saveOverrides(JSONArray moves) {
         try {
-            String json = prefs.getString(KEY_DATA, null);
-            if (json == null) return;
-            JSONObject obj = new JSONObject(json);
-            JSONObject ov = obj.optJSONObject("overrides");
+            if (data == null) return;
+            JSONObject ov = overrides;
             if (ov == null) ov = new JSONObject();
             for (int i = 0; i < moves.length(); i++) {
                 JSONObject m = moves.optJSONObject(i);
@@ -181,40 +187,39 @@ public class ScheduleStore {
                 pos.put("r", r);
                 ov.put(k, pos);
             }
-            obj.put("overrides", ov);
-            prefs.edit().putString(KEY_DATA, obj.toString()).apply();
+            overrides = ov;
+            data.put("overrides", ov);
+            persist();
         } catch (Exception ignored) {
         }
     }
 
     /** 主题：light / dark */
     public String getTheme() {
-        return prefs.getString(KEY_THEME, "light");
+        return theme;
     }
 
     public void setTheme(String mode) {
-        prefs.edit().putString(KEY_THEME, (mode == null || mode.isEmpty()) ? "light" : mode).apply();
+        theme = (mode == null || mode.isEmpty()) ? "light" : mode;
+        prefs.edit().putString(KEY_THEME, theme).apply();
     }
 
     /** 自定义背景图文件名（空字符串=未设置） */
     public String getBgImage() {
-        return prefs.getString(KEY_BG, "");
+        return bgImage;
     }
 
     public void setBgImage(String fileName) {
-        prefs.edit().putString(KEY_BG, fileName == null ? "" : fileName).apply();
+        bgImage = (fileName == null) ? "" : fileName;
+        prefs.edit().putString(KEY_BG, bgImage).apply();
     }
 
     /** 清除所有拖动位置覆盖（恢复课程在课表中的原始位置） */
     public void clearOverrides() {
-        try {
-            String json = prefs.getString(KEY_DATA, null);
-            if (json == null) return;
-            JSONObject obj = new JSONObject(json);
-            obj.remove("overrides");
-            prefs.edit().putString(KEY_DATA, obj.toString()).apply();
-        } catch (Exception ignored) {
-        }
+        if (data == null) return;
+        data.remove("overrides");
+        overrides = null;
+        persist();
     }
 
     // ====== 保存（覆盖旧数据 = 删除上次课表） ======
@@ -229,7 +234,7 @@ public class ScheduleStore {
      * @param ending          本次更新是否由窗口末尾触发（提前更新后五周）
      */
     public void save(Context ctx, int parsedWeek, int parsedTotal, long week1MondayOverride,
-                     String[] newPeriodTimes, JSONArray newCourses, int oldStart, int oldEnd, boolean ending) {
+                     String[] newPeriodTimes, JSONArray newCourses) {
         try {
             // 刷新课表前先读出旧的位置覆盖表（用户拖动布局），保存时继续继承
             JSONObject oldOverrides = getOverrides();
@@ -272,7 +277,9 @@ public class ScheduleStore {
                 obj.put("overrides", oldOverrides);
             }
 
-            prefs.edit().putString(KEY_DATA, obj.toString()).apply();
+            data = obj;
+            overrides = obj.optJSONObject("overrides");
+            persist();
             windowStart = start; windowEnd = end; totalWeeks = total;
             courses = newCourses;
             if (newPeriodTimes != null && newPeriodTimes.length > 0) periodTimes = newPeriodTimes;
@@ -301,27 +308,6 @@ public class ScheduleStore {
         c.set(Calendar.HOUR_OF_DAY, 0); c.set(Calendar.MINUTE, 0);
         c.set(Calendar.SECOND, 0); c.set(Calendar.MILLISECOND, 0);
         return c.getTimeInMillis();
-    }
-
-    /** 窗口末周的最后三天提醒时刻：周五/六/日（过去的不返回） */
-    public long[] reminderTimes() {
-        if (windowEnd <= 0 || week1Monday <= 0) return new long[0];
-        long endMonday = mondayOf(windowEnd);
-        long now = System.currentTimeMillis();
-        long[] all = {endMonday + 4 * DAY, endMonday + 5 * DAY, endMonday + 6 * DAY};
-        int n = 0;
-        for (long t : all) if (t > now) n++;
-        long[] out = new long[n];
-        int i = 0;
-        for (long t : all) if (t > now) out[i++] = t;
-        return out;
-    }
-
-    /** 今天是否处于窗口末周最后三天（周五及以后） */
-    public boolean isEndingWindow() {
-        int tw = todayWeek();
-        return tw != 0 && windowEnd != 0 && tw == windowEnd
-            && startOfToday() >= mondayOf(windowEnd) + 4 * DAY;
     }
 
     /**

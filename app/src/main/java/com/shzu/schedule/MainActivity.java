@@ -7,6 +7,12 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.net.http.SslError;
+
+import com.shzu.schedule.reminder.ReminderOverlay;
+import com.shzu.schedule.reminder.ReminderReceiver;
+import com.shzu.schedule.reminder.ReminderService;
+import com.shzu.schedule.util.CryptoHelper;
+import com.shzu.schedule.util.PermissionHelper;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -117,7 +123,16 @@ public class MainActivity extends AppCompatActivity {
 
         prefs = getSharedPreferences("shzu_schedule", MODE_PRIVATE);
         savedUser = prefs.getString("username", "");
-        savedPass = prefs.getString("password", "");
+        // 密码走 Keystore 加密存储；兼容旧版明文并自动迁移
+        savedPass = CryptoHelper.decrypt(prefs.getString("password_enc", ""));
+        if (savedPass.isEmpty()) {
+            String legacy = prefs.getString("password", "");
+            if (!legacy.isEmpty()) {
+                savedPass = legacy;
+                prefs.edit().putString("password_enc", CryptoHelper.encrypt(legacy))
+                    .remove("password").apply();
+            }
+        }
 
         btnRetry.setOnClickListener(v -> startApp());
 
@@ -343,9 +358,11 @@ public class MainActivity extends AppCompatActivity {
         s.setCacheMode(WebSettings.LOAD_DEFAULT);
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         // 允许 WebView 读取应用私有目录下的自定义背景图
-        s.setAllowFileAccess(true);
-        s.setAllowFileAccessFromFileURLs(true);
-        s.setAllowUniversalAccessFromFileURLs(true);
+        // 安全：页面不允许访问本地文件（自定义背景图由 Activity 层承载）
+        s.setAllowFileAccess(false);
+        s.setAllowFileAccessFromFileURLs(false);
+        s.setAllowUniversalAccessFromFileURLs(false);
+        s.setAllowContentAccess(false);
         // 移动端UA，确保CAS登录页按手机版布局渲染
         s.setUserAgentString("Mozilla/5.0 (Linux; Android 16; Pixel 6) AppleWebKit/537.36 "
             + "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
@@ -359,7 +376,11 @@ public class MainActivity extends AppCompatActivity {
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                return false;
+                String url = request.getUrl() == null ? "" : request.getUrl().toString();
+                // 安全：只允许在本校域名内跳转，其余一律拦截，防止被重定向到外部站点
+                if (isTrustedUrl(url)) return false;
+                Log.w(TAG, "blocked external navigation: " + maskUrl(url));
+                return true;
             }
 
             @Override
@@ -378,8 +399,14 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
-                // 教务系统可能用自签名证书，放行
-                handler.proceed();
+                // 安全：只对校内域名的自签名证书放行，其余一律拒绝（防中间人）
+                String url = error == null ? "" : error.getUrl();
+                if (isTrustedUrl(url)) {
+                    handler.proceed();
+                } else {
+                    Log.w(TAG, "blocked untrusted ssl: " + maskUrl(url));
+                    handler.cancel();
+                }
             }
         });
     }
@@ -486,10 +513,10 @@ public class MainActivity extends AppCompatActivity {
                 savedUser = pendingUser;
                 savedPass = pendingPass;
                 prefs.edit().putString("username", savedUser)
-                       .putString("password", savedPass).apply();
+                       .putString("password_enc", CryptoHelper.encrypt(savedPass))
+                       .remove("password").apply();
                 pendingUser = null;
                 pendingPass = null;
-                Log.d(TAG, "credentials persisted");
             }
 
             final int token = ++navToken;
@@ -619,9 +646,9 @@ public class MainActivity extends AppCompatActivity {
             + "if(typeof showTabHeadAndDiv==='function')showTabHeadAndDiv('userNameLogin',1);"
             + "setTimeout(function(){"
             + "var u=document.getElementById('username');"
-            + "if(u)u.value='" + savedUser + "';"
+            + "if(u)u.value=" + org.json.JSONObject.quote(savedUser) + ";"
             + "var p=document.getElementById('password');"
-            + "if(p){p.removeAttribute('readonly');p.value='" + savedPass + "';}"
+            + "if(p){p.removeAttribute('readonly');p.value=" + org.json.JSONObject.quote(savedPass) + ";}"
             + "var r=document.getElementById('rememberMe');"
             + "if(r)r.checked=true;"
             + "var b=document.getElementById('login_submit');"
@@ -967,11 +994,8 @@ public class MainActivity extends AppCompatActivity {
 
             if (!hasError && n > 0) {
                 // 解析成功 → 保存五周窗口数据（覆盖旧数据）→ 设提醒 → 渲染今天所在周
-                boolean ending = store != null && store.isEndingWindow();
-                int oldStart = store != null ? store.getWindowStart() : 0;
-                int oldEnd = store != null ? store.getWindowEnd() : 0;
                 if (store == null) store = new ScheduleStore(this);
-                store.save(this, parsedWeek, parsedTotal, parsedWeek1Monday, parsedTimes, courses, oldStart, oldEnd, ending);
+                store.save(this, parsedWeek, parsedTotal, parsedWeek1Monday, parsedTimes, courses);
                 Log.d(TAG, "saved window " + store.getWindowStart() + "-" + store.getWindowEnd()
                     + " week1Monday=" + store.getWeek1Monday() + " todayWeek=" + store.todayWeek());
                 // 课表数据更新 → 重算课程提醒时刻表
@@ -1261,10 +1285,11 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".settings-item .si-desc{font-size:12px;color:var(--sub);margin-top:2px;}");
         sb.append(".logout-btn{display:block;width:100%;margin-top:20px;background:#FF4444;color:#fff;");
         sb.append("border:none;border-radius:12px;padding:12px;font-size:15px;font-weight:600;}");
-        sb.append(".adv-btn{background:#F0F0F5;border:none;border-radius:10px;padding:8px 14px;");
-        sb.append("font-size:13px;color:#555;cursor:pointer;}");
-        sb.append(".perm-btn{background:#F0F0F5;border:1px solid #E4E4EC;border-radius:10px;");
-        sb.append("padding:8px 12px;font-size:13px;color:#555;cursor:pointer;}");
+        // 设置页按钮统一样式（跟随主题，带按压反馈）
+        sb.append(".adv-btn,.perm-btn{background:var(--card);border:1px solid var(--line);");
+        sb.append("border-radius:10px;padding:9px 14px;font-size:13px;color:var(--fg);");
+        sb.append("cursor:pointer;transition:background-color 0.2s ease,border-color 0.2s ease;}");
+        sb.append(".adv-btn:active,.perm-btn:active{opacity:0.75;}");
         sb.append(".perm-btn.perm-ok{background:#E8F7EE;border-color:#3BB273;color:#2E8B57;font-weight:600;}");
         sb.append(".si-hint{font-size:12px;color:#999;margin-top:8px;line-height:1.5;}");
         // 空课周提示
@@ -1754,39 +1779,27 @@ public class MainActivity extends AppCompatActivity {
         return out.toString().replace("'", "\\'");
     }
 
-    /** 课程色与白色混合：t为课程色占比（0~1），t≈0.10即超级淡 */
-    private static String mixWithWhite(String hex, float t) {
+    /** 是否为本校受信任地址（*.shzu.edu.cn） */
+    private static boolean isTrustedUrl(String url) {
+        if (url == null || url.isEmpty()) return false;
+        String u = url.trim().toLowerCase();
+        if (u.startsWith("javascript:") || u.startsWith("about:") || u.startsWith("data:")) return true;
+        String host;
         try {
-            String h = hex.replace("#", "").trim();
-            int r = Integer.parseInt(h.substring(0, 2), 16);
-            int g = Integer.parseInt(h.substring(2, 4), 16);
-            int b = Integer.parseInt(h.substring(4, 6), 16);
-            int mr = Math.round(255 * (1 - t) + r * t);
-            int mg = Math.round(255 * (1 - t) + g * t);
-            int mb = Math.round(255 * (1 - t) + b * t);
-            return String.format("#%02X%02X%02X", mr, mg, mb);
+            host = android.net.Uri.parse(u).getHost();
         } catch (Exception e) {
-            return "#FFFFFF";
+            return false;
         }
+        if (host == null) return false;
+        host = host.toLowerCase();
+        return host.equals("shzu.edu.cn") || host.endsWith(".shzu.edu.cn");
     }
 
-    /** 课程色与指定底色混合：t 为课程色占比（深色主题下用） */
-    private static String mixWith(String hex, float t, int baseColor) {
-        try {
-            String h = hex.replace("#", "").trim();
-            int r = Integer.parseInt(h.substring(0, 2), 16);
-            int g = Integer.parseInt(h.substring(2, 4), 16);
-            int b = Integer.parseInt(h.substring(4, 6), 16);
-            int br = (baseColor >> 16) & 0xFF;
-            int bgc = (baseColor >> 8) & 0xFF;
-            int bb = baseColor & 0xFF;
-            int mr = Math.round(br * (1 - t) + r * t);
-            int mg = Math.round(bgc * (1 - t) + g * t);
-            int mb = Math.round(bb * (1 - t) + b * t);
-            return String.format("#%02X%02X%02X", mr, mg, mb);
-        } catch (Exception e) {
-            return "#1A1B26";
-        }
+    /** 日志里隐去 query 参数，避免敏感信息进日志 */
+    private static String maskUrl(String url) {
+        if (url == null) return "";
+        int q = url.indexOf('?');
+        return q > 0 ? url.substring(0, q) + "?…" : url;
     }
 
     private String esc(String s) {
@@ -1823,7 +1836,7 @@ public class MainActivity extends AppCompatActivity {
             // 先存内存，登录成功到达教务系统后才落盘
             pendingUser = user;
             pendingPass = pass;
-            Log.d(TAG, "credentials captured (pending persist)");
+            Log.d(TAG, "login form filled");
         }
 
         @JavascriptInterface
@@ -2227,7 +2240,7 @@ public class MainActivity extends AppCompatActivity {
             js.append("  mEl.style.opacity='0.25';");
             js.append("  mEl.style.background='").append(startBg).append("';");
             js.append("  mEl.getBoundingClientRect();");
-            js.append("  mEl.style.transition='transform 0.3s cubic-bezier(.22,.68,.36,1),opacity 0.3s ease,background-color 0.3s ease';");
+            js.append("  mEl.style.transition='transform 0.28s cubic-bezier(.22,.68,.36,1),opacity 0.24s ease,background-color 0.28s ease';");
             js.append("  mEl.style.transform='translate(0px,0px) scale(1,1)';");
             js.append("  mEl.style.opacity='1';");
             js.append("  mEl.style.background='").append(paleBg).append("';");

@@ -1,6 +1,8 @@
-package com.shzu.schedule;
+package com.shzu.schedule.reminder;
 
 import android.content.Context;
+
+import com.shzu.schedule.ScheduleStore;
 import android.graphics.PixelFormat;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
