@@ -23,14 +23,14 @@ import java.util.regex.Pattern;
  *   totalWeeks: 学期总周数
  *   updatedAt: 抓取时间
  *   courses: [ {day,row,name,teacher,location,weeks} ]
- * }
+ *   overrides: { courseKey: {d,r} }  用户拖动调整的位置覆盖
  */
 public class ScheduleStore {
 
     private static final String PREFS = "schedule_store";
     private static final String KEY_DATA = "data";
     private static final long DAY = 86400000L;
-    private static final int DATA_VERSION = 12; // 递增以清除旧版/测试数据（v12: 新增教学班级字段，正式版）
+    private static final int DATA_VERSION = 13; // 递增以清除旧版/测试数据（v13: 清除拖动测试期写入的坏 overrides）
 
     private final SharedPreferences prefs;
     private long week1Monday = 0;
@@ -108,6 +108,44 @@ public class ScheduleStore {
         courses = null;
     }
 
+    /** 用户拖动产生的位置覆盖表（courseKey → {d,r}），无则返回null */
+    public JSONObject getOverrides() {
+        try {
+            String json = prefs.getString(KEY_DATA, null);
+            if (json == null) return null;
+            JSONObject obj = new JSONObject(json);
+            if (obj.optInt("version", 1) < DATA_VERSION) return null;
+            return obj.optJSONObject("overrides");
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** 合并写入位置覆盖：moves = [{k,d,r}]，k为courseKey，d为1..7(周一..周日)，r为1..5(大节) */
+    public void saveOverrides(JSONArray moves) {
+        try {
+            String json = prefs.getString(KEY_DATA, null);
+            if (json == null) return;
+            JSONObject obj = new JSONObject(json);
+            JSONObject ov = obj.optJSONObject("overrides");
+            if (ov == null) ov = new JSONObject();
+            for (int i = 0; i < moves.length(); i++) {
+                JSONObject m = moves.optJSONObject(i);
+                if (m == null) continue;
+                String k = m.optString("k", "");
+                int d = m.optInt("d", 0), r = m.optInt("r", 0);
+                if (k.isEmpty() || d < 1 || d > 7 || r < 1 || r > 5) continue;
+                JSONObject pos = new JSONObject();
+                pos.put("d", d);
+                pos.put("r", r);
+                ov.put(k, pos);
+            }
+            obj.put("overrides", ov);
+            prefs.edit().putString(KEY_DATA, obj.toString()).apply();
+        } catch (Exception ignored) {
+        }
+    }
+
     // ====== 保存（覆盖旧数据 = 删除上次课表） ======
 
     /**
@@ -122,6 +160,8 @@ public class ScheduleStore {
     public void save(Context ctx, int parsedWeek, int parsedTotal, long week1MondayOverride,
                      String[] newPeriodTimes, JSONArray newCourses, int oldStart, int oldEnd, boolean ending) {
         try {
+            // 刷新课表前先读出旧的位置覆盖表（用户拖动布局），保存时继续继承
+            JSONObject oldOverrides = getOverrides();
             // 优先使用从教学周历接口获取的第1周周一日期
             if (week1MondayOverride > 0) {
                 week1Monday = week1MondayOverride;
@@ -164,6 +204,10 @@ public class ScheduleStore {
                 JSONArray ptArr = new JSONArray();
                 for (String t : newPeriodTimes) ptArr.put(t);
                 obj.put("periodTimes", ptArr);
+            }
+            // 继承用户拖动产生的位置覆盖，避免刷新课表丢失自定义布局
+            if (oldOverrides != null && oldOverrides.length() > 0) {
+                obj.put("overrides", oldOverrides);
             }
 
             prefs.edit().putString(KEY_DATA, obj.toString()).apply();

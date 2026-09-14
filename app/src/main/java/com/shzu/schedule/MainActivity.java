@@ -857,6 +857,18 @@ public class MainActivity extends AppCompatActivity {
         return Integer.parseInt(p[0]) * 60 + Integer.parseInt(p[1]);
     }
 
+    /** 课程排课记录唯一标识（用于拖动位置覆盖）：名称|教师|周次|原day|原row
+     *  必须编入教务原始位置：同名称同周次的多条记录（如晚自习排周一~周五及周日5条）key 各不相同，
+     *  可独立拖动互不覆盖；而同一门课跨周渲染时原始位置恒定，key 不变，拖动位置对所有周同步生效。
+     *  旧格式 override（不含位置后缀）自然失配失效，无需清除数据 */
+    private static String courseKey(JSONObject c) {
+        return (c.optString("name", "").replaceAll("\\s+", " ").trim()
+            + "|" + c.optString("teacher", "").replaceAll("\\s+", " ").trim()
+            + "|" + c.optString("weeks", "").replaceAll("\\s+", " ").trim()
+            + "|" + c.optInt("day", 0)
+            + "|" + c.optInt("row", 0));
+    }
+
     // ====== 按周渲染课表 ======
 
     private int currentDisplayWeek = 1;
@@ -890,6 +902,9 @@ public class MainActivity extends AppCompatActivity {
         Map<String, Integer> colorMap = new HashMap<>();
         int colorIdx = 0;
 
+        // 用户拖动产生的位置覆盖（长按拖动课表后保存的自定义布局）
+        JSONObject ov = store.getOverrides();
+
         // (节次行,星期) → 课程列表；同格多课合并
         Map<String, JSONArray> cellMap = new HashMap<>();
         int maxRow = 0;
@@ -898,6 +913,14 @@ public class MainActivity extends AppCompatActivity {
             if (c == null) continue;
             int row = c.optInt("row", 0);
             int day = c.optInt("day", 0);
+            // 优先使用用户拖动定义的位置
+            if (ov != null) {
+                JSONObject o = ov.optJSONObject(courseKey(c));
+                if (o != null) {
+                    int nd = o.optInt("d", 0), nr = o.optInt("r", 0);
+                    if (nd >= 1 && nd <= 7 && nr >= 1 && nr <= 5) { day = nd; row = nr; }
+                }
+            }
             if (row <= 0 || day < 1 || day > 7) continue;
             if (row > 5) continue; // 最多5节(9-10节)，不显示11-14节
             String key = row + "_" + (day - 1);
@@ -928,7 +951,8 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<style>");
         sb.append("*{margin:0;padding:0;box-sizing:border-box;}");
         sb.append("body{font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;");
-        sb.append("background:#FFFFFF;min-height:100vh;color:#333;padding:12px 8px;}");
+        sb.append("background:#FFFFFF;height:100vh;color:#333;padding:12px 8px 0 8px;");
+        sb.append("display:flex;flex-direction:column;overflow:hidden;}");
         sb.append(".header{text-align:center;margin-bottom:10px;}");
         sb.append(".header h1{font-size:20px;font-weight:700;color:#333;}");
         sb.append(".toolbar{display:flex;justify-content:center;align-items:center;gap:12px;margin-top:8px;}");
@@ -941,29 +965,54 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".btns{display:flex;justify-content:center;gap:10px;margin-top:8px;}");
         sb.append(".btn{background:#F0F0F5;border:none;color:#555;font-size:12px;");
         sb.append("border-radius:16px;padding:6px 16px;}");
-        sb.append(".grid{display:grid;grid-template-columns:48px repeat(7,1fr);gap:3px;");
-        sb.append("background:#F8F8FA;border-radius:14px;padding:8px;}");
+        // 全局禁用文字选中：长按课程卡片拖动时不会误触发系统选词/复制弹窗
+        sb.append("*{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;}");
+        sb.append(".modal input,.modal textarea{-webkit-user-select:auto;user-select:auto;}");
+        sb.append(".grid{display:grid;grid-template-columns:34px repeat(7,1fr);gap:3px;");
+        sb.append("flex:1;min-height:0;grid-auto-rows:1fr;background:#F8F8FA;border-radius:14px;padding:8px;}");
         sb.append(".gh{text-align:center;font-weight:700;font-size:12px;padding:8px 2px;");
         sb.append("background:#F0F0F5;border-radius:8px;color:#333;}");
         sb.append(".gh-date{font-size:10px;font-weight:400;color:#999;margin-top:2px;}");
         sb.append(".gh.today{background:#667eea;color:#fff;}");
         sb.append(".gh.today .gh-date{color:#ddd;}");
-        sb.append(".ts{font-size:9px;text-align:center;color:#777;");
+        sb.append(".ts{font-size:10px;text-align:center;color:#777;");
         sb.append("display:flex;flex-direction:column;align-items:center;justify-content:center;");
-        sb.append("background:#F0F0F5;border-radius:8px;padding:4px 2px;}");
+        sb.append("background:#F0F0F5;border-radius:8px;padding:4px 2px;line-height:1.15;}");
         sb.append(".ts .ts-time{font-size:8px;color:#aaa;margin-top:2px;}");
-        sb.append(".course{border-radius:10px;padding:7px 6px;font-size:11px;");
-        sb.append("min-height:54px;box-shadow:0 1px 4px rgba(0,0,0,0.08);");
-        sb.append("transition:transform 0.2s;overflow:hidden;display:flex;");
-        sb.append("flex-direction:column;justify-content:center;cursor:pointer;}");
+        sb.append(".course{border-radius:10px;padding:9px 7px;font-size:11px;");
+        sb.append("display:flex;flex-direction:column;justify-content:flex-start;cursor:pointer;position:relative;overflow:hidden;");
+        sb.append("transition:transform 0.18s,opacity 0.18s,box-shadow 0.18s;}");
+        // 长名称底部淡出遮罩（渐变到卡片底色，文字不超出卡片）
+        sb.append(".course::after{content:'';position:absolute;left:0;right:0;bottom:0;height:14px;");
+        sb.append("background:linear-gradient(rgba(255,255,255,0) 0,var(--cc,#fff) 100%);pointer-events:none;}");
         sb.append(".course:active{transform:scale(0.96);}");
+        // 长按浮起拖动态：变大+微透明+深阴影
+        sb.append(".course.dragging{opacity:0.72;transform:scale(1.07);z-index:50;");
+        sb.append("box-shadow:0 10px 28px rgba(0,0,0,0.28);transition:none;animation:none;pointer-events:none;}");
+        // 落点高亮
+        sb.append(".drop-hint{outline:2.5px dashed #667eea;outline-offset:-2px;}");
+        sb.append(".empty.drop-hint{background:#EEF0FF;}");
         sb.append(".course .name{font-weight:700;margin-bottom:3px;line-height:1.25;");
         sb.append("font-size:12px;color:#fff;}");
         sb.append(".course .info{font-size:10px;opacity:0.9;line-height:1.4;color:#fff;}");
         sb.append(".empty{background:#FAFAFC;border-radius:8px;}");
+        sb.append(".grid-head{display:grid;grid-template-columns:34px repeat(7,1fr);gap:3px;margin-bottom:4px;padding:0 8px;}");
+        // 拖动模式底部操作栏（横向拉长、低高度；拖动中下滑隐藏）
+        sb.append(".dockbar{position:fixed;left:50%;bottom:10px;transform:translate(-50%,150%);");
+        sb.append("background:#fff;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.2);");
+        sb.append("display:flex;gap:6px;padding:6px 8px;z-index:80;opacity:0;");
+        sb.append("width:calc(100% - 24px);max-width:420px;");
+        sb.append("transition:transform 0.3s cubic-bezier(.22,.68,.36,1),opacity 0.3s ease;}");
+        sb.append(".dockbar.show{transform:translate(-50%,0);opacity:1;}");
+        sb.append(".dockbar.hide-drag{transform:translate(-50%,150%);opacity:0;}");
+        sb.append(".db-btn{border:none;border-radius:12px;padding:9px 10px;font-size:12px;font-weight:600;}");
+        sb.append(".db-btn:disabled{opacity:0.4;}");
+        sb.append(".db-apply{background:#667eea;color:#fff;flex:2.2;order:2;font-size:14px;}");
+        sb.append(".db-cancel{background:#F0F0F5;color:#555;flex:1;order:1;}");
+        sb.append(".db-undo{background:#F0F0F5;color:#555;flex:1;order:3;}");
         sb.append("@keyframes fadeIn{from{opacity:0;transform:translateY(8px);}");
         sb.append("to{opacity:1;transform:translateY(0);}}");
-        sb.append(".course{animation:fadeIn 0.3s ease-out both;}");
+        sb.append(".course{animation:fadeIn 0.18s ease-out both;}");
         // 课程详情弹窗
         sb.append(".modal-bg{display:none;position:fixed;top:0;left:0;width:100%;height:100%;");
         sb.append("background:rgba(0,0,0,0.4);z-index:100;}");
@@ -1027,8 +1076,8 @@ public class MainActivity extends AppCompatActivity {
         sb.append("</div>");
         sb.append("</div>");
 
-        // 网格
-        sb.append("<div class='grid'>");
+        // 表头（独立网格，不参与课程行高度分配）
+        sb.append("<div class='grid-head'>");
         sb.append("<div class='gh'></div>");
         String[] days = {"周一", "周二", "周三", "周四", "周五", "周六", "周日"};
         for (int d = 1; d <= 7; d++) {
@@ -1042,6 +1091,10 @@ public class MainActivity extends AppCompatActivity {
             sb.append("<div class='").append(cls).append("'>")
               .append(days[d - 1]).append(dateStr).append("</div>");
         }
+        sb.append("</div>");
+
+        // 课程网格
+        sb.append("<div class='grid'>");
 
         int numRows = Math.min(maxRow, 5);
         if (numRows == 0 && courses.length() == 0) {
@@ -1051,7 +1104,13 @@ public class MainActivity extends AppCompatActivity {
         for (int row = 1; row <= numRows; row++) {
             String label = row <= periodLabels.length ? periodLabels[row - 1] : row + "节";
             String time = row <= periodTimes.length ? periodTimes[row - 1] : "";
-            sb.append("<div class='ts'>").append(label);
+            // 节次标签竖向排列：每个字符独占一行（1-2节 → 1/−/2/节）
+            StringBuilder vLabel = new StringBuilder();
+            for (int ci = 0; ci < label.length(); ci++) {
+                if (ci > 0) vLabel.append("<br>");
+                vLabel.append(esc(String.valueOf(label.charAt(ci))));
+            }
+            sb.append("<div class='ts'>").append(vLabel);
             if (!time.isEmpty()) sb.append("<div class='ts-time'>").append(time).append("</div>");
             sb.append("</div>");
 
@@ -1063,9 +1122,15 @@ public class MainActivity extends AppCompatActivity {
                     int ci = colorMap.getOrDefault(firstName, 0);
                     String color = colors[ci % colors.length];
                     String detail = buildCourseDetail(first, week, label, time, color);
-                    sb.append("<div class='course' style='background:").append(color)
-                      .append(";animation-delay:").append((row + d) * 0.05).append("s' data-detail='")
-                      .append(detail).append("'>");
+                    // 格内所有课程的标识（拖动应用时整格一起持久化）
+                    StringBuilder keysB = new StringBuilder();
+                    for (int k = 0; k < arr.length(); k++) {
+                        if (k > 0) keysB.append(";;;");
+                        keysB.append(courseKey(arr.optJSONObject(k)).replace("'", "\\'"));
+                    }
+                    sb.append("<div class='course' style='--cc:").append(color)
+                      .append(";background:var(--cc);animation-delay:").append((row + d) * 0.05).append("s' data-detail='")
+                      .append(detail).append("' data-keys='").append(keysB).append("' data-day='").append(d).append("' data-row='").append(row).append("'>");
                     // 显示所有课程名（多门用换行分隔）
                     for (int k = 0; k < arr.length(); k++) {
                         JSONObject cc = arr.optJSONObject(k);
@@ -1086,7 +1151,8 @@ public class MainActivity extends AppCompatActivity {
                     if (!info.isEmpty()) sb.append("<div class='info'>").append(info).append("</div>");
                     sb.append("</div>");
                 } else {
-                    sb.append("<div class='empty'></div>");
+                    // 空格也带位置属性：拖动放置时 swapNodes 能正确交换属性，否则卡片位置被清空导致应用不生效
+                    sb.append("<div class='empty' data-day='").append(d).append("' data-row='").append(row).append("'></div>");
                 }
             }
         }
@@ -1125,18 +1191,150 @@ public class MainActivity extends AppCompatActivity {
         sb.append("</div>");
         sb.append("</div></div>");
 
+        // 拖动模式底部操作栏
+        sb.append("<div class='dockbar' id='dockbar'>");
+        sb.append("<button class='db-btn db-apply' onclick='applyMoves()'>应用</button>");
+        sb.append("<button class='db-btn db-cancel' onclick='cancelMoves()'>取消更改</button>");
+        sb.append("<button class='db-btn db-undo' id='undoBtn' onclick='undoMove()' disabled>撤销</button>");
+        sb.append("</div>");
+
         // JS
         sb.append("<script>");
+        sb.append("var CUR_WEEK=").append(week).append(";");
+        // ===== 长按拖动调整课程位置 =====
+        sb.append("var dragMode=false,dragEl=null,undoStack=[],pressTimer=null;");
+        sb.append("var pressX=0,pressY=0,baseR=null,curHint=null,didDrag=false;");
+        sb.append("function swapNodes(a,b){");
+        sb.append("  var ph=document.createElement('div');");
+        sb.append("  a.parentNode.insertBefore(ph,a);");
+        sb.append("  b.parentNode.insertBefore(a,b);");
+        sb.append("  ph.parentNode.insertBefore(b,ph);");
+        sb.append("  ph.parentNode.removeChild(ph);");
+        // 交换 data-day/data-row 属性，确保位置信息随节点一起更新
+        sb.append("  var ad=a.getAttribute('data-day'),ar=a.getAttribute('data-row');");
+        sb.append("  var bd=b.getAttribute('data-day'),br=b.getAttribute('data-row');");
+        sb.append("  a.setAttribute('data-day',bd||'');a.setAttribute('data-row',br||'');");
+        sb.append("  b.setAttribute('data-day',ad||'');b.setAttribute('data-row',ar||'');");
+        sb.append("}");
+        sb.append("function setHint(el){");
+        sb.append("  if(curHint===el)return;");
+        sb.append("  if(curHint)curHint.classList.remove('drop-hint');");
+        sb.append("  curHint=el;");
+        sb.append("  if(el)el.classList.add('drop-hint');");
+        sb.append("}");
+        sb.append("function showDock(){");
+        sb.append("  var db=document.getElementById('dockbar');");
+        sb.append("  if(db)db.classList.add('show');");
+        sb.append("  dragMode=true;");
+        sb.append("}");
+        sb.append("function updateUndoBtn(){");
+        sb.append("  var b=document.getElementById('undoBtn');");
+        sb.append("  if(b)b.disabled=undoStack.length===0;");
+        sb.append("}");
+        // 长按浮起：卡片变大+微透明+深阴影；拖动中底部栏下滑隐藏
+        sb.append("function startLift(card){");
+        sb.append("  dragEl=card;");
+        sb.append("  baseR=card.getBoundingClientRect();");
+        sb.append("  card.classList.add('dragging');");
+        sb.append("  card.style.pointerEvents='none';");
+        sb.append("  showDock();");
+        sb.append("  var db=document.getElementById('dockbar');");
+        sb.append("  if(db)db.classList.add('hide-drag');");
+        sb.append("}");
+        // 跟手移动：手指即卡片中心（首帧关闭过渡实现即时跟随）
+        sb.append("function moveDrag(x,y){");
+        sb.append("  if(!dragEl||!baseR)return;");
+        sb.append("  dragEl.style.transition='none';");
+        sb.append("  var dx=x-(baseR.left+baseR.width/2);var dy=y-(baseR.top+baseR.height/2);");
+        sb.append("  dragEl.style.transform='translate('+dx+'px,'+dy+'px) scale(1.07)';");
+        sb.append("  var under=document.elementFromPoint(x,y);");
+        sb.append("  var cell=under?under.closest('.course,.empty'):null;");
+        sb.append("  setHint(cell&&cell!==dragEl?cell:null);");
+        sb.append("  window.__suppressSwipe=true;");
+        sb.append("}");
+        // 松手结算：目标为空格→放置；有课→对调；格子统一按节点互换处理
+        // 注意：必须先用 pointerEvents='none' 状态查 elementFromPoint（此时拖动卡片不参与命中），
+        // 再恢复样式；否则卡片自己挡在触点下方会命中自身导致交换失败弹回
+        sb.append("function endDrag(t){");
+        sb.append("  var el=dragEl;dragEl=null;");
+        sb.append("  el.classList.remove('dragging');");
+        sb.append("  var target=null;");
+        sb.append("  if(t){var under=document.elementFromPoint(t.clientX,t.clientY);");
+        sb.append("    target=under?under.closest('.course,.empty'):null;}");
+        sb.append("  el.style.transition='';el.style.transform='';el.style.pointerEvents='';");
+        sb.append("  if(target&&target!==el){");
+        sb.append("    swapNodes(el,target);");
+        sb.append("    undoStack.push([el,target]);");
+        sb.append("    updateUndoBtn();");
+        sb.append("  }");
+        sb.append("  setHint(null);");
+        sb.append("  didDrag=true;");
+        sb.append("  var db=document.getElementById('dockbar');");
+        sb.append("  if(db)db.classList.remove('hide-drag');");
+        sb.append("  setTimeout(function(){window.__suppressSwipe=false;},50);");
+        sb.append("}");
+        sb.append("function undoMove(){");
+        sb.append("  if(!undoStack.length)return;");
+        sb.append("  var p=undoStack.pop();");
+        sb.append("  swapNodes(p[0],p[1]);");
+        sb.append("  updateUndoBtn();");
+        sb.append("}");
+        sb.append("function applyMoves(){");
+        sb.append("  var cards=document.querySelectorAll('.course[data-day]');var moves=[];");
+        sb.append("  cards.forEach(function(el){");
+        sb.append("    var d=parseInt(el.getAttribute('data-day')||'0');");
+        sb.append("    var r=parseInt(el.getAttribute('data-row')||'0');");
+        sb.append("    if(d<1||r<1)return;");
+        sb.append("    var keys=(el.getAttribute('data-keys')||'').split(';;;');");
+        sb.append("    for(var ki=0;ki<keys.length;ki++){");
+        sb.append("      if(keys[ki])moves.push({k:keys[ki],d:d,r:r});");
+        sb.append("    }");
+        sb.append("  });");
+        sb.append("  Android.onApplyMoves(JSON.stringify(moves),CUR_WEEK);");
+        sb.append("}");
+        sb.append("function cancelMoves(){Android.onCancelMoves(CUR_WEEK);}");
+        // 课程卡事件：长按500ms浮起/拖动模式即时浮起；拖动后抑制click
         sb.append("document.querySelectorAll('.course').forEach(function(el){");
+        sb.append("  el.addEventListener('touchstart',function(e){");
+        sb.append("    if(dragEl)return;");
+        sb.append("    var card=this;");
+        sb.append("    pressX=e.touches[0].clientX;pressY=e.touches[0].clientY;");
+        sb.append("    if(dragMode){startLift(card);}");
+        sb.append("    else{pressTimer=setTimeout(function(){pressTimer=null;startLift(card);},500);}");
+        sb.append("  },false);");
+        sb.append("  el.addEventListener('touchmove',function(e){");
+        sb.append("    if(dragEl===this){");
+        sb.append("      e.preventDefault();");
+        sb.append("      moveDrag(e.touches[0].clientX,e.touches[0].clientY);");
+        sb.append("    }else if(pressTimer){");
+        sb.append("      var t=e.touches[0];");
+        sb.append("      if(Math.abs(t.clientX-pressX)>12||Math.abs(t.clientY-pressY)>12){clearTimeout(pressTimer);pressTimer=null;}");
+        sb.append("    }");
+        sb.append("  },false);");
+        sb.append("  el.addEventListener('touchend',function(e){");
+        sb.append("    if(pressTimer){clearTimeout(pressTimer);pressTimer=null;}");
+        sb.append("    if(dragEl===this){e.preventDefault();endDrag(e.changedTouches[0]);}");
+        sb.append("  },false);");
+        sb.append("  el.addEventListener('touchcancel',function(){");
+        sb.append("    if(pressTimer){clearTimeout(pressTimer);pressTimer=null;}");
+        sb.append("    if(dragEl===this)endDrag(null);");
+        sb.append("  },false);");
         sb.append("  el.addEventListener('click',function(){");
+        sb.append("    if(didDrag){didDrag=false;return;}");
+        sb.append("    if(dragMode)return;");
         sb.append("    var d=this.getAttribute('data-detail');");
         sb.append("    if(d){window.__cardRect=this.getBoundingClientRect();Android.onCourseClick(d);}");
         sb.append("  });");
         sb.append("});");
-        // 触摸滑动
+        // 触摸滑动切周（拖动中/拖动模式下禁用）
         sb.append("var touchStartX=0,touchEndX=0;");
         sb.append("document.addEventListener('touchstart',function(e){touchStartX=e.changedTouches[0].screenX;},false);");
         sb.append("document.addEventListener('touchend',function(e){");
+        sb.append("  if(window.__suppressSwipe||dragEl){window.__suppressSwipe=false;return;}");
+        sb.append("  if(dragMode)return;");
+        // 详情/设置弹窗打开时不响应滑动切周，避免误触跳周
+        sb.append("  var cm=document.getElementById('courseModal'),sm=document.getElementById('settingsModal');");
+        sb.append("  if((cm&&cm.classList.contains('show'))||(sm&&sm.classList.contains('show')))return;");
         sb.append("  touchEndX=e.changedTouches[0].screenX;");
         sb.append("  var dx=touchEndX-touchStartX;");
         sb.append("  if(Math.abs(dx)>80){Android.onWeekChanged(").append(week + "+(dx>0?-1:1)").append(");}");
@@ -1337,6 +1535,29 @@ public class MainActivity extends AppCompatActivity {
         @JavascriptInterface
         public void onCourseClick(String detailJson) {
             handler.post(() -> showCourseDetail(detailJson));
+        }
+
+        @JavascriptInterface
+        public void onApplyMoves(String movesJson, final int week) {
+            handler.post(() -> {
+                try {
+                    JSONArray arr = new JSONArray(movesJson);
+                    if (store == null) store = new ScheduleStore(MainActivity.this);
+                    store.saveOverrides(arr);
+                    Log.d(TAG, "overrides applied: " + arr.length() + " courses, re-render week " + week);
+                    renderWeekSchedule(week);
+                } catch (Exception e) {
+                    Log.e(TAG, "applyMoves error", e);
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void onCancelMoves(final int week) {
+            handler.post(() -> {
+                Log.d(TAG, "moves cancelled, re-render week " + week);
+                renderWeekSchedule(week);
+            });
         }
 
         @JavascriptInterface
