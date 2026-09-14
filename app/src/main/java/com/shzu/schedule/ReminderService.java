@@ -206,6 +206,7 @@ public class ReminderService extends Service {
     /** 全量重算所有已选课程的提醒时刻 */
     private void rebuild() {
         List<Trigger> list = new ArrayList<>();
+        int skipped = 0;
         try {
             ScheduleStore store = new ScheduleStore(this);
             Set<String> keys = store.getReminderKeys();
@@ -265,7 +266,17 @@ public class ReminderService extends Service {
                         cal.set(Calendar.MILLISECOND, 0);
                         long triggerTime = cal.getTimeInMillis() - advance * MINUTE;
 
-                        if (triggerTime <= now) continue;
+                        // 【今日以前的课程提醒一律禁用】
+                        // 用绝对时间戳比较：昨天/更早的提醒时刻、以及今天已经过去的时刻
+                        // 都不会排入，避免重启 App 或改系统时间后把旧课补弹出来。
+                        if (triggerTime <= now) {
+                            skipped++;
+                            if (skipped <= 8) {
+                                Log.d(TAG, "disable past reminder: " + name + " week " + w
+                                    + " at " + fmtTime(triggerTime));
+                            }
+                            continue;
+                        }
 
                         Trigger t = new Trigger();
                         t.time = triggerTime;
@@ -295,7 +306,8 @@ public class ReminderService extends Service {
             triggers.clear();
             triggers.addAll(list);
         }
-        Log.d(TAG, "rebuild: " + list.size() + " reminders pending");
+        Log.d(TAG, "rebuild: " + list.size() + " reminders pending"
+            + (skipped > 0 ? " (" + skipped + " past reminders disabled)" : ""));
         updateServiceNotification();
     }
 
@@ -349,8 +361,10 @@ public class ReminderService extends Service {
 
     private Notification buildServiceNotification() {
         int pending;
+        Trigger next = null;
         synchronized (triggers) {
             pending = triggers.size();
+            if (!triggers.isEmpty()) next = triggers.get(0);
         }
         Intent open = new Intent(this, MainActivity.class);
         open.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
@@ -359,9 +373,14 @@ public class ReminderService extends Service {
             : PendingIntent.FLAG_UPDATE_CURRENT;
         PendingIntent pi = PendingIntent.getActivity(this, 0, open, flag);
 
-        String text = pending > 0
-            ? "已开启课程提醒 · " + pending + " 个提醒待触发"
-            : "已开启课程提醒";
+        String text;
+        if (next != null) {
+            text = "下次提醒：" + fmtTime(next.time) + " " + next.name;
+        } else if (pending > 0) {
+            text = "已开启课程提醒 · " + pending + " 个提醒待触发";
+        } else {
+            text = "已开启课程提醒";
+        }
 
         return new NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_popup_reminder)
@@ -418,6 +437,12 @@ public class ReminderService extends Service {
     }
 
     // ====== 工具 ======
+
+    /** 格式化提醒时刻，用于日志与通知展示 */
+    private static String fmtTime(long millis) {
+        return new java.text.SimpleDateFormat("M月d日 HH:mm", java.util.Locale.CHINA)
+            .format(new java.util.Date(millis));
+    }
 
     /** 从 "10:00-11:40" 解析起始时间 */
     private static int[] parseStartTime(String timeStr) {
