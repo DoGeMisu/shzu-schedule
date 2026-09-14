@@ -3,13 +3,15 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: 'a5526d76-d803-4f1d-aab7-2c26a40626ab'
-  PropagateID: 'a5526d76-d803-4f1d-aab7-2c26a40626ab'
-  ReservedCode1: 'e22897de-a62e-4948-b7fb-9f02617c002e'
-  ReservedCode2: 'e22897de-a62e-4948-b7fb-9f02617c002e'
+  ProduceID: '83b6e61a-c025-4a97-ab58-f25c857e9fbd'
+  PropagateID: '83b6e61a-c025-4a97-ab58-f25c857e9fbd'
+  ReservedCode1: 'c3e97d7d-959d-4895-8ad8-9e7d8f5e4293'
+  ReservedCode2: 'c3e97d7d-959d-4895-8ad8-9e7d8f5e4293'
 ---
 
 # 石大课表 (SHZU Schedule)
+
+> **非官方声明**：本项目**非石河子大学官方软件**，由在校学生利用**课余时间**出于学习目的独立开发维护，与学校官方及教务部门无任何关联。
 
 石河子大学课表安卓应用：自动登录学校统一身份认证（CAS），抓取教务系统课表，本地离线渲染，带五周滚动窗口与开学日期自动识别。
 
@@ -74,7 +76,10 @@ gradle assembleDebug
 
 ## 免责声明
 
-本项目仅供学习交流，请合理使用，遵守学校相关规定。使用者需自行承担风险。
+- 本项目为**非官方**的学生业余作品，与石河子大学及其教务部门无任何关联
+- 由在校学生在**业余时间**独立开发，仅供学习交流
+- 请合理使用，遵守学校相关规定
+- 使用本项目产生的一切后果由使用者自行承担
 
 ## License
 
