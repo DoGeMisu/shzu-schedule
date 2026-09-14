@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: 'ae59aa08-eb07-4761-a901-8db28c7fd852'
-  PropagateID: 'ae59aa08-eb07-4761-a901-8db28c7fd852'
-  ReservedCode1: 'b78c0a16-cf79-463f-9ab6-beaf02e0421b'
-  ReservedCode2: 'b78c0a16-cf79-463f-9ab6-beaf02e0421b'
+  ProduceID: 'c28dbd9e-4769-489a-878b-aa3a40977d84'
+  PropagateID: 'c28dbd9e-4769-489a-878b-aa3a40977d84'
+  ReservedCode1: 'b00c8fb0-7ca2-4ef3-aba3-7ac95198bca8'
+  ReservedCode2: 'b00c8fb0-7ca2-4ef3-aba3-7ac95198bca8'
 ---
 
 # 石大课表 (SHZU Schedule)
@@ -15,9 +15,16 @@ AIGC:
 
 石河子大学课表安卓应用：自动登录学校统一身份认证（CAS），抓取教务系统整学期课表，本地离线渲染，支持课前提醒、深浅主题与自定义背景。
 
-![Platform](https://img.shields.io/badge/Platform-Android-3DDC84) ![Language](https://img.shields.io/badge/Language-Java-orange) ![UI](https://img.shields.io/badge/UI-WebView%20HTML%2FCSS%2FJS-blue) ![Version](https://img.shields.io/badge/Version-1.1.0-667eea)
+![Platform](https://img.shields.io/badge/Platform-Android-3DDC84) ![Language](https://img.shields.io/badge/Language-Java-orange) ![UI](https://img.shields.io/badge/UI-WebView%20HTML%2FCSS%2FJS-blue) ![Version](https://img.shields.io/badge/Version-1.1.1-667eea)
 
-## ✨ v1.1.0 更新亮点
+## ✨ v1.1.1 更新亮点
+
+- 🛡 **权限体检清单**：设置页一眼看出缺哪项权限（悬浮窗 / 通知 / 后台运行 / 自启动），点任一项直接跳转去开
+- 📱 **机型专属指引**：按小米红米、华为荣耀、OPPO/realme/一加、vivo/iQOO、魅族、三星分别给出**具体设置路径**
+- ⚡ **小米/红米专项**：一键直达「后台弹出界面」权限页（这项不开，提醒弹不出来，只会发通知）
+- 🔔 新增通知权限检测与一键申请，未开启时明确提示会降级为通知提醒
+
+## v1.1.0 主要更新
 
 - 🔔 **课前提醒全面重做**：课程卡片右上角铃铛一键开关，到点用**悬浮窗**弹提醒页面，**来电式循环响铃 + 震动**，退出应用、锁屏也照常提醒
 - 📅 **整学期课表**：一次拉取全学期并本地保存，总周数从教务教学周历自动获取（不再写死），无需再按窗口反复刷新

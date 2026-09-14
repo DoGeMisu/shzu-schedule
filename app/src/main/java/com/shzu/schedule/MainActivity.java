@@ -230,13 +230,14 @@ public class MainActivity extends AppCompatActivity {
     private void refreshPermissionUi() {
         final boolean overlay = ReminderOverlay.canDraw(this);
         final boolean battery = PermissionHelper.isIgnoringBatteryOptimizations(this);
+        final boolean notify = PermissionHelper.hasNotificationPermission(this);
         handler.postDelayed(new Runnable() {
             @Override
             public void run() {
                 if (webView == null) return;
                 try {
                     webView.evaluateJavascript(
-                        "if(window.updatePermUi){updatePermUi(" + overlay + "," + battery + ")}",
+                        "if(window.updatePermUi){updatePermUi(" + overlay + "," + battery + "," + notify + ")}",
                         null);
                 } catch (Exception ignored) {
                 }
@@ -1290,7 +1291,22 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".settings-item .si-desc{font-size:12px;color:var(--sub);margin-top:2px;}");
         sb.append(".logout-btn{display:block;width:100%;margin-top:20px;background:#FF4444;color:#fff;");
         sb.append("border:none;border-radius:12px;padding:12px;font-size:15px;font-weight:600;}");
+        // 权限清单样式（一眼看出缺哪项）
+        sb.append(".perm-list{margin-top:10px;}");
+        sb.append(".perm-row{display:flex;align-items:flex-start;gap:10px;padding:10px 12px;");
+        sb.append("border-radius:10px;background:var(--card);margin-bottom:8px;cursor:pointer;}");
+        sb.append(".perm-row:active{opacity:0.75;}");
+        sb.append(".perm-row .perm-st{font-size:15px;font-weight:700;width:18px;text-align:center;flex:0 0 auto;}");
+        sb.append(".perm-row.ok .perm-st{color:#3BB273;}");
+        sb.append(".perm-row.bad .perm-st{color:#E5533D;}");
+        sb.append(".perm-row.warn .perm-st{color:#E8A200;}");
+        sb.append(".perm-row .perm-tx{flex:1;font-size:13px;color:var(--fg);line-height:1.35;}");
+        sb.append(".perm-row .perm-tx i{display:block;font-style:normal;font-size:11px;color:var(--sub);margin-top:3px;}");
         // 设置页按钮统一样式（跟随主题，带按压反馈）
+        sb.append(".adv-btn{background:var(--card);border:1px solid var(--line);");
+        sb.append("border-radius:10px;padding:9px 14px;font-size:13px;color:var(--fg);");
+        sb.append("cursor:pointer;transition:background-color 0.2s ease,border-color 0.2s ease;}");
+        sb.append(".adv-btn:active{opacity:0.75;}");
         sb.append(".adv-btn,.perm-btn{background:var(--card);border:1px solid var(--line);");
         sb.append("border-radius:10px;padding:9px 14px;font-size:13px;color:var(--fg);");
         sb.append("cursor:pointer;transition:background-color 0.2s ease,border-color 0.2s ease;}");
@@ -1503,16 +1519,14 @@ public class MainActivity extends AppCompatActivity {
               .append(sel).append(">").append(opt).append("分钟</button>");
         }
         sb.append("</div></div>");
-        // 提醒权限：悬浮窗 / 自启动 / 后台运行
+        // 提醒权限：清单式，一眼看出缺哪项，点即跳转
         sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
         sb.append("<div><div class='si-label'>提醒权限</div>");
-        sb.append("<div class='si-desc'>开启后即使退出应用，到点也能弹出提醒页面；再次点击可去系统设置里关闭</div></div>");
-        sb.append("<div style='display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;'>");
-        sb.append("<button class='perm-btn' id='permOverlay' onclick='Android.onRequestOverlay()'>悬浮窗权限</button>");
-        sb.append("<button class='perm-btn' id='permAutoStart' onclick='Android.onRequestAutoStart()'>自启动权限</button>");
-        sb.append("<button class='perm-btn' id='permBattery' onclick='Android.onRequestBattery()'>后台运行权限</button>");
-        sb.append("</div>");
+        sb.append("<div class='si-desc'>开启后退出应用、锁屏也能准时弹提醒；点任一项可直接去开启</div></div>");
+        sb.append("<div class='perm-list' id='permList'></div>");
         sb.append("<div class='si-hint' id='permHint'>权限状态检测中…</div>");
+        sb.append("<button class='adv-btn' style='margin-top:10px;width:100%;' onclick='toggleGuide()'>查看本机设置指引</button>");
+        sb.append("<div class='si-hint' id='permGuide' style='display:none;white-space:pre-line;text-align:left;'></div>");
         sb.append("</div>");
         // 课程布局
         sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
@@ -1534,6 +1548,7 @@ public class MainActivity extends AppCompatActivity {
         // JS
         sb.append("<script>");
         sb.append("var CUR_WEEK=").append(week).append(";");
+        sb.append("var PERM_GUIDE=").append(org.json.JSONObject.quote(PermissionHelper.guideText())).append(";");
         // ===== 长按拖动调整课程位置 =====
         sb.append("var dragMode=false,dragEl=null,undoStack=[],pressTimer=null;");
         sb.append("var pressX=0,pressY=0,baseR=null,curHint=null,didDrag=false;");
@@ -1707,16 +1722,31 @@ public class MainActivity extends AppCompatActivity {
         sb.append("    setTimeout(function(){modal.classList.remove('show');mEl.style.transition='';mEl.style.transform='';mEl.style.opacity='';mEl.style.background='';},230);");
         sb.append("  }else{modal.classList.remove('show');mEl.style.background='';}");
         sb.append("}");
-        sb.append("function updatePermUi(overlay,battery){");
-        sb.append("  var o=document.getElementById('permOverlay');");
-        sb.append("  if(o){if(overlay){o.classList.add('perm-ok');o.textContent='悬浮窗权限 已开启';}");
-        sb.append("  else{o.classList.remove('perm-ok');o.textContent='悬浮窗权限 未开启';}}");
-        sb.append("  var b=document.getElementById('permBattery');");
-        sb.append("  if(b){if(battery){b.classList.add('perm-ok');b.textContent='后台运行 已允许';}");
-        sb.append("  else{b.classList.remove('perm-ok');b.textContent='后台运行权限';}}");
-        sb.append("  var h=document.getElementById('permHint');");
-        sb.append("  if(h){h.textContent=overlay?'悬浮窗已开启，提醒可弹出在任意界面之上':'请开启悬浮窗权限，否则提醒只能以通知形式显示';}");
-        sb.append("}");
+        sb.append("function updatePermUi(overlay,battery,notify){");
+        sb.append("  var list=[");
+        sb.append("    {n:'悬浮窗权限',ok:overlay,t:'到点把提醒弹在其他应用之上（最关键）',a:'Android.onRequestOverlay()'},");
+        sb.append("    {n:'通知权限',ok:notify,t:'权限不足时用通知兜底提醒',a:'Android.onRequestNotification()'},");
+        sb.append("    {n:'后台运行',ok:battery,t:'不受系统省电限制，避免被系统冻结',a:'Android.onRequestBattery()'},");
+        sb.append("    {n:'自启动',ok:null,t:'重启手机后自动恢复提醒（系统无接口，需手动确认）',a:'Android.onRequestAutoStart()'}");
+        sb.append("  ];");
+        sb.append("  var h='';");
+        sb.append("  for(var i=0;i<list.length;i++){var it=list[i];");
+        sb.append("    var cls=it.ok===null?'warn':(it.ok?'ok':'bad');");
+        sb.append("    var st=it.ok===null?'!':(it.ok?'\\u2713':'\\u2715');");
+        sb.append("    h+='<div class=\"perm-row '+cls+'\" onclick=\"'+it.a+'\">';");
+        sb.append("    h+='<span class=\"perm-st\">'+st+'</span>';");
+        sb.append("    h+='<span class=\"perm-tx\"><b>'+it.n+'</b><i>'+it.t+'</i></span>';");
+        sb.append("    h+='</div>';}");
+        sb.append("  var pl=document.getElementById('permList');");
+        sb.append("  if(pl)pl.innerHTML=h;");
+        sb.append("  var hint=document.getElementById('permHint');");
+        sb.append("  if(hint){");
+        sb.append("    if(overlay&&notify)hint.textContent='权限已就绪，退出应用也能准时提醒';");
+        sb.append("    else hint.textContent='还差关键权限未开，此时提醒会降级为普通通知（点上方任一项去开启）';");
+        sb.append("  }}");
+        sb.append("function toggleGuide(){var g=document.getElementById('permGuide');if(!g)return;");
+        sb.append("  if(g.style.display==='none'){g.textContent=PERM_GUIDE;g.style.display='block';}");
+        sb.append("  else g.style.display='none';}");
         sb.append("function showSettings(){document.getElementById('settingsModal').classList.add('show');");
         sb.append("if(window.Android&&Android.onSettingsOpened)Android.onSettingsOpened();}");
         sb.append("function closeSettings(){document.getElementById('settingsModal').classList.remove('show');}");
@@ -2086,6 +2116,21 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @JavascriptInterface
+        public void onRequestNotification() {
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (Build.VERSION.SDK_INT >= 33) {
+                        ActivityCompat.requestPermissions(MainActivity.this,
+                            new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 100);
+                    } else {
+                        PermissionHelper.openAppDetails(MainActivity.this);
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
         public void onRequestOverlay() {
             handler.post(new Runnable() {
                 @Override
@@ -2100,7 +2145,10 @@ public class MainActivity extends AppCompatActivity {
             handler.post(new Runnable() {
                 @Override
                 public void run() {
-                    boolean ok = PermissionHelper.openAutoStartSettings(MainActivity.this);
+                    // 小米/红米优先直达权限编辑页（“后台弹出界面”是提醒能否弹出的关键）
+                    boolean ok = PermissionHelper.isMiui()
+                        ? PermissionHelper.openMiuiPopupPermission(MainActivity.this)
+                        : PermissionHelper.openAutoStartSettings(MainActivity.this);
                     Toast.makeText(MainActivity.this,
                         ok ? "如列表中有「石大课表」请允许自启动；找不到说明本机无此开关"
                            : "未能打开自启动设置，请到系统设置里手动允许",

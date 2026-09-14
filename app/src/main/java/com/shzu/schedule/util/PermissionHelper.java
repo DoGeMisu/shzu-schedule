@@ -113,6 +113,95 @@ public class PermissionHelper {
         }
     }
 
+    /** 通知权限是否已开启 */
+    public static boolean hasNotificationPermission(Context ctx) {
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                return ctx.checkSelfPermission("android.permission.POST_NOTIFICATIONS")
+                    == android.content.pm.PackageManager.PERMISSION_GRANTED;
+            }
+            android.app.NotificationManager nm =
+                (android.app.NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+            return nm != null && nm.areNotificationsEnabled();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** 当前机型厂商（小写） */
+    public static String manufacturer() {
+        String m = android.os.Build.MANUFACTURER;
+        return m == null ? "" : m.toLowerCase();
+    }
+
+    /** 是否小米/红米（有"后台弹出界面"这道额外限制） */
+    public static boolean isMiui() {
+        String m = manufacturer();
+        return m.contains("xiaomi") || m.contains("redmi") || m.contains("poco");
+    }
+
+    /**
+     * 本机需要手动开启的权限指引（按厂商给具体路径）
+     * 国产 ROM 对"后台弹窗 / 自启动 / 省电策略"常有额外限制，且没有统一 API，
+     * 只能明确告诉用户去哪个开关，否则不熟悉手机设置的用户根本找不到。
+     */
+    public static String guideText() {
+        String m = manufacturer();
+        StringBuilder sb = new StringBuilder();
+        if (isMiui()) {
+            sb.append("小米/红米（MIUI、HyperOS）\n")
+              .append("1）设置 → 应用设置 → 应用管理 → 石大课表 → 权限管理 → 「后台弹出界面」设为允许\n")
+              .append("2）设置 → 应用设置 → 应用管理 → 石大课表 → 省电策略 → 无限制\n")
+              .append("3）设置 → 应用设置 → 应用管理 → 石大课表 → 自启动 → 允许\n")
+              .append("（第 1 步最关键：不开的话提醒弹不出来，只会发通知）");
+        } else if (m.contains("huawei") || m.contains("honor")) {
+            sb.append("华为/荣耀（EMUI、HarmonyOS）\n")
+              .append("1）设置 → 应用 → 应用启动管理 → 石大课表 → 关闭「自动管理」，手动打开：自启动 / 关联启动 / 后台活动\n")
+              .append("2）设置 → 应用 → 应用管理 → 石大课表 → 权限 → 悬浮窗 → 允许\n")
+              .append("3）设置 → 电池 → 更多电池设置 → 关闭「休眠时始终保持网络连接」以外的省电限制");
+        } else if (m.contains("oppo") || m.contains("realme") || m.contains("oneplus")) {
+            sb.append("OPPO / realme / 一加（ColorOS）\n")
+              .append("1）设置 → 应用管理 → 石大课表 → 权限管理 → 悬浮窗 → 允许\n")
+              .append("2）设置 → 应用管理 → 石大课表 → 耗电管理 → 允许后台活动 / 允许自启动\n")
+              .append("3）最近任务界面下拉卡片 → 加锁（防止被一键清理）");
+        } else if (m.contains("vivo") || m.contains("iqoo")) {
+            sb.append("vivo / iQOO（OriginOS）\n")
+              .append("1）设置 → 应用与权限 → 权限管理 → 石大课表 → 悬浮窗 → 允许\n")
+              .append("2）设置 → 应用与权限 → 应用管理 → 石大课表 → 权限 → 自启动 → 允许\n")
+              .append("3）设置 → 电池 → 后台高耗电 → 允许石大课表后台运行");
+        } else if (m.contains("meizu") || m.contains("flyme")) {
+            sb.append("魅族（Flyme）\n")
+              .append("1）设置 → 应用管理 → 石大课表 → 权限管理 → 悬浮窗 → 允许\n")
+              .append("2）手机管家 → 权限管理 → 后台管理 → 石大课表 → 允许后台运行");
+        } else if (m.contains("samsung")) {
+            sb.append("三星（One UI）\n")
+              .append("1）设置 → 应用程序 → 石大课表 → 权限 → 显示在其他应用上层 → 允许\n")
+              .append("2）设置 → 电池 → 后台使用限制 → 从「深度休眠应用」中移除石大课表");
+        } else {
+            sb.append("通用步骤（各机型大同小异）\n")
+              .append("1）在系统设置里找到「石大课表」，把「悬浮窗 / 显示在其他应用上层」设为允许\n")
+              .append("2）把它的「自启动 / 后台运行 / 省电策略」设为允许或不限制\n")
+              .append("3）在最近任务里给它加锁，避免被一键清理");
+        }
+        return sb.toString();
+    }
+
+    /** 小米：直达"后台弹出界面"权限编辑页 */
+    public static boolean openMiuiPopupPermission(Context ctx) {
+        try {
+            Intent i = new Intent("miui.intent.action.APP_PERM_EDITOR");
+            i.setClassName("com.miui.securitycenter",
+                "com.miui.permcenter.permissions.PermissionsEditorActivity");
+            i.putExtra("extra_pkgname", ctx.getPackageName());
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            ctx.startActivity(i);
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "open miui permission editor failed", e);
+        }
+        return openAppDetails(ctx);
+    }
+
     /** 电池优化白名单是否已加入 */
     public static boolean isIgnoringBatteryOptimizations(Context ctx) {
         try {
