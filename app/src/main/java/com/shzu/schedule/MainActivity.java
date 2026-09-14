@@ -1247,12 +1247,15 @@ public class MainActivity extends AppCompatActivity {
         sb.append("to{opacity:1;transform:translateY(0);}}");
         sb.append(".course{animation:fadeIn 0.18s ease-out both;}");
         // 课程详情弹窗
-        sb.append(".modal-bg{display:none;position:fixed;top:0;left:0;width:100%;height:100%;");
-        sb.append("background:rgba(0,0,0,0.4);z-index:100;}");
-        sb.append(".modal-bg.show{display:flex;align-items:center;justify-content:center;}");
+        // 弹窗常驻渲染树（用 visibility/opacity 控制显隐），避免首次打开时重新布局造成卡顿
+        sb.append(".modal-bg{display:flex;align-items:center;justify-content:center;position:fixed;");
+        sb.append("top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.4);z-index:100;");
+        sb.append("visibility:hidden;opacity:0;pointer-events:none;transition:opacity 0.16s ease;}");
+        sb.append(".modal-bg.show{visibility:visible;opacity:1;pointer-events:auto;}");
         sb.append(".modal{background:var(--modal);border-radius:16px;width:85%;max-width:340px;");
         sb.append("padding:20px;box-shadow:0 8px 32px rgba(0,0,0,0.3);");
-        sb.append("will-change:transform,opacity;transition:background-color 0.3s ease;}");
+        sb.append("will-change:transform,opacity;transform:translateZ(0);");
+        sb.append("transition:background-color 0.3s ease;}");
         sb.append("@keyframes slideUp{from{transform:translateY(30px);opacity:0;}");
         sb.append("to{transform:translateY(0);opacity:1;}}");
         sb.append(".modal h2{font-size:16px;font-weight:700;margin-bottom:12px;color:var(--fg);}");
@@ -1279,6 +1282,8 @@ public class MainActivity extends AppCompatActivity {
         sb.append("border-bottom:2px solid transparent;}");
         sb.append(".tab.active{color:#667eea;border-bottom-color:#667eea;font-weight:600;}");
         sb.append(".tab-content{padding:16px 20px;overflow-y:auto;-webkit-overflow-scrolling:touch;flex:1 1 auto;}");
+        sb.append("@keyframes tabIn{from{opacity:0;transform:translateX(14px);}to{opacity:1;transform:translateX(0);}}");
+        sb.append(".tab-in{animation:tabIn 0.22s ease-out;}");
         sb.append(".settings-item{display:flex;justify-content:space-between;align-items:center;");
         sb.append("padding:14px 0;border-bottom:1px solid var(--line);}");
         sb.append(".settings-item .si-label{font-size:15px;color:var(--fg);}");
@@ -1628,7 +1633,7 @@ public class MainActivity extends AppCompatActivity {
         sb.append("    var card=this;");
         sb.append("    pressX=e.touches[0].clientX;pressY=e.touches[0].clientY;");
         sb.append("    if(dragMode){startLift(card);}");
-        sb.append("    else{pressTimer=setTimeout(function(){pressTimer=null;startLift(card);},500);}");
+        sb.append("    else{pressTimer=setTimeout(function(){pressTimer=null;startLift(card);if(window.Android&&Android.onDragStart)Android.onDragStart();},700);}");
         sb.append("  },false);");
         sb.append("  el.addEventListener('touchmove',function(e){");
         sb.append("    if(dragEl===this){");
@@ -1735,9 +1740,13 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  if(b)b.style.display=url?'inline-block':'none';}");
         sb.append("updateThemeBtn('").append("dark".equals(theme) ? "dark" : "light").append("');");
         sb.append("function switchTab(i){");
-        sb.append("  document.getElementById('tabAccount').style.display=i===0?'block':'none';");
-        sb.append("  document.getElementById('tabGeneral').style.display=i===1?'block':'none';");
+        sb.append("  var acc=document.getElementById('tabAccount'),gen=document.getElementById('tabGeneral');");
+        sb.append("  acc.style.display=i===0?'block':'none';");
+        sb.append("  gen.style.display=i===1?'block':'none';");
         sb.append("  document.querySelectorAll('.tab').forEach(function(t,idx){t.classList.toggle('active',idx===i);});");
+        // 切换动画：内容淡入 + 轻微右移
+        sb.append("  var cur=i===0?acc:gen;");
+        sb.append("  if(cur){cur.classList.remove('tab-in');void cur.offsetHeight;cur.classList.add('tab-in');}");
         sb.append("}");
         sb.append("</script>");
         sb.append("</body></html>");
@@ -2040,6 +2049,27 @@ public class MainActivity extends AppCompatActivity {
                         Toast.makeText(MainActivity.this, "已清除图片背景", Toast.LENGTH_SHORT).show();
                     } catch (Exception e) {
                         Log.e(TAG, "clear bg error", e);
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void onDragStart() {
+            // 长按进入拖动模式：轻震一下给用户明确反馈
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        android.os.Vibrator v = (android.os.Vibrator) getSystemService(VIBRATOR_SERVICE);
+                        if (v != null && v.hasVibrator()) {
+                            if (Build.VERSION.SDK_INT >= 26) {
+                                v.vibrate(android.os.VibrationEffect.createOneShot(30, 80));
+                            } else {
+                                v.vibrate(30);
+                            }
+                        }
+                    } catch (Exception ignored) {
                     }
                 }
             });
