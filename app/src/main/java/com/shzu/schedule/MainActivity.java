@@ -128,6 +128,8 @@ public class MainActivity extends AppCompatActivity {
 
         setupWebView();
         playSplashAnimation();
+        // 启动课程提醒前台服务（自建定时器，不依赖系统闹钟）
+        ReminderService.start(this);
         startApp();
     }
 
@@ -170,6 +172,31 @@ public class MainActivity extends AppCompatActivity {
             Log.e(TAG, "splash animation error", e);
             splashOverlay.setVisibility(View.GONE);
         }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // 从系统权限页返回后刷新设置页权限状态
+        refreshPermissionUi();
+    }
+
+    /** 把悬浮窗/后台运行权限状态同步到设置页 */
+    private void refreshPermissionUi() {
+        final boolean overlay = ReminderOverlay.canDraw(this);
+        final boolean battery = PermissionHelper.isIgnoringBatteryOptimizations(this);
+        handler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (webView == null) return;
+                try {
+                    webView.evaluateJavascript(
+                        "if(window.updatePermUi){updatePermUi(" + overlay + "," + battery + ")}",
+                        null);
+                } catch (Exception ignored) {
+                }
+            }
+        }, 250);
     }
 
     @Override
@@ -262,6 +289,7 @@ public class MainActivity extends AppCompatActivity {
             Log.d(TAG, "startApp: local data ok, rendering week " + tw);
             renderWeekSchedule(tw > 0 ? tw : 1);
             setupReminders();
+            ReminderService.start(this);
             return;
         }
         if (store.hasData()) {
@@ -786,6 +814,8 @@ public class MainActivity extends AppCompatActivity {
                 Log.d(TAG, "saved window " + store.getWindowStart() + "-" + store.getWindowEnd()
                     + " week1Monday=" + store.getWeek1Monday() + " todayWeek=" + store.todayWeek());
                 setupReminders();
+                // 课表数据更新 → 重算课程提醒时刻表
+                ReminderService.reload(this);
                 int tw = store.todayWeek();
                 renderWeekSchedule(tw > 0 ? tw : 1);
                 return;
@@ -965,7 +995,17 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".btns{display:flex;justify-content:center;gap:10px;margin-top:8px;}");
         sb.append(".btn{background:#F0F0F5;border:none;color:#555;font-size:12px;");
         sb.append("border-radius:16px;padding:6px 16px;}");
-        // 全局禁用文字选中：长按课程卡片拖动时不会误触发系统选词/复制弹窗
+        // 课程卡片右上角提醒铃铛：点击即开关该课提醒
+        sb.append(".course .bell{position:absolute;top:5px;right:5px;width:24px;height:24px;");
+        sb.append("border-radius:50%;display:flex;align-items:center;justify-content:center;");
+        sb.append("background:rgba(255,255,255,0.22);z-index:12;");
+        sb.append("transition:transform 0.18s ease,background 0.18s ease;}");
+        sb.append(".course .bell svg{width:15px;height:15px;fill:rgba(255,255,255,0.62);");
+        sb.append("transition:fill 0.18s ease;}");
+        sb.append(".course .bell.on{background:#FFECA8;}");
+        sb.append(".course .bell.on svg{fill:#D99400;}");
+        sb.append(".course .bell:active{transform:scale(0.85);}");
+        sb.append(".course.remind-on{box-shadow:inset 0 0 0 2px rgba(255,214,71,0.92);}");
         sb.append("*{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;}");
         sb.append(".modal input,.modal textarea{-webkit-user-select:auto;user-select:auto;}");
         sb.append(".grid{display:grid;grid-template-columns:34px repeat(7,1fr);gap:3px;");
@@ -1044,6 +1084,12 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".settings-item .si-desc{font-size:12px;color:#999;margin-top:2px;}");
         sb.append(".logout-btn{display:block;width:100%;margin-top:20px;background:#FF4444;color:#fff;");
         sb.append("border:none;border-radius:12px;padding:12px;font-size:15px;font-weight:600;}");
+        sb.append(".adv-btn{background:#F0F0F5;border:none;border-radius:10px;padding:8px 14px;");
+        sb.append("font-size:13px;color:#555;cursor:pointer;}");
+        sb.append(".perm-btn{background:#F0F0F5;border:1px solid #E4E4EC;border-radius:10px;");
+        sb.append("padding:8px 12px;font-size:13px;color:#555;cursor:pointer;}");
+        sb.append(".perm-btn.perm-ok{background:#E8F7EE;border-color:#3BB273;color:#2E8B57;font-weight:600;}");
+        sb.append(".si-hint{font-size:12px;color:#999;margin-top:8px;line-height:1.5;}");
         sb.append("</style></head><body>");
 
         // 头部
@@ -1128,9 +1174,17 @@ public class MainActivity extends AppCompatActivity {
                         if (k > 0) keysB.append(";;;");
                         keysB.append(courseKey(arr.optJSONObject(k)).replace("'", "\\'"));
                     }
-                    sb.append("<div class='course' style='--cc:").append(color)
+                    // 该格第一门课是否已设提醒
+                    String firstKey = courseKey(first);
+                    boolean hasReminder = store.getReminderKeys().contains(firstKey);
+                    sb.append("<div class='course" + (hasReminder ? " remind-on" : "") + "' style='--cc:").append(color)
                       .append(";background:var(--cc);animation-delay:").append((row + d) * 0.05).append("s' data-detail='")
                       .append(detail).append("' data-keys='").append(keysB).append("' data-day='").append(d).append("' data-row='").append(row).append("'>");
+                    // 右上角铃铛：点击开关该课提醒
+                    sb.append("<div class='bell").append(hasReminder ? " on" : "").append("' data-rkey='")
+                      .append(esc(firstKey)).append("' onclick='toggleBell(event,this)'>")
+                      .append("<svg viewBox='0 0 24 24'><path d='M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.63-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.64 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z'/></svg>")
+                      .append("</div>");
                     // 显示所有课程名（多门用换行分隔）
                     for (int k = 0; k < arr.length(); k++) {
                         JSONObject cc = arr.optJSONObject(k);
@@ -1186,8 +1240,39 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<div class='si-desc'>白色背景</div></div></div>");
         sb.append("<div class='settings-item'><div><div class='si-label'>课程颜色</div>");
         sb.append("<div class='si-desc'>相同课程相同颜色</div></div></div>");
-        sb.append("<div class='settings-item'><div><div class='si-label'>提醒功能</div>");
-        sb.append("<div class='si-desc'>窗口末周自动提醒</div></div></div>");
+        // 提醒提前时间选择器
+        int curAdvance = store != null ? store.getAdvanceMinutes() : 15;
+        sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
+        sb.append("<div><div class='si-label'>提醒提前时间</div>");
+        sb.append("<div class='si-desc'>上课前提前多久通知</div></div>");
+        sb.append("<div style='display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;'>");
+        int[] options = {5, 10, 15, 20, 30, 45, 60};
+        for (int opt : options) {
+            String sel = (opt == curAdvance) ? "style='background:#667eea;color:#fff;'" : "";
+            sb.append("<button class='adv-btn' onclick='setAdvance(").append(opt).append(")' ")
+              .append(sel).append(">").append(opt).append("分钟</button>");
+        }
+        sb.append("</div></div>");
+        // 提醒权限：悬浮窗 / 自启动 / 后台运行
+        sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
+        sb.append("<div><div class='si-label'>提醒权限</div>");
+        sb.append("<div class='si-desc'>开启后即使退出应用，到点也能弹出提醒页面</div></div>");
+        sb.append("<div style='display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;'>");
+        sb.append("<button class='perm-btn' id='permOverlay' onclick='Android.onRequestOverlay()'>悬浮窗权限</button>");
+        sb.append("<button class='perm-btn' id='permAutoStart' onclick='Android.onRequestAutoStart()'>自启动权限</button>");
+        sb.append("<button class='perm-btn' id='permBattery' onclick='Android.onRequestBattery()'>后台运行权限</button>");
+        sb.append("</div>");
+        sb.append("<div class='si-hint' id='permHint'>悬浮窗权限：检测中…</div>");
+        sb.append("</div>");
+        // 调试：10 秒后弹测试提醒
+        sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
+        sb.append("<div><div class='si-label'>提醒调试</div>");
+        sb.append("<div class='si-desc'>10 秒后弹出一条测试提醒，可退回桌面验证弹窗</div></div>");
+        sb.append("<button class='adv-btn' style='margin-top:10px;background:#667eea;color:#fff;' ");
+        sb.append("onclick='Android.onDebugReminder(10)'>测试提醒（10 秒后）</button>");
+        sb.append("</div>");
+        sb.append("<div class='settings-item'><div><div class='si-label'>窗口末周提醒</div>");
+        sb.append("<div class='si-desc'>课表周期结束前三天提醒更新</div></div></div>");
         sb.append("</div>");
         sb.append("</div></div>");
 
@@ -1339,6 +1424,17 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  var dx=touchEndX-touchStartX;");
         sb.append("  if(Math.abs(dx)>80){Android.onWeekChanged(").append(week + "+(dx>0?-1:1)").append(");}");
         sb.append("},false);");
+        // ===== 课程卡片铃铛：点击开关该课提醒 =====
+        sb.append("function toggleBell(ev,el){");
+        sb.append("  ev.stopPropagation();");
+        sb.append("  var key=el.getAttribute('data-rkey')||'';");
+        sb.append("  if(!key)return;");
+        sb.append("  var on=!el.classList.contains('on');");
+        sb.append("  el.classList.toggle('on',on);");
+        sb.append("  var card=el.closest('.course');");
+        sb.append("  if(card)card.classList.toggle('remind-on',on);");
+        sb.append("  Android.onToggleCourseReminder(key,on);");
+        sb.append("}");
         // 弹窗（课程详情：反向缩回卡片，背景色同步还原；设置：直接关闭）
         sb.append("function closeModal(){");
         sb.append("  var modal=document.getElementById('courseModal');var mEl=document.querySelector('#courseModal .modal');var r=window.__cardRect;");
@@ -1357,8 +1453,23 @@ public class MainActivity extends AppCompatActivity {
         sb.append("    setTimeout(function(){modal.classList.remove('show');mEl.style.transition='';mEl.style.transform='';mEl.style.opacity='';mEl.style.background='';},230);");
         sb.append("  }else{modal.classList.remove('show');mEl.style.background='';}");
         sb.append("}");
-        sb.append("function showSettings(){document.getElementById('settingsModal').classList.add('show');}");
+        sb.append("function updatePermUi(overlay,battery){");
+        sb.append("  var o=document.getElementById('permOverlay');");
+        sb.append("  if(o){if(overlay){o.classList.add('perm-ok');o.textContent='悬浮窗权限 已开启';}");
+        sb.append("  else{o.classList.remove('perm-ok');o.textContent='悬浮窗权限 未开启';}}");
+        sb.append("  var b=document.getElementById('permBattery');");
+        sb.append("  if(b){if(battery){b.classList.add('perm-ok');b.textContent='后台运行 已允许';}");
+        sb.append("  else{b.classList.remove('perm-ok');b.textContent='后台运行权限';}}");
+        sb.append("  var h=document.getElementById('permHint');");
+        sb.append("  if(h){h.textContent=overlay?'悬浮窗已开启，提醒可弹出在任意界面之上':'请开启悬浮窗权限，否则提醒只能以通知形式显示';}");
+        sb.append("}");
+        sb.append("function showSettings(){document.getElementById('settingsModal').classList.add('show');");
+        sb.append("if(window.Android&&Android.onSettingsOpened)Android.onSettingsOpened();}");
         sb.append("function closeSettings(){document.getElementById('settingsModal').classList.remove('show');}");
+        sb.append("function setAdvance(m){Android.onSetAdvance(m);");
+        sb.append("document.querySelectorAll('.adv-btn').forEach(function(b){");
+        sb.append("b.style.background='';b.style.color='';});");
+        sb.append("event.target.style.background='#667eea';event.target.style.color='#fff';}");
         sb.append("function switchTab(i){");
         sb.append("  document.getElementById('tabAccount').style.display=i===0?'block':'none';");
         sb.append("  document.getElementById('tabGeneral').style.display=i===1?'block':'none';");
@@ -1557,6 +1668,109 @@ public class MainActivity extends AppCompatActivity {
             handler.post(() -> {
                 Log.d(TAG, "moves cancelled, re-render week " + week);
                 renderWeekSchedule(week);
+            });
+        }
+
+        @JavascriptInterface
+        public void onToggleCourseReminder(String key, final boolean on) {
+            if (key == null || key.isEmpty()) return;
+            final String k = key;
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        if (store == null) store = new ScheduleStore(MainActivity.this);
+                        java.util.Set<String> keys = store.getReminderKeys();
+                        if (on) keys.add(k); else keys.remove(k);
+                        store.saveReminderKeys(keys);
+                        ReminderService.reload(MainActivity.this);
+                        String name = k.split("\\|")[0];
+                        Toast.makeText(MainActivity.this,
+                            on ? "已开启「" + name + "」上课提醒（共 " + keys.size() + " 门）"
+                               : "已关闭「" + name + "」上课提醒",
+                            Toast.LENGTH_SHORT).show();
+                        Log.d(TAG, "toggle reminder " + (on ? "on" : "off") + ": " + k);
+                    } catch (Exception e) {
+                        Log.e(TAG, "toggle reminder error", e);
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void onSetAdvance(int minutes) {
+            handler.post(() -> {
+                if (store == null) store = new ScheduleStore(MainActivity.this);
+                store.setAdvanceMinutes(minutes);
+                Log.d(TAG, "advance set to " + minutes + " minutes");
+                // 提前量变了 → 重算提醒时刻表
+                ReminderService.reload(MainActivity.this);
+                Toast.makeText(MainActivity.this,
+                    "提醒提前量已设为 " + minutes + " 分钟",
+                    Toast.LENGTH_SHORT).show();
+            });
+        }
+
+        @JavascriptInterface
+        public void onSettingsOpened() {
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    refreshPermissionUi();
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void onRequestOverlay() {
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    PermissionHelper.openOverlaySettings(MainActivity.this);
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void onRequestAutoStart() {
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    boolean ok = PermissionHelper.openAutoStartSettings(MainActivity.this);
+                    Toast.makeText(MainActivity.this,
+                        ok ? "请在列表中找到「石大课表」并允许自启动"
+                           : "未找到自启动设置页，请在系统设置中手动允许自启动",
+                        Toast.LENGTH_LONG).show();
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void onRequestBattery() {
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    PermissionHelper.openBatterySettings(MainActivity.this);
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void onDebugReminder(final int seconds) {
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    int sec = seconds <= 0 ? 10 : seconds;
+                    if (!ReminderOverlay.canDraw(MainActivity.this)) {
+                        Toast.makeText(MainActivity.this,
+                            "悬浮窗权限未开启，提醒将以通知形式显示",
+                            Toast.LENGTH_LONG).show();
+                    }
+                    ReminderService.debug(MainActivity.this, sec);
+                    Toast.makeText(MainActivity.this,
+                        sec + " 秒后弹出测试提醒，可退回桌面查看",
+                        Toast.LENGTH_SHORT).show();
+                }
             });
         }
 

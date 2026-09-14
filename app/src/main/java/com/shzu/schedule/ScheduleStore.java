@@ -29,8 +29,11 @@ public class ScheduleStore {
 
     private static final String PREFS = "schedule_store";
     private static final String KEY_DATA = "data";
+    private static final String KEY_REMINDERS = "course_reminders";  // 已选提醒课程 JSON Set
+    private static final String KEY_ADVANCE = "reminder_advance";   // 全局提前量（分钟）
     private static final long DAY = 86400000L;
     private static final int DATA_VERSION = 13; // 递增以清除旧版/测试数据（v13: 清除拖动测试期写入的坏 overrides）
+    private static final int DEFAULT_ADVANCE = 15; // 默认提前15分钟
 
     private final SharedPreferences prefs;
     private long week1Monday = 0;
@@ -106,6 +109,42 @@ public class ScheduleStore {
         windowEnd = 0;
         totalWeeks = 0;
         courses = null;
+    }
+
+    // ====== 课程提醒 ======
+
+    /** 获取全局提前量（分钟），默认15 */
+    public int getAdvanceMinutes() {
+        return prefs.getInt(KEY_ADVANCE, DEFAULT_ADVANCE);
+    }
+
+    /** 设置全局提前量（分钟） */
+    public void setAdvanceMinutes(int minutes) {
+        prefs.edit().putInt(KEY_ADVANCE, minutes).apply();
+    }
+
+    /** 获取已选提醒课程的 key 集合（courseKey 字符串数组），空集返回长度0 */
+    public java.util.Set<String> getReminderKeys() {
+        String json = prefs.getString(KEY_REMINDERS, null);
+        java.util.Set<String> set = new java.util.HashSet<>();
+        if (json == null) return set;
+        try {
+            JSONArray arr = new JSONArray(json);
+            for (int i = 0; i < arr.length(); i++) set.add(arr.getString(i));
+        } catch (Exception ignored) {}
+        return set;
+    }
+
+    /** 保存提醒课程 key 集合（全量覆盖） */
+    public void saveReminderKeys(java.util.Set<String> keys) {
+        JSONArray arr = new JSONArray();
+        for (String k : keys) arr.put(k);
+        prefs.edit().putString(KEY_REMINDERS, arr.toString()).apply();
+    }
+
+    /** 判断某课程是否已设提醒 */
+    public boolean isReminder(String courseKey) {
+        return getReminderKeys().contains(courseKey);
     }
 
     /** 用户拖动产生的位置覆盖表（courseKey → {d,r}），无则返回null */
