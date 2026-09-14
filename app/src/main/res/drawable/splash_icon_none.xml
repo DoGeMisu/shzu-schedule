@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 完全透明的占位图标，使 Android 12+ 系统开屏不显示任何图标 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="oval">
+    <solid android:color="#00000000" />
+    <size android:width="48dp" android:height="48dp" />
+</shape>

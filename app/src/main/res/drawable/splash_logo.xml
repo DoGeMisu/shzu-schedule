@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="140dp"
+    android:height="140dp"
+    android:viewportWidth="200"
+    android:viewportHeight="200">
+
+    <!-- 外环：校徽式圆环 -->
+    <path
+        android:strokeColor="#2C3E50"
+        android:strokeWidth="5"
+        android:fillColor="#00000000"
+        android:pathData="M100,15 a85,85 0 1,0 0.001,0 z" />
+
+    <!-- 内环 -->
+    <path
+        android:strokeColor="#2C3E50"
+        android:strokeWidth="2.5"
+        android:fillColor="#00000000"
+        android:pathData="M100,27 a73,73 0 1,0 0.001,0 z" />
+
+    <!-- 课表网格：外框 -->
+    <path
+        android:strokeColor="#667eea"
+        android:strokeWidth="6"
+        android:fillColor="#00000000"
+        android:pathData="M55,60 L145,60 L145,140 L55,140 z" />
+
+    <!-- 网格横线 -->
+    <path
+        android:strokeColor="#667eea"
+        android:strokeWidth="4"
+        android:pathData="M55,80 L145,80" />
+    <path
+        android:strokeColor="#667eea"
+        android:strokeWidth="4"
+        android:pathData="M55,100 L145,100" />
+    <path
+        android:strokeColor="#667eea"
+        android:strokeWidth="4"
+        android:pathData="M55,120 L145,120" />
+
+    <!-- 网格竖线 -->
+    <path
+        android:strokeColor="#667eea"
+        android:strokeWidth="4"
+        android:pathData="M85,60 L85,140" />
+    <path
+        android:strokeColor="#667eea"
+        android:strokeWidth="4"
+        android:pathData="M115,60 L115,140" />
+
+    <!-- 课表中的一门课：色块 -->
+    <path
+        android:fillColor="#FF6B6B"
+        android:pathData="M59,64 L81,64 L81,76 L59,76 z" />
+    <path
+        android:fillColor="#4ECDC4"
+        android:pathData="M119,84 L141,84 L141,96 L119,96 z" />
+    <path
+        android:fillColor="#FFEAA7"
+        android:pathData="M89,104 L111,104 L111,116 L89,116 z" />
+
+</vector>

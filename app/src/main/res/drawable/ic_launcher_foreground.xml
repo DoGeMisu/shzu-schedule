@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Calendar icon -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M38,30 L42,30 L42,26 L46,26 L46,30 L62,30 L62,26 L66,26 L66,30 L70,30 C72.2,30 74,31.8 74,34 L74,70 C74,72.2 72.2,74 70,74 L38,74 C35.8,74 34,72.2 34,70 L34,34 C34,31.8 35.8,30 38,30 Z M38,38 L38,70 L70,70 L70,38 Z" />
+    <!-- Calendar grid lines -->
+    <path
+        android:fillColor="#667eea"
+        android:pathData="M38,46 L70,46 L70,48 L38,48 Z" />
+    <path
+        android:fillColor="#667eea"
+        android:pathData="M38,56 L70,56 L70,58 L38,58 Z" />
+    <path
+        android:fillColor="#667eea"
+        android:pathData="M49,38 L51,38 L51,70 L49,70 Z" />
+    <path
+        android:fillColor="#667eea"
+        android:pathData="M57,38 L59,38 L59,70 L57,70 Z" />
+</vector>
