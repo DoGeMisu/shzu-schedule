@@ -31,6 +31,8 @@ public class ScheduleStore {
     private static final String KEY_DATA = "data";
     private static final String KEY_REMINDERS = "course_reminders";  // 已选提醒课程 JSON Set
     private static final String KEY_ADVANCE = "reminder_advance";   // 全局提前量（分钟）
+    private static final String KEY_THEME = "theme";                // 课表主题 light/dark
+    private static final String KEY_BG = "bg_image";                // 自定义背景图文件名
     private static final long DAY = 86400000L;
     private static final int DATA_VERSION = 13; // 递增以清除旧版/测试数据（v13: 清除拖动测试期写入的坏 overrides）
     private static final int DEFAULT_ADVANCE = 15; // 默认提前15分钟
@@ -185,6 +187,36 @@ public class ScheduleStore {
         }
     }
 
+    /** 主题：light / dark */
+    public String getTheme() {
+        return prefs.getString(KEY_THEME, "light");
+    }
+
+    public void setTheme(String mode) {
+        prefs.edit().putString(KEY_THEME, (mode == null || mode.isEmpty()) ? "light" : mode).apply();
+    }
+
+    /** 自定义背景图文件名（空字符串=未设置） */
+    public String getBgImage() {
+        return prefs.getString(KEY_BG, "");
+    }
+
+    public void setBgImage(String fileName) {
+        prefs.edit().putString(KEY_BG, fileName == null ? "" : fileName).apply();
+    }
+
+    /** 清除所有拖动位置覆盖（恢复课程在课表中的原始位置） */
+    public void clearOverrides() {
+        try {
+            String json = prefs.getString(KEY_DATA, null);
+            if (json == null) return;
+            JSONObject obj = new JSONObject(json);
+            obj.remove("overrides");
+            prefs.edit().putString(KEY_DATA, obj.toString()).apply();
+        } catch (Exception ignored) {
+        }
+    }
+
     // ====== 保存（覆盖旧数据 = 删除上次课表） ======
 
     /**
@@ -216,20 +248,11 @@ public class ScheduleStore {
             }
 
             int todayW = parsedWeek > 0 ? parsedWeek : todayWeek();
-            int total = parsedTotal > 0 ? parsedTotal : (totalWeeks > 0 ? totalWeeks : todayW + 19);
+            int total = parsedTotal > 0 ? parsedTotal : Math.max(maxWeekOf(newCourses), todayW + 19);
 
-            // 新窗口起始规则：
-            // 首次 = 今天周次；已过期 = 从今天起新五周；
-            // 窗口末尾提前更新 = 旧窗口下一周起的后五周；周期内普通刷新 = 窗口不变
-            int start;
-            if (oldEnd > 0) {
-                if (todayW > oldEnd) start = Math.max(todayW, 1);
-                else if (ending) start = oldEnd + 1;
-                else start = Math.max(oldStart, 1);
-            } else {
-                start = Math.max(todayW, 1);
-            }
-            int end = Math.min(start + 4, Math.max(start, total));
+            // 整学期课表：窗口固定为 1..总周数（不再按五周滚动）
+            int start = 1;
+            int end = Math.max(total, 1);
 
             JSONObject obj = new JSONObject();
             obj.put("version", DATA_VERSION);
@@ -302,13 +325,12 @@ public class ScheduleStore {
     }
 
     /**
-     * 是否需要刷新抓取：
-     * 今天已超出窗口（新周期开始），或处于窗口末周周五及以后（提前3天更新后五周）
+     * 是否需要刷新抓取。
+     * 已改为一次性拉取整学期课表并保存本地，不再按五周窗口自动刷新；
+     * 课表更新由用户手动点“刷新课表”触发。
      */
     public boolean needsRefresh() {
-        int tw = todayWeek();
-        if (tw == 0 || windowEnd == 0) return false;
-        return tw > windowEnd || isEndingWindow();
+        return false;
     }
 
     // ====== 按周过滤课程 ======
@@ -324,6 +346,26 @@ public class ScheduleStore {
             if (weekMatches(weeks, week)) out.put(c);
         }
         return out;
+    }
+
+    /** 从课程数据推断最大周次（总周数兜底用） */
+    public static int maxWeekOf(JSONArray list) {
+        int max = 0;
+        if (list == null) return 0;
+        for (int i = 0; i < list.length(); i++) {
+            JSONObject c = list.optJSONObject(i);
+            if (c == null) continue;
+            String w = c.optString("weeks", "").replaceAll("\\[.*?\\]", "");
+            Matcher m = Pattern.compile("(\\d+)").matcher(w);
+            while (m.find()) {
+                try {
+                    int v = Integer.parseInt(m.group(1));
+                    if (v > max && v <= 40) max = v;
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        return max;
     }
 
     /**

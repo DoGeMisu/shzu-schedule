@@ -61,6 +61,7 @@ public class MainActivity extends AppCompatActivity {
 
     // ====== UI ======
     private WebView webView;
+    private android.widget.ImageView bgImageView;
     private View loadingOverlay;
     private View errorOverlay;
     private View splashOverlay;
@@ -105,6 +106,9 @@ public class MainActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
 
         webView = findViewById(R.id.webView);
+        bgImageView = findViewById(R.id.bgImage);
+        // WebView 透明：露出下层自定义背景图，切周重载时不会闪白
+        webView.setBackgroundColor(0x00000000);
         loadingOverlay = findViewById(R.id.loadingOverlay);
         errorOverlay = findViewById(R.id.errorOverlay);
         loadingText = findViewById(R.id.loadingText);
@@ -177,8 +181,34 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        applyAppBackground();
         // 从系统权限页返回后刷新设置页权限状态
         refreshPermissionUi();
+    }
+
+    /** 把主题底色与自定义背景图应用到 Activity 层（WebView 透明，切周不闪） */
+    private void applyAppBackground() {
+        try {
+            ScheduleStore s = store != null ? store : new ScheduleStore(this);
+            boolean dark = "dark".equals(s.getTheme());
+            String bgName = s.getBgImage();
+            java.io.File f = bgName.isEmpty() ? null : new java.io.File(getFilesDir(), bgName);
+            if (f != null && f.exists()) {
+                android.graphics.Bitmap bmp =
+                    android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath());
+                if (bmp != null) {
+                    bgImageView.setImageBitmap(bmp);
+                    bgImageView.setVisibility(View.VISIBLE);
+                }
+            } else {
+                bgImageView.setImageDrawable(null);
+                bgImageView.setVisibility(View.GONE);
+            }
+            View root = (View) webView.getParent();
+            if (root != null) root.setBackgroundColor(dark ? 0xFF0F1016 : 0xFFFFFFFF);
+        } catch (Exception e) {
+            Log.e(TAG, "applyAppBackground error", e);
+        }
     }
 
     /** 把悬浮窗/后台运行权限状态同步到设置页 */
@@ -197,6 +227,90 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
         }, 250);
+    }
+
+    // ====== 自定义图片背景（相册选图） ======
+
+    private static final int REQ_PICK_BG = 2001;
+
+    private void pickBackgroundImage() {
+        try {
+            Intent i = new Intent(Intent.ACTION_PICK,
+                android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
+            i.setType("image/*");
+            startActivityForResult(i, REQ_PICK_BG);
+        } catch (Exception e) {
+            Log.e(TAG, "pick bg failed", e);
+            Toast.makeText(this, "无法打开相册", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_PICK_BG && resultCode == RESULT_OK
+                && data != null && data.getData() != null) {
+            saveBackgroundImage(data.getData());
+        }
+    }
+
+    /** 读取相册选中的图片，压缩后存到应用私有目录，并应用到课表背景 */
+    private void saveBackgroundImage(final android.net.Uri uri) {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    java.io.InputStream in = getContentResolver().openInputStream(uri);
+                    if (in == null) return;
+                    android.graphics.Bitmap bmp = android.graphics.BitmapFactory.decodeStream(in);
+                    in.close();
+                    if (bmp == null) return;
+                    // 限制宽度，避免图片过大影响渲染
+                    int maxW = 1080;
+                    if (bmp.getWidth() > maxW) {
+                        int h = (int) (bmp.getHeight() * (maxW / (float) bmp.getWidth()));
+                        android.graphics.Bitmap scaled =
+                            android.graphics.Bitmap.createScaledBitmap(bmp, maxW, h, true);
+                        bmp.recycle();
+                        bmp = scaled;
+                    }
+                    // 文件名带时间戳：URL 变化后 WebView 会重新加载，而不是用缓存
+                    final String fileName = "user_bg_" + System.currentTimeMillis() + ".jpg";
+                    java.io.File out = new java.io.File(getFilesDir(), fileName);
+                    java.io.FileOutputStream fos = new java.io.FileOutputStream(out);
+                    bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, fos);
+                    fos.close();
+                    bmp.recycle();
+
+                    final String path = out.getAbsolutePath();
+                    handler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (store == null) store = new ScheduleStore(MainActivity.this);
+                            // 删掉上一张背景图，避免残留占空间
+                            String old = store.getBgImage();
+                            if (!old.isEmpty() && !old.equals(fileName)) {
+                                java.io.File f = new java.io.File(getFilesDir(), old);
+                                if (f.exists()) f.delete();
+                            }
+                            store.setBgImage(fileName);
+                            applyAppBackground();
+                            webView.evaluateJavascript(
+                                "applyBg('file://" + path + "')", null);
+                            Toast.makeText(MainActivity.this, "背景已更新", Toast.LENGTH_SHORT).show();
+                        }
+                    });
+                } catch (Exception e) {
+                    Log.e(TAG, "save bg failed", e);
+                    handler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            Toast.makeText(MainActivity.this, "设置背景失败", Toast.LENGTH_SHORT).show();
+                        }
+                    });
+                }
+            }
+        }).start();
     }
 
     @Override
@@ -228,6 +342,10 @@ public class MainActivity extends AppCompatActivity {
         s.setUseWideViewPort(true);
         s.setCacheMode(WebSettings.LOAD_DEFAULT);
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        // 允许 WebView 读取应用私有目录下的自定义背景图
+        s.setAllowFileAccess(true);
+        s.setAllowFileAccessFromFileURLs(true);
+        s.setAllowUniversalAccessFromFileURLs(true);
         // 移动端UA，确保CAS登录页按手机版布局渲染
         s.setUserAgentString("Mozilla/5.0 (Linux; Android 16; Pixel 6) AppleWebKit/537.36 "
             + "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
@@ -288,7 +406,6 @@ public class MainActivity extends AppCompatActivity {
             int tw = store.todayWeek();
             Log.d(TAG, "startApp: local data ok, rendering week " + tw);
             renderWeekSchedule(tw > 0 ? tw : 1);
-            setupReminders();
             ReminderService.start(this);
             return;
         }
@@ -640,12 +757,28 @@ public class MainActivity extends AppCompatActivity {
             + "    if(!useDate)useDate=zlDates[zlDates.length-1];"
             + "    var dStr=useDate.replace(/[年月]/g,'-').replace(/日/g,'');"
             + "    var parts=dStr.split('-');"
-            + "    if(parts.length>=3){"
-            + "      var y=parseInt(parts[0]),m=parseInt(parts[1]),da=parseInt(parts[2]);"
-            + "      result.week1Monday=new Date(y,m-1,da).getTime();"
-            + "    }"
-            + "  }"
-            + "}catch(e){}"
+             + "    if(parts.length>=3){"
+             + "      var y=parseInt(parts[0]),m=parseInt(parts[1]),da=parseInt(parts[2]);"
+             + "      result.week1Monday=new Date(y,m-1,da).getTime();"
+             + "    }"
+             // 用教学周历覆盖的日期范围推算学期总周数（比周次下拉框可靠，下拉框常带多余空周）
+             + "    if(result.week1Monday>0){"
+             + "      var maxTs=0;"
+             + "      for(var zj=0;zj<zlDates.length;zj++){"
+             + "        var zs=zlDates[zj].replace(/[年月]/g,'-').replace(/日/g,'');"
+             + "        var zp=zs.split('-');"
+             + "        if(zp.length>=3){"
+             + "          var zt=new Date(parseInt(zp[0]),parseInt(zp[1])-1,parseInt(zp[2])).getTime();"
+             + "          if(zt>maxTs)maxTs=zt;"
+             + "        }"
+             + "      }"
+             + "      if(maxTs>result.week1Monday){"
+             + "        var wks=Math.floor((maxTs-result.week1Monday)/(7*86400000))+1;"
+             + "        if(wks>=6&&wks<=30)result.totalWeeks=wks;"
+             + "      }"
+             + "    }"
+             + "  }"
+             + "}catch(e){}"
             // 从页面提取节次时间表（教务课表每个大节th自带时间，如"第一二节 10:00-11:40"）：th标签 > 页面文本
             + "try{"
             + "  var ptRes=[];"
@@ -772,6 +905,31 @@ public class MainActivity extends AppCompatActivity {
 
     // ====== 课表展示 ======
 
+    /**
+     * 清洗解析出的课程数据
+     * 教务页面底部有些文字（如“XX课程实习”）会被误解析成课程，行号会跑到 1-5 之外，
+     * 这里统一丢弃行号越界与无课名的条目，避免脏数据写进存储。
+     */
+    private static JSONArray sanitizeCourses(JSONArray in) {
+        if (in == null) return null;
+        JSONArray out = new JSONArray();
+        for (int i = 0; i < in.length(); i++) {
+            JSONObject c = in.optJSONObject(i);
+            if (c == null) continue;
+            int day = c.optInt("day", 0);
+            int row = c.optInt("row", 0);
+            if (day < 1 || day > 7 || row < 1 || row > 5) continue;
+            String name = c.optString("name", "").trim();
+            if (name.isEmpty()) continue;
+            out.put(c);
+        }
+        if (out.length() != in.length()) {
+            Log.d(TAG, "sanitizeCourses: dropped " + (in.length() - out.length())
+                + " invalid entries");
+        }
+        return out;
+    }
+
     private void displaySchedule(String json) {
         parseResultReceived = true;
         try {
@@ -796,6 +954,9 @@ public class MainActivity extends AppCompatActivity {
             // 注意：optString("error") 会把 JSON null 读成字符串 "null"，必须用 opt + NULL 判断
             Object errObj = obj.opt("error");
             boolean hasError = errObj != null && errObj != JSONObject.NULL;
+            // 清洗解析结果：丢弃行号越界(非1-5大节)、无课名的解析残留
+            // （教务页面底部文字会被误当成课程，行号会算到 1-5 之外）
+            courses = sanitizeCourses(courses);
             int n = courses == null ? 0 : courses.length();
             int parsedWeek = obj.optInt("currentWeek", 0);
             int parsedTotal = obj.optInt("totalWeeks", 0);
@@ -813,7 +974,6 @@ public class MainActivity extends AppCompatActivity {
                 store.save(this, parsedWeek, parsedTotal, parsedWeek1Monday, parsedTimes, courses, oldStart, oldEnd, ending);
                 Log.d(TAG, "saved window " + store.getWindowStart() + "-" + store.getWindowEnd()
                     + " week1Monday=" + store.getWeek1Monday() + " todayWeek=" + store.todayWeek());
-                setupReminders();
                 // 课表数据更新 → 重算课程提醒时刻表
                 ReminderService.reload(this);
                 int tw = store.todayWeek();
@@ -980,20 +1140,28 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<meta name='viewport' content='width=device-width,initial-scale=1.0'>");
         sb.append("<style>");
         sb.append("*{margin:0;padding:0;box-sizing:border-box;}");
+        // 主题变量：浅色（默认）/ 深色，背景与文字带过渡动画
+        sb.append(":root{--bg:#FFFFFF;--fg:#333;--sub:#999;--card:#F0F0F5;--card2:#F8F8FA;");
+        sb.append("--line:#F0F0F5;--empty:#FAFAFC;--modal:#FFFFFF;}");
+        sb.append("body.dark{--bg:#0F1016;--fg:#E9E9F2;--sub:#A9A9BE;--card:#1E1F2A;--card2:#161722;");
+        sb.append("--line:#2A2B38;--empty:#191A24;--modal:#1A1B26;}");
         sb.append("body{font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;");
-        sb.append("background:#FFFFFF;height:100vh;color:#333;padding:12px 8px 0 8px;");
+        sb.append("background-color:var(--bg);height:100vh;color:var(--fg);padding:12px 8px 0 8px;");
+        sb.append("transition:background-color 0.35s ease,color 0.35s ease;");
         sb.append("display:flex;flex-direction:column;overflow:hidden;}");
+        // 有自定义背景图时页面背景透明，露出 Activity 层图片（切周不闪）
+        sb.append("body.hasbg{background-color:transparent;}");
         sb.append(".header{text-align:center;margin-bottom:10px;}");
-        sb.append(".header h1{font-size:20px;font-weight:700;color:#333;}");
+        sb.append(".header h1{font-size:20px;font-weight:700;color:var(--fg);}");
         sb.append(".toolbar{display:flex;justify-content:center;align-items:center;gap:12px;margin-top:8px;}");
-        sb.append(".wbtn{background:#F0F0F5;border:none;color:#555;");
+        sb.append(".wbtn{background:var(--card);border:none;color:var(--fg);");
         sb.append("font-size:16px;border-radius:20px;width:36px;height:36px;}");
         sb.append(".wbtn:disabled{opacity:0.3;}");
-        sb.append(".wlabel{font-size:16px;font-weight:700;min-width:64px;color:#333;}");
+        sb.append(".wlabel{font-size:16px;font-weight:700;min-width:64px;color:var(--fg);}");
         sb.append(".wdate{font-size:12px;color:#999;margin-top:4px;}");
         sb.append(".hint{text-align:center;font-size:12px;color:#888;margin-top:4px;}");
         sb.append(".btns{display:flex;justify-content:center;gap:10px;margin-top:8px;}");
-        sb.append(".btn{background:#F0F0F5;border:none;color:#555;font-size:12px;");
+        sb.append(".btn{background:var(--card);border:none;color:var(--fg);font-size:12px;");
         sb.append("border-radius:16px;padding:6px 16px;}");
         // 课程卡片右上角提醒铃铛：点击即开关该课提醒
         sb.append(".course .bell{position:absolute;top:5px;right:5px;width:24px;height:24px;");
@@ -1009,15 +1177,16 @@ public class MainActivity extends AppCompatActivity {
         sb.append("*{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;}");
         sb.append(".modal input,.modal textarea{-webkit-user-select:auto;user-select:auto;}");
         sb.append(".grid{display:grid;grid-template-columns:34px repeat(7,1fr);gap:3px;");
-        sb.append("flex:1;min-height:0;grid-auto-rows:1fr;background:#F8F8FA;border-radius:14px;padding:8px;}");
+        sb.append("flex:1;min-height:0;grid-auto-rows:1fr;background:var(--card2);border-radius:14px;padding:8px;");
+        sb.append("transition:background-color 0.35s ease;}");
         sb.append(".gh{text-align:center;font-weight:700;font-size:12px;padding:8px 2px;");
-        sb.append("background:#F0F0F5;border-radius:8px;color:#333;}");
+        sb.append("background:var(--card);border-radius:8px;color:var(--fg);}");
         sb.append(".gh-date{font-size:10px;font-weight:400;color:#999;margin-top:2px;}");
         sb.append(".gh.today{background:#667eea;color:#fff;}");
         sb.append(".gh.today .gh-date{color:#ddd;}");
         sb.append(".ts{font-size:10px;text-align:center;color:#777;");
         sb.append("display:flex;flex-direction:column;align-items:center;justify-content:center;");
-        sb.append("background:#F0F0F5;border-radius:8px;padding:4px 2px;line-height:1.15;}");
+        sb.append("background:var(--card);border-radius:8px;padding:4px 2px;line-height:1.15;}");
         sb.append(".ts .ts-time{font-size:8px;color:#aaa;margin-top:2px;}");
         sb.append(".course{border-radius:10px;padding:9px 7px;font-size:11px;");
         sb.append("display:flex;flex-direction:column;justify-content:flex-start;cursor:pointer;position:relative;overflow:hidden;");
@@ -1035,7 +1204,7 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".course .name{font-weight:700;margin-bottom:3px;line-height:1.25;");
         sb.append("font-size:12px;color:#fff;}");
         sb.append(".course .info{font-size:10px;opacity:0.9;line-height:1.4;color:#fff;}");
-        sb.append(".empty{background:#FAFAFC;border-radius:8px;}");
+        sb.append(".empty{background:var(--empty);border-radius:8px;}");
         sb.append(".grid-head{display:grid;grid-template-columns:34px repeat(7,1fr);gap:3px;margin-bottom:4px;padding:0 8px;}");
         // 拖动模式底部操作栏（横向拉长、低高度；拖动中下滑隐藏）
         sb.append(".dockbar{position:fixed;left:50%;bottom:10px;transform:translate(-50%,150%);");
@@ -1057,31 +1226,39 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".modal-bg{display:none;position:fixed;top:0;left:0;width:100%;height:100%;");
         sb.append("background:rgba(0,0,0,0.4);z-index:100;}");
         sb.append(".modal-bg.show{display:flex;align-items:center;justify-content:center;}");
-        sb.append(".modal{background:#fff;border-radius:16px;width:85%;max-width:340px;");
-        sb.append("padding:20px;box-shadow:0 8px 32px rgba(0,0,0,0.2);");
-        sb.append("will-change:transform,opacity;}");
+        sb.append(".modal{background:var(--modal);border-radius:16px;width:85%;max-width:340px;");
+        sb.append("padding:20px;box-shadow:0 8px 32px rgba(0,0,0,0.3);");
+        sb.append("will-change:transform,opacity;transition:background-color 0.3s ease;}");
         sb.append("@keyframes slideUp{from{transform:translateY(30px);opacity:0;}");
         sb.append("to{transform:translateY(0);opacity:1;}}");
-        sb.append(".modal h2{font-size:16px;font-weight:700;margin-bottom:12px;color:#333;}");
-        sb.append(".modal .row{display:flex;padding:8px 0;border-bottom:1px solid #F0F0F5;}");
-        sb.append(".modal .row .label{color:#999;font-size:13px;min-width:70px;}");
-        sb.append(".modal .row .val{color:#333;font-size:13px;flex:1;}");
+        sb.append(".modal h2{font-size:16px;font-weight:700;margin-bottom:12px;color:var(--fg);}");
+        sb.append(".modal .row{display:flex;padding:8px 0;border-bottom:1px solid var(--line);}");
+        sb.append(".modal .row .label{color:var(--sub);font-size:13px;min-width:70px;}");
+        sb.append(".modal .row .val{color:var(--fg);font-size:13px;flex:1;}");
+        sb.append(".modal #cmBody{max-height:58vh;overflow-y:auto;-webkit-overflow-scrolling:touch;}");
+        sb.append(".modal .cblock{margin-top:2px;}");
+        sb.append(".modal .cblock+.cblock{border-top:1px solid var(--line);margin-top:14px;padding-top:14px;}");
+        sb.append(".modal .cb-name{font-size:15px;font-weight:700;color:var(--fg);margin-bottom:4px;}");
+        sb.append(".modal .cb-tag{font-size:11px;color:var(--sub);font-weight:400;margin-left:6px;}");
         sb.append(".modal-close{display:block;margin:16px auto 0;background:#667eea;color:#fff;");
         sb.append("border:none;border-radius:12px;padding:8px 32px;font-size:14px;}");
         // 设置弹窗
-        sb.append(".settings-modal{background:#fff;border-radius:16px;width:88%;max-width:360px;");
-        sb.append("overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,0.2);");
-        sb.append("animation:slideUp 0.25s ease-out;}");
-        sb.append(".settings-modal h2{font-size:18px;font-weight:700;padding:20px 20px 12px;color:#333;}");
-        sb.append(".tab-bar{display:flex;border-bottom:1px solid #F0F0F5;}");
-        sb.append(".tab{flex:1;text-align:center;padding:10px;font-size:14px;color:#999;");
+        sb.append(".settings-modal{background:var(--modal);border-radius:16px;width:88%;max-width:360px;");
+        sb.append("overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,0.3);");
+        sb.append("animation:slideUp 0.25s ease-out;max-height:82vh;");
+        sb.append("display:flex;flex-direction:column;transition:background-color 0.3s ease;}");
+        // 标题与标签栏固定，仅内容区滚动
+        sb.append(".settings-modal h2{font-size:18px;font-weight:700;padding:20px 20px 12px;color:var(--fg);");
+        sb.append("flex:0 0 auto;}");
+        sb.append(".tab-bar{display:flex;border-bottom:1px solid var(--line);flex:0 0 auto;}");
+        sb.append(".tab{flex:1;text-align:center;padding:10px;font-size:14px;color:var(--sub);");
         sb.append("border-bottom:2px solid transparent;}");
         sb.append(".tab.active{color:#667eea;border-bottom-color:#667eea;font-weight:600;}");
-        sb.append(".tab-content{padding:16px 20px;}");
+        sb.append(".tab-content{padding:16px 20px;overflow-y:auto;-webkit-overflow-scrolling:touch;flex:1 1 auto;}");
         sb.append(".settings-item{display:flex;justify-content:space-between;align-items:center;");
-        sb.append("padding:14px 0;border-bottom:1px solid #F0F0F5;}");
-        sb.append(".settings-item .si-label{font-size:15px;color:#333;}");
-        sb.append(".settings-item .si-desc{font-size:12px;color:#999;margin-top:2px;}");
+        sb.append("padding:14px 0;border-bottom:1px solid var(--line);}");
+        sb.append(".settings-item .si-label{font-size:15px;color:var(--fg);}");
+        sb.append(".settings-item .si-desc{font-size:12px;color:var(--sub);margin-top:2px;}");
         sb.append(".logout-btn{display:block;width:100%;margin-top:20px;background:#FF4444;color:#fff;");
         sb.append("border:none;border-radius:12px;padding:12px;font-size:15px;font-weight:600;}");
         sb.append(".adv-btn{background:#F0F0F5;border:none;border-radius:10px;padding:8px 14px;");
@@ -1090,7 +1267,39 @@ public class MainActivity extends AppCompatActivity {
         sb.append("padding:8px 12px;font-size:13px;color:#555;cursor:pointer;}");
         sb.append(".perm-btn.perm-ok{background:#E8F7EE;border-color:#3BB273;color:#2E8B57;font-weight:600;}");
         sb.append(".si-hint{font-size:12px;color:#999;margin-top:8px;line-height:1.5;}");
-        sb.append("</style></head><body>");
+        // 空课周提示
+        sb.append(".emptyweek{grid-column:1/-1;text-align:center;color:var(--sub);font-size:13px;padding:40px 0;}");
+        // 自定义图片背景：卡片/控件半透明，文字保持原色
+        sb.append("body.hasbg .grid{background:transparent;}");
+        sb.append("body.hasbg .gh{background:rgba(240,240,245,0.62);}");
+        sb.append("body.hasbg .ts{background:rgba(240,240,245,0.62);}");
+        sb.append("body.hasbg .empty{background:transparent;}");
+        sb.append("body.hasbg .btn{background:rgba(240,240,245,0.62);}");
+        sb.append("body.hasbg .wbtn{background:rgba(240,240,245,0.62);}");
+        sb.append("body.hasbg .course{background:transparent;}");
+        sb.append("body.hasbg .course::before{content:'';position:absolute;inset:0;");
+        sb.append("background:var(--cc);opacity:0.84;z-index:0;}");
+        sb.append("body.hasbg .course .name,body.hasbg .course .info{position:relative;z-index:1;}");
+        sb.append("body.hasbg .course::after{opacity:0.84;}");
+        sb.append("body.hasbg.dark .grid{background:transparent;}");
+        sb.append("body.hasbg.dark .gh{background:rgba(30,31,42,0.62);}");
+        sb.append("body.hasbg.dark .ts{background:rgba(30,31,42,0.62);}");
+        sb.append("body.hasbg.dark .empty{background:transparent;}");
+        sb.append("body.hasbg.dark .btn{background:rgba(30,31,42,0.62);}");
+        sb.append("body.hasbg.dark .wbtn{background:rgba(30,31,42,0.62);}");
+        sb.append("body.hasbg.dark .course::before{opacity:0.88;}");
+        sb.append("body.hasbg.dark .course::after{opacity:0.88;}");
+        // 有自定义背景图时弹窗半透明（毛玻璃观感）
+        sb.append("body.hasbg .settings-modal{background:rgba(255,255,255,0.78);}");
+        sb.append("body.hasbg.dark .settings-modal{background:rgba(22,23,34,0.78);}");
+        sb.append("body.hasbg .modal-close{background:rgba(102,126,234,0.92);}");
+        // 应用主题与自定义背景图
+        String theme = store != null ? store.getTheme() : "light";
+        String bgName = store != null ? store.getBgImage() : "";
+        boolean hasBg = !bgName.isEmpty() && new java.io.File(getFilesDir(), bgName).exists();
+        sb.append("</style></head><body class='").append("dark".equals(theme) ? "dark" : "light")
+          .append(hasBg ? " hasbg" : "")
+          .append("'>");
 
         // 头部
         sb.append("<div class='header'>");
@@ -1143,9 +1352,10 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<div class='grid'>");
 
         int numRows = Math.min(maxRow, 5);
-        if (numRows == 0 && courses.length() == 0) {
-            sb.append("<div style='grid-column:1/-1;text-align:center;padding:40px 0;")
-              .append("color:#999;font-size:14px;'>本周没有课程</div>");
+        // 空课周：只显示提示，不渲染空空格子
+        if (courses.length() == 0) numRows = 0;
+        if (numRows == 0) {
+            sb.append("<div class='emptyweek'>这一周没有课程</div>");
         }
         for (int row = 1; row <= numRows; row++) {
             String label = row <= periodLabels.length ? periodLabels[row - 1] : row + "节";
@@ -1167,22 +1377,23 @@ public class MainActivity extends AppCompatActivity {
                     String firstName = first.optString("name", "").replaceAll("\\s+", " ").trim();
                     int ci = colorMap.getOrDefault(firstName, 0);
                     String color = colors[ci % colors.length];
-                    String detail = buildCourseDetail(first, week, label, time, color);
-                    // 格内所有课程的标识（拖动应用时整格一起持久化）
+                    // 详情包含该格所有课程（同一时段可能有多门重叠课）
+                    String detail = buildCourseDetailArray(arr, week, label, time, color);
+                    // 格内所有课程的标识（拖动/提醒均按整格处理）
                     StringBuilder keysB = new StringBuilder();
+                    boolean allOn = true;
+                    java.util.Set<String> rk = store.getReminderKeys();
                     for (int k = 0; k < arr.length(); k++) {
                         if (k > 0) keysB.append(";;;");
-                        keysB.append(courseKey(arr.optJSONObject(k)).replace("'", "\\'"));
+                        String ck = courseKey(arr.optJSONObject(k));
+                        keysB.append(ck.replace("'", "\\'"));
+                        if (!rk.contains(ck)) allOn = false;
                     }
-                    // 该格第一门课是否已设提醒
-                    String firstKey = courseKey(first);
-                    boolean hasReminder = store.getReminderKeys().contains(firstKey);
-                    sb.append("<div class='course" + (hasReminder ? " remind-on" : "") + "' style='--cc:").append(color)
+                    sb.append("<div class='course" + (allOn ? " remind-on" : "") + "' style='--cc:").append(color)
                       .append(";background:var(--cc);animation-delay:").append((row + d) * 0.05).append("s' data-detail='")
                       .append(detail).append("' data-keys='").append(keysB).append("' data-day='").append(d).append("' data-row='").append(row).append("'>");
-                    // 右上角铃铛：点击开关该课提醒
-                    sb.append("<div class='bell").append(hasReminder ? " on" : "").append("' data-rkey='")
-                      .append(esc(firstKey)).append("' onclick='toggleBell(event,this)'>")
+                    // 右上角铃铛：一键开关这一格所有课程的提醒
+                    sb.append("<div class='bell").append(allOn ? " on" : "").append("' onclick='toggleBell(event,this)'>")
                       .append("<svg viewBox='0 0 24 24'><path d='M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.63-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.64 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z'/></svg>")
                       .append("</div>");
                     // 显示所有课程名（多门用换行分隔）
@@ -1236,10 +1447,19 @@ public class MainActivity extends AppCompatActivity {
         sb.append("</div>");
         // 通用设置
         sb.append("<div class='tab-content' id='tabGeneral' style='display:none'>");
-        sb.append("<div class='settings-item'><div><div class='si-label'>课表背景</div>");
-        sb.append("<div class='si-desc'>白色背景</div></div></div>");
-        sb.append("<div class='settings-item'><div><div class='si-label'>课程颜色</div>");
-        sb.append("<div class='si-desc'>相同课程相同颜色</div></div></div>");
+        // 课表背景：深浅主题切换 + 自定义图片
+        sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
+        sb.append("<div><div class='si-label'>课表背景</div>");
+        sb.append("<div class='si-desc'>切换浅色/深色，或从相册选一张图片当背景</div></div>");
+        sb.append("<div style='display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;'>");
+        sb.append("<button class='adv-btn' id='themeLight' onclick='setTheme(\"light\")'>浅色</button>");
+        sb.append("<button class='adv-btn' id='themeDark' onclick='setTheme(\"dark\")'>深色</button>");
+        sb.append("<button class='adv-btn' onclick='Android.onPickBackground()'>选择图片背景</button>");
+        sb.append("<button class='adv-btn' id='clearBgBtn' style='display:").append(hasBg ? "inline-block" : "none")
+          .append(";background:#FFF0F0;color:#e55;' ");
+        sb.append("onclick='Android.onClearBackground()'>清除图片背景</button>");
+        sb.append("</div>");
+        sb.append("</div>");
         // 提醒提前时间选择器
         int curAdvance = store != null ? store.getAdvanceMinutes() : 15;
         sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
@@ -1249,30 +1469,28 @@ public class MainActivity extends AppCompatActivity {
         int[] options = {5, 10, 15, 20, 30, 45, 60};
         for (int opt : options) {
             String sel = (opt == curAdvance) ? "style='background:#667eea;color:#fff;'" : "";
-            sb.append("<button class='adv-btn' onclick='setAdvance(").append(opt).append(")' ")
+            sb.append("<button class='adv-btn adv-min' onclick='setAdvance(").append(opt).append(")' ")
               .append(sel).append(">").append(opt).append("分钟</button>");
         }
         sb.append("</div></div>");
         // 提醒权限：悬浮窗 / 自启动 / 后台运行
         sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
         sb.append("<div><div class='si-label'>提醒权限</div>");
-        sb.append("<div class='si-desc'>开启后即使退出应用，到点也能弹出提醒页面</div></div>");
+        sb.append("<div class='si-desc'>开启后即使退出应用，到点也能弹出提醒页面；再次点击可去系统设置里关闭</div></div>");
         sb.append("<div style='display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;'>");
         sb.append("<button class='perm-btn' id='permOverlay' onclick='Android.onRequestOverlay()'>悬浮窗权限</button>");
         sb.append("<button class='perm-btn' id='permAutoStart' onclick='Android.onRequestAutoStart()'>自启动权限</button>");
         sb.append("<button class='perm-btn' id='permBattery' onclick='Android.onRequestBattery()'>后台运行权限</button>");
         sb.append("</div>");
-        sb.append("<div class='si-hint' id='permHint'>悬浮窗权限：检测中…</div>");
+        sb.append("<div class='si-hint' id='permHint'>权限状态检测中…</div>");
         sb.append("</div>");
-        // 调试：10 秒后弹测试提醒
+        // 课程布局
         sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
-        sb.append("<div><div class='si-label'>提醒调试</div>");
-        sb.append("<div class='si-desc'>10 秒后弹出一条测试提醒，可退回桌面验证弹窗</div></div>");
-        sb.append("<button class='adv-btn' style='margin-top:10px;background:#667eea;color:#fff;' ");
-        sb.append("onclick='Android.onDebugReminder(10)'>测试提醒（10 秒后）</button>");
+        sb.append("<div><div class='si-label'>课程布局</div>");
+        sb.append("<div class='si-desc'>如果课表位置看起来不对，可一键恢复课程默认位置</div></div>");
+        sb.append("<button class='adv-btn' style='margin-top:10px;background:#FFF0F0;color:#e55;' ");
+        sb.append("onclick='Android.onResetLayout()'>重置课程布局</button>");
         sb.append("</div>");
-        sb.append("<div class='settings-item'><div><div class='si-label'>窗口末周提醒</div>");
-        sb.append("<div class='si-desc'>课表周期结束前三天提醒更新</div></div></div>");
         sb.append("</div>");
         sb.append("</div></div>");
 
@@ -1408,7 +1626,7 @@ public class MainActivity extends AppCompatActivity {
         sb.append("    if(didDrag){didDrag=false;return;}");
         sb.append("    if(dragMode)return;");
         sb.append("    var d=this.getAttribute('data-detail');");
-        sb.append("    if(d){window.__cardRect=this.getBoundingClientRect();Android.onCourseClick(d);}");
+        sb.append("    if(d){window.__cardRect=this.getBoundingClientRect();window.__openedCard=this;this.style.opacity='0';Android.onCourseClick(d);}");
         sb.append("  });");
         sb.append("});");
         // 触摸滑动切周（拖动中/拖动模式下禁用）
@@ -1427,16 +1645,22 @@ public class MainActivity extends AppCompatActivity {
         // ===== 课程卡片铃铛：点击开关该课提醒 =====
         sb.append("function toggleBell(ev,el){");
         sb.append("  ev.stopPropagation();");
-        sb.append("  var key=el.getAttribute('data-rkey')||'';");
-        sb.append("  if(!key)return;");
+        sb.append("  var card=el.closest('.course');");
+        sb.append("  if(!card)return;");
+        sb.append("  var keys=(card.getAttribute('data-keys')||'').split(';;;').filter(function(k){return k;});");
+        sb.append("  if(!keys.length)return;");
         sb.append("  var on=!el.classList.contains('on');");
         sb.append("  el.classList.toggle('on',on);");
-        sb.append("  var card=el.closest('.course');");
-        sb.append("  if(card)card.classList.toggle('remind-on',on);");
-        sb.append("  Android.onToggleCourseReminder(key,on);");
+        sb.append("  card.classList.toggle('remind-on',on);");
+        sb.append("  Android.onToggleCourseReminder(keys.join(';;;'),on);");
         sb.append("}");
         // 弹窗（课程详情：反向缩回卡片，背景色同步还原；设置：直接关闭）
         sb.append("function closeModal(){");
+        // 卡片放大成弹窗：关掉时把原卡片恢复显示
+        sb.append("  if(window.__openedCard){var oc=window.__openedCard;window.__openedCard=null;");
+        sb.append("oc.style.transition='transform 0.26s ease,opacity 0.26s ease';");
+        sb.append("oc.style.transform='translate(0px,0px) scale(1,1)';oc.style.opacity='1';");
+        sb.append("setTimeout(function(){oc.style.transition='';oc.style.transform='';oc.style.opacity='';oc.style.willChange='';},280);}");
         sb.append("  var modal=document.getElementById('courseModal');var mEl=document.querySelector('#courseModal .modal');var r=window.__cardRect;");
         sb.append("  if(r&&r.width>0){");
         sb.append("    var m=mEl.getBoundingClientRect();");
@@ -1467,9 +1691,24 @@ public class MainActivity extends AppCompatActivity {
         sb.append("if(window.Android&&Android.onSettingsOpened)Android.onSettingsOpened();}");
         sb.append("function closeSettings(){document.getElementById('settingsModal').classList.remove('show');}");
         sb.append("function setAdvance(m){Android.onSetAdvance(m);");
-        sb.append("document.querySelectorAll('.adv-btn').forEach(function(b){");
+        sb.append("document.querySelectorAll('.adv-min').forEach(function(b){");
         sb.append("b.style.background='';b.style.color='';});");
         sb.append("event.target.style.background='#667eea';event.target.style.color='#fff';}");
+        // 主题切换（带背景过渡动画）
+        sb.append("function setTheme(m){");
+        sb.append("  document.body.classList.toggle('dark',m==='dark');");
+        sb.append("  updateThemeBtn(m);");
+        sb.append("  Android.onSetTheme(m);}");
+        sb.append("function updateThemeBtn(m){");
+        sb.append("  var l=document.getElementById('themeLight'),d=document.getElementById('themeDark');");
+        sb.append("  if(l){l.style.background=m==='dark'?'':'#667eea';l.style.color=m==='dark'?'':'#fff';}");
+        sb.append("  if(d){d.style.background=m==='dark'?'#667eea':'';d.style.color=m==='dark'?'#fff':'';}}");
+        // 自定义图片背景
+        sb.append("function applyBg(url){");
+        sb.append("  document.body.classList.toggle('hasbg',!!url);");
+        sb.append("  var b=document.getElementById('clearBgBtn');");
+        sb.append("  if(b)b.style.display=url?'inline-block':'none';}");
+        sb.append("updateThemeBtn('").append("dark".equals(theme) ? "dark" : "light").append("');");
         sb.append("function switchTab(i){");
         sb.append("  document.getElementById('tabAccount').style.display=i===0?'block':'none';");
         sb.append("  document.getElementById('tabGeneral').style.display=i===1?'block':'none';");
@@ -1480,7 +1719,8 @@ public class MainActivity extends AppCompatActivity {
         return sb.toString();
     }
 
-    private String buildCourseDetail(JSONObject c, int week, String periodLabel, String periodTime, String color) {
+    /** 单个课程的详情对象 */
+    private JSONObject buildCourseDetailObj(JSONObject c, int week, String periodLabel, String periodTime, String color) {
         try {
             JSONObject d = new JSONObject();
             d.put("name", c.optString("name", ""));
@@ -1497,10 +1737,21 @@ public class MainActivity extends AppCompatActivity {
             d.put("cls", c.optString("cls", ""));
             d.put("remark", c.optString("remark", ""));
             d.put("color", color == null ? "" : color);
-            return d.toString().replace("'", "\\'");
+            return d;
         } catch (Exception e) {
-            return "{}";
+            return new JSONObject();
         }
+    }
+
+    /** 该格所有课程的详情数组（同一时段可能重叠多门课） */
+    private String buildCourseDetailArray(JSONArray arr, int week, String periodLabel, String periodTime, String color) {
+        JSONArray out = new JSONArray();
+        for (int i = 0; i < arr.length(); i++) {
+            JSONObject c = arr.optJSONObject(i);
+            if (c == null) continue;
+            out.put(buildCourseDetailObj(c, week, periodLabel, periodTime, color));
+        }
+        return out.toString().replace("'", "\\'");
     }
 
     /** 课程色与白色混合：t为课程色占比（0~1），t≈0.10即超级淡 */
@@ -1519,24 +1770,22 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // ====== 五周窗口末尾提醒（最后三天每天一条通知） ======
-
-    private void setupReminders() {
-        if (store == null) return;
-        long[] times = store.reminderTimes();
-        AlarmManager am = (AlarmManager) getSystemService(ALARM_SERVICE);
-        if (am == null) return;
-        int flag = Build.VERSION.SDK_INT >= 23
-            ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
-            : PendingIntent.FLAG_UPDATE_CURRENT;
-        for (int i = 0; i < 3; i++) {
-            PendingIntent pi = PendingIntent.getBroadcast(this, 100 + i,
-                new Intent(this, ReminderReceiver.class), flag);
-            am.cancel(pi);
-            if (times != null && i < times.length) {
-                am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, times[i], pi);
-                Log.d(TAG, "reminder#" + i + " set at " + ScheduleStore.fmtDate(times[i]));
-            }
+    /** 课程色与指定底色混合：t 为课程色占比（深色主题下用） */
+    private static String mixWith(String hex, float t, int baseColor) {
+        try {
+            String h = hex.replace("#", "").trim();
+            int r = Integer.parseInt(h.substring(0, 2), 16);
+            int g = Integer.parseInt(h.substring(2, 4), 16);
+            int b = Integer.parseInt(h.substring(4, 6), 16);
+            int br = (baseColor >> 16) & 0xFF;
+            int bgc = (baseColor >> 8) & 0xFF;
+            int bb = baseColor & 0xFF;
+            int mr = Math.round(br * (1 - t) + r * t);
+            int mg = Math.round(bgc * (1 - t) + g * t);
+            int mb = Math.round(bb * (1 - t) + b * t);
+            return String.format("#%02X%02X%02X", mr, mg, mb);
+        } catch (Exception e) {
+            return "#1A1B26";
         }
     }
 
@@ -1672,24 +1921,27 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @JavascriptInterface
-        public void onToggleCourseReminder(String key, final boolean on) {
-            if (key == null || key.isEmpty()) return;
-            final String k = key;
+        public void onToggleCourseReminder(String keyList, final boolean on) {
+            if (keyList == null || keyList.isEmpty()) return;
+            final String[] ks = keyList.split(";;;");
             handler.post(new Runnable() {
                 @Override
                 public void run() {
                     try {
                         if (store == null) store = new ScheduleStore(MainActivity.this);
                         java.util.Set<String> keys = store.getReminderKeys();
-                        if (on) keys.add(k); else keys.remove(k);
+                        for (String k : ks) {
+                            if (k == null || k.isEmpty()) continue;
+                            if (on) keys.add(k); else keys.remove(k);
+                        }
                         store.saveReminderKeys(keys);
                         ReminderService.reload(MainActivity.this);
-                        String name = k.split("\\|")[0];
+                        String label = ks.length > 1 ? (ks.length + " 门课程") : ks[0].split("\\|")[0];
                         Toast.makeText(MainActivity.this,
-                            on ? "已开启「" + name + "」上课提醒（共 " + keys.size() + " 门）"
-                               : "已关闭「" + name + "」上课提醒",
+                            on ? "已开启「" + label + "」上课提醒（共 " + keys.size() + " 门）"
+                               : "已关闭「" + label + "」上课提醒",
                             Toast.LENGTH_SHORT).show();
-                        Log.d(TAG, "toggle reminder " + (on ? "on" : "off") + ": " + k);
+                        Log.d(TAG, "toggle reminder " + (on ? "on" : "off") + " x" + ks.length);
                     } catch (Exception e) {
                         Log.e(TAG, "toggle reminder error", e);
                     }
@@ -1708,6 +1960,75 @@ public class MainActivity extends AppCompatActivity {
                 Toast.makeText(MainActivity.this,
                     "提醒提前量已设为 " + minutes + " 分钟",
                     Toast.LENGTH_SHORT).show();
+            });
+        }
+
+        @JavascriptInterface
+        public void onResetLayout() {
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        if (store == null) store = new ScheduleStore(MainActivity.this);
+                        store.clearOverrides();
+                        renderWeekSchedule(currentDisplayWeek);
+                        ReminderService.reload(MainActivity.this);
+                        Toast.makeText(MainActivity.this,
+                            "已重置课程布局，恢复默认位置", Toast.LENGTH_SHORT).show();
+                        Log.d(TAG, "course layout overrides cleared");
+                    } catch (Exception e) {
+                        Log.e(TAG, "reset layout error", e);
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void onSetTheme(String mode) {
+            if (store == null) store = new ScheduleStore(MainActivity.this);
+            store.setTheme(mode);
+            applyAppBackground();
+            Log.d(TAG, "theme set to " + mode);
+        }
+
+        @JavascriptInterface
+        public void onPickBackground() {
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    pickBackgroundImage();
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void onClearBackground() {
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        if (store == null) store = new ScheduleStore(MainActivity.this);
+                        String cur = store.getBgImage();
+                        if (!cur.isEmpty()) {
+                            java.io.File f = new java.io.File(getFilesDir(), cur);
+                            if (f.exists()) f.delete();
+                        }
+                        // 清理历史遗留的背景图文件
+                        java.io.File[] olds = getFilesDir().listFiles();
+                        if (olds != null) {
+                            for (java.io.File f : olds) {
+                                String n = f.getName();
+                                if (n.startsWith("user_bg") && n.endsWith(".jpg")) f.delete();
+                            }
+                        }
+                        store.setBgImage("");
+                        applyAppBackground();
+                        webView.evaluateJavascript("applyBg('')", null);
+                        Toast.makeText(MainActivity.this, "已清除图片背景", Toast.LENGTH_SHORT).show();
+                    } catch (Exception e) {
+                        Log.e(TAG, "clear bg error", e);
+                    }
+                }
             });
         }
 
@@ -1738,8 +2059,8 @@ public class MainActivity extends AppCompatActivity {
                 public void run() {
                     boolean ok = PermissionHelper.openAutoStartSettings(MainActivity.this);
                     Toast.makeText(MainActivity.this,
-                        ok ? "请在列表中找到「石大课表」并允许自启动"
-                           : "未找到自启动设置页，请在系统设置中手动允许自启动",
+                        ok ? "如列表中有「石大课表」请允许自启动；找不到说明本机无此开关"
+                           : "未能打开自启动设置，请到系统设置里手动允许",
                         Toast.LENGTH_LONG).show();
                 }
             });
@@ -1801,61 +2122,129 @@ public class MainActivity extends AppCompatActivity {
 
     private void showCourseDetail(String detailJson) {
         try {
-            JSONObject d = new JSONObject(detailJson);
-            String name = d.optString("name", "");
-            String teacher = d.optString("teacher", "");
-            String location = d.optString("location", "");
-            String weeks = d.optString("weeks", "");
-            String period = d.optString("period", "");
-            String time = d.optString("time", "");
-            String weekStr = d.optString("week", "");
-            String weekday = d.optString("weekday", "");
-            String count = d.optString("count", "");
-            String cls = d.optString("cls", "");
-            String remark = d.optString("remark", "");
-            String color = d.optString("color", "");
-            // 弹窗背景：课程色超级淡版本；展开动画中从课程原色减淡过渡
-            String paleBg = color.isEmpty() ? "#FFFFFF" : mixWithWhite(color, 0.10f);
-            String startBg = color.isEmpty() ? "#FFFFFF" : color;
+            String raw = detailJson == null ? "" : detailJson.trim();
+            JSONArray list = new JSONArray();
+            if (raw.startsWith("[")) {
+                list = new JSONArray(raw);
+            } else if (!raw.isEmpty()) {
+                list.put(new JSONObject(raw));
+            }
+            if (list.length() == 0) return;
 
-            String js = "javascript:(function(){"
-                + "document.getElementById('cmTitle').textContent='" + esc(name).replace("'", "\\'") + "';"
-                + "var b=document.getElementById('cmBody');"
-                + "var html='';"
-                + "html+='<div class=\"row\"><span class=\"label\">上课时间</span><span class=\"val\">" + esc(weekStr) + (weekday.isEmpty() ? "" : " " + esc(weekday)) + " " + esc(period) + (time.isEmpty() ? "" : " " + esc(time)) + "</span></div>';"
-                + "html+='<div class=\"row\"><span class=\"label\">教学周次</span><span class=\"val\">" + esc(weeks) + "</span></div>';"
-                + "html+='<div class=\"row\"><span class=\"label\">上课地点</span><span class=\"val\">" + esc(location) + "</span></div>';"
-                + "html+='<div class=\"row\"><span class=\"label\">授课教师</span><span class=\"val\">" + esc(teacher) + "</span></div>';"
-                + "html+='<div class=\"row\"><span class=\"label\">教学班级</span><span class=\"val\">" + (cls.isEmpty() ? "\u2014" : esc(cls)) + "</span></div>';"
-                + (count.isEmpty() ? "" : "html+='<div class=\"row\"><span class=\"label\">选课人数</span><span class=\"val\">" + esc(count) + "人</span></div>';")
-                + "html+='<div class=\"row\"><span class=\"label\">教学备注</span><span class=\"val\">" + (remark.isEmpty() ? "无内容" : esc(remark)) + "</span></div>';"
-                + "b.innerHTML=html;"
-                + "var modal=document.getElementById('courseModal');"
-                + "var mEl=document.querySelector('#courseModal .modal');"
-                + "modal.classList.add('show');"
-                + "window.__modalColor='" + startBg + "';"
-                // FLIP：从卡片位置/尺寸放大展开成弹窗，背景随放大从课程色减淡为超淡色
-                + "var r=window.__cardRect;"
-                + "if(r&&r.width>0){"
-                + "  var m=mEl.getBoundingClientRect();"
-                + "  var sx=r.width/m.width;var sy=Math.max(r.height/m.height,0.15);"
-                + "  var dx=(r.left+r.width/2)-(m.left+m.width/2);var dy=(r.top+r.height/2)-(m.top+m.height/2);"
-                + "  mEl.style.transition='none';"
-                + "  mEl.style.transformOrigin='center center';"
-                + "  mEl.style.transform='translate('+dx+'px,'+dy+'px) scale('+sx+','+sy+')';"
-                + "  mEl.style.opacity='0.25';"
-                + "  mEl.style.background='" + startBg + "';"
-                + "  mEl.getBoundingClientRect();"
-                + "  mEl.style.transition='transform 0.3s cubic-bezier(.22,.68,.36,1),opacity 0.3s ease,background-color 0.3s ease';"
-                + "  mEl.style.transform='translate(0px,0px) scale(1,1)';"
-                + "  mEl.style.opacity='1';"
-                + "  mEl.style.background='" + paleBg + "';"
-                + "  setTimeout(function(){mEl.style.transition='';},330);"
-                + "}else{mEl.style.transform='translate(0px,0px) scale(1,1)';mEl.style.opacity='1';mEl.style.background='" + paleBg + "';}"
-                + "})()";
-            webView.evaluateJavascript(js, null);
+            JSONObject first = list.optJSONObject(0);
+            String firstName = first.optString("name", "");
+            String color = first.optString("color", "");
+            // 弹窗背景跟随主题：浅色=课程色+白，深色=课程色+深底，有自定义背景图=半透明
+            boolean dark = "dark".equals(store != null ? store.getTheme() : "light");
+            String bgNameCur = store != null ? store.getBgImage() : "";
+            boolean hasBgCur = !bgNameCur.isEmpty()
+                && new java.io.File(getFilesDir(), bgNameCur).exists();
+            String paleBg;
+            String startBg;
+            // 弹窗就是“被放大的课程卡片”：背景由卡片原色淡出到纯白（深色主题为纯黑）
+            if (hasBgCur) {
+                paleBg = dark ? "rgba(0,0,0,0.72)" : "rgba(255,255,255,0.72)";
+            } else {
+                paleBg = dark ? "#000000" : "#FFFFFF";
+            }
+            startBg = color.isEmpty() ? paleBg : color;
+            String title = list.length() > 1 ? firstName + " 等" + list.length() + "门" : firstName;
+
+            StringBuilder js = new StringBuilder();
+            js.append("javascript:(function(){");
+            js.append("document.getElementById('cmTitle').textContent='").append(jss(title)).append("';");
+            js.append("var b=document.getElementById('cmBody');");
+            js.append("var html='';");
+
+            // 同一时段可能重叠多门课：全部列出
+            for (int i = 0; i < list.length(); i++) {
+                JSONObject d = list.optJSONObject(i);
+                if (d == null) continue;
+                String cName = d.optString("name", "");
+                String teacher = d.optString("teacher", "");
+                String location = d.optString("location", "");
+                String weeks = d.optString("weeks", "");
+                String period = d.optString("period", "");
+                String time = d.optString("time", "");
+                String weekStr = d.optString("week", "");
+                String weekday = d.optString("weekday", "");
+                String count = d.optString("count", "");
+                String cls = d.optString("cls", "");
+                String remark = d.optString("remark", "");
+
+                js.append("html+='<div class=\"cblock\">';");
+                // 单门课时弹窗标题已显示课名，不再重复；多门课（重叠）时才分别列出每门
+                if (list.length() > 1) {
+                    js.append("html+='<div class=\"cb-name\">").append(jss(cName));
+                    js.append("<span class=\"cb-tag\">第").append(i + 1).append("门</span>");
+                    js.append("</div>';");
+                }
+                js.append("html+='<div class=\"row\"><span class=\"label\">上课时间</span><span class=\"val\">")
+                  .append(jss(weekStr)).append(weekday.isEmpty() ? "" : " " + jss(weekday)).append(" ")
+                  .append(jss(period)).append(time.isEmpty() ? "" : " " + jss(time)).append("</span></div>';");
+                js.append("html+='<div class=\"row\"><span class=\"label\">教学周次</span><span class=\"val\">").append(jss(weeks)).append("</span></div>';");
+                js.append("html+='<div class=\"row\"><span class=\"label\">上课地点</span><span class=\"val\">")
+                  .append(location.isEmpty() ? "\u2014" : jss(location)).append("</span></div>';");
+                js.append("html+='<div class=\"row\"><span class=\"label\">授课教师</span><span class=\"val\">")
+                  .append(teacher.isEmpty() ? "\u2014" : jss(teacher)).append("</span></div>';");
+                js.append("html+='<div class=\"row\"><span class=\"label\">教学班级</span><span class=\"val\">")
+                  .append(cls.isEmpty() ? "\u2014" : jss(cls)).append("</span></div>';");
+                if (!count.isEmpty()) {
+                    js.append("html+='<div class=\"row\"><span class=\"label\">选课人数</span><span class=\"val\">").append(jss(count)).append("人</span></div>';");
+                }
+                js.append("html+='<div class=\"row\"><span class=\"label\">教学备注</span><span class=\"val\">")
+                  .append(remark.isEmpty() ? "无内容" : jss(remark)).append("</span></div>';");
+                js.append("html+='</div>';");
+            }
+
+            js.append("b.innerHTML=html;");
+            js.append("var modal=document.getElementById('courseModal');");
+            js.append("var mEl=document.querySelector('#courseModal .modal');");
+            js.append("modal.classList.add('show');");
+            js.append("window.__modalColor='").append(startBg).append("';");
+            // FLIP：从卡片位置/尺寸放大展开成弹窗，背景随放大从课程色减淡为超淡色
+            js.append("var r=window.__cardRect;");
+            js.append("if(r&&r.width>0){");
+            js.append("  var m=mEl.getBoundingClientRect();");
+            js.append("  var sx=r.width/m.width;var sy=Math.max(r.height/m.height,0.15);");
+            js.append("  var dx=(r.left+r.width/2)-(m.left+m.width/2);var dy=(r.top+r.height/2)-(m.top+m.height/2);");
+            // 原卡片同步放大到弹窗尺寸后淡出（像打开App时图标放大展开）
+            js.append("  var card=window.__openedCard;");
+            js.append("  if(card){");
+            js.append("    card.style.transition='none';");
+            js.append("    card.style.transformOrigin='center center';");
+            js.append("    card.style.willChange='transform,opacity';");
+            js.append("    card.style.transform='translate(0px,0px) scale(1,1)';");
+            js.append("    card.style.opacity='1';");
+            js.append("    card.getBoundingClientRect();");
+            js.append("    card.style.transition='transform 0.3s cubic-bezier(.22,.68,.36,1),opacity 0.2s ease 0.16s';");
+            js.append("    card.style.transform='translate('+dx+'px,'+dy+'px) scale('+(1/sx)+','+(1/sy)+')';");
+            js.append("    card.style.opacity='0';");
+            js.append("  }");
+            js.append("  mEl.style.transition='none';");
+            js.append("  mEl.style.transformOrigin='center center';");
+            js.append("  mEl.style.transform='translate('+dx+'px,'+dy+'px) scale('+sx+','+sy+')';");
+            js.append("  mEl.style.opacity='0.25';");
+            js.append("  mEl.style.background='").append(startBg).append("';");
+            js.append("  mEl.getBoundingClientRect();");
+            js.append("  mEl.style.transition='transform 0.3s cubic-bezier(.22,.68,.36,1),opacity 0.3s ease,background-color 0.3s ease';");
+            js.append("  mEl.style.transform='translate(0px,0px) scale(1,1)';");
+            js.append("  mEl.style.opacity='1';");
+            js.append("  mEl.style.background='").append(paleBg).append("';");
+            js.append("  setTimeout(function(){mEl.style.transition='';},330);");
+            js.append("}else{mEl.style.transform='translate(0px,0px) scale(1,1)';mEl.style.opacity='1';mEl.style.background='").append(paleBg).append("';}");
+            js.append("})()");
+
+            webView.evaluateJavascript(js.toString(), null);
         } catch (Exception e) {
             Log.e(TAG, "showCourseDetail error", e);
         }
+    }
+
+    /** 拼进 JS 单引号字符串：先 HTML 转义，再转义反斜杠/单引号/换行 */
+    private String jss(String s) {
+        if (s == null) return "";
+        return esc(s).replace("\\", "\\\\").replace("'", "\\'")
+            .replace("\n", " ").replace("\r", "");
     }
 }

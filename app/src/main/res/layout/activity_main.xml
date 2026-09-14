@@ -4,6 +4,14 @@
     android:layout_height="match_parent"
     android:background="#FFFFFF">
 
+    <!-- 自定义背景图（最底层，切周重载页面时不会闪白） -->
+    <ImageView
+        android:id="@+id/bgImage"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scaleType="centerCrop"
+        android:visibility="gone" />
+
     <!-- Main WebView -->
     <WebView
         android:id="@+id/webView"

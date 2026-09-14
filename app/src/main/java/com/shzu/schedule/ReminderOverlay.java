@@ -81,17 +81,18 @@ public class ReminderOverlay {
 
             // ===== 根：全屏半透明遮罩 =====
             FrameLayout root = new FrameLayout(ctx);
-            root.setBackgroundColor(0xCC0A0A12);
+            root.setBackgroundColor(0xB30A0A12);
 
             // ===== 渐变提醒卡片 =====
             LinearLayout card = new LinearLayout(ctx);
             card.setOrientation(LinearLayout.VERTICAL);
 
+            // 半透明白玻璃质感：白色渐变 + 高光描边
             GradientDrawable cardBg = new GradientDrawable(
                 GradientDrawable.Orientation.TL_BR,
-                new int[]{0xFF6D7BEE, 0xFF764BA2, 0xFF5B3E9E});
-            cardBg.setCornerRadius(24 * d);
-            cardBg.setStroke((int) Math.max(1, 1.5f * d), 0x55FFFFFF);
+                new int[]{0xE6FFFFFF, 0xD9FFFFFF, 0xCCFFFFFF});
+            cardBg.setCornerRadius(16 * d);
+            cardBg.setStroke((int) Math.max(1, 1.2f * d), 0x99FFFFFF);
             card.setBackground(cardBg);
             card.setPadding(dp(ctx, 22), dp(ctx, 22), dp(ctx, 22), dp(ctx, 18));
 
@@ -99,7 +100,7 @@ public class ReminderOverlay {
             TextView tag = new TextView(ctx);
             tag.setText("课程提醒");
             tag.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-            tag.setTextColor(0xCCFFFFFF);
+            tag.setTextColor(0x992A2A3A);
             tag.setLetterSpacing(0.18f);
             card.addView(tag);
 
@@ -107,7 +108,7 @@ public class ReminderOverlay {
             TextView title = new TextView(ctx);
             title.setText(name == null || name.isEmpty() ? "即将上课" : name);
             title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24);
-            title.setTextColor(0xFFFFFFFF);
+            title.setTextColor(0xFF1A1A2E);
             title.setTypeface(Typeface.DEFAULT_BOLD);
             LinearLayout.LayoutParams titleLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -116,7 +117,7 @@ public class ReminderOverlay {
 
             // 分隔线
             View div = new View(ctx);
-            div.setBackgroundColor(0x44FFFFFF);
+            div.setBackgroundColor(0x22000000);
             LinearLayout.LayoutParams divLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, Math.max(1, dp(ctx, 1)));
             divLp.topMargin = dp(ctx, 14);
@@ -145,12 +146,12 @@ public class ReminderOverlay {
             TextView ok = new TextView(ctx);
             ok.setText("知道了");
             ok.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
-            ok.setTextColor(0xFF5B4BA8);
+            ok.setTextColor(0xFFFFFFFF);
             ok.setTypeface(Typeface.DEFAULT_BOLD);
             ok.setGravity(Gravity.CENTER);
             GradientDrawable okBg = new GradientDrawable();
-            okBg.setColor(0xFFFFFFFF);
-            okBg.setCornerRadius(14 * d);
+            okBg.setColor(0xFF667EEA);
+            okBg.setCornerRadius(10 * d);
             ok.setBackground(okBg);
             ok.setPadding(0, dp(ctx, 13), 0, dp(ctx, 13));
             LinearLayout.LayoutParams okLp = new LinearLayout.LayoutParams(
@@ -194,6 +195,14 @@ public class ReminderOverlay {
                     | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
                 PixelFormat.TRANSLUCENT);
             lp.gravity = Gravity.CENTER;
+            // 毛玻璃：系统支持时对背后的内容做模糊
+            if (Build.VERSION.SDK_INT >= 31) {
+                try {
+                    lp.setBlurBehindRadius(20);
+                    lp.flags |= WindowManager.LayoutParams.FLAG_BLUR_BEHIND;
+                } catch (Exception ignored) {
+                }
+            }
 
             wm.addView(root, lp);
             overlayView = root;
@@ -311,14 +320,14 @@ public class ReminderOverlay {
         TextView lab = new TextView(ctx);
         lab.setText(label);
         lab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        lab.setTextColor(0x99FFFFFF);
+        lab.setTextColor(0x882A2A3A);
         lab.setMinWidth(dp(ctx, 42));
         row.addView(lab);
 
         TextView val = new TextView(ctx);
         val.setText(value);
         val.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
-        val.setTextColor(0xFFFFFFFF);
+        val.setTextColor(0xFF22222E);
         LinearLayout.LayoutParams valLp = new LinearLayout.LayoutParams(
             0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
         valLp.leftMargin = dp(ctx, 10);
