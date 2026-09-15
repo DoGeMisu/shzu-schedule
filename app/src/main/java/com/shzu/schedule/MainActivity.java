@@ -337,11 +337,19 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     public void onBackPressed() {
-        if (webView.canGoBack()) {
-            webView.goBack();
-        } else {
-            super.onBackPressed();
-        }
+        // 先问 JS 层：设置页/课程详情弹窗是否消费了本次返回
+        webView.evaluateJavascript(
+                "typeof handleBack==='function'?handleBack():'0'",
+                value -> {
+                    if (value != null && value.contains("1")) {
+                        return; // JS 已关闭顶层页面，返回键到此为止
+                    }
+                    if (webView.canGoBack()) {
+                        webView.goBack();
+                    } else {
+                        super.onBackPressed();
+                    }
+                });
     }
 
     // ====== WebView 初始化 ======
@@ -1342,6 +1350,38 @@ public class MainActivity extends AppCompatActivity {
         // 应用主题与自定义背景图
         String theme = store != null ? store.getTheme() : "light";
         String bgName = store != null ? store.getBgImage() : "";
+        // ===== 独立设置页样式 =====
+        sb.append(".page{position:fixed;top:0;left:0;right:0;bottom:0;background:var(--bg);z-index:95;");
+        sb.append("display:flex;flex-direction:column;visibility:hidden;transform:translateX(100%);");
+        sb.append("transition:transform 0.26s cubic-bezier(.22,.68,.36,1),visibility 0.26s ease;}");
+        sb.append(".page.show{visibility:visible;transform:translateX(0);}");
+        sb.append(".page-head{display:flex;align-items:center;padding:8px;border-bottom:1px solid var(--line);flex:0 0 auto;}");
+        sb.append(".ph-back{background:transparent;border:none;font-size:26px;color:var(--fg);width:48px;height:48px;cursor:pointer;}");
+        sb.append(".ph-title{flex:1;text-align:center;font-size:17px;font-weight:700;color:var(--fg);}");
+        sb.append(".ph-pad{width:48px;flex:0 0 auto;}");
+        sb.append(".page-body{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:16px;}");
+        sb.append(".nav-card{background:var(--card);border-radius:14px;overflow:hidden;}");
+        sb.append(".nav-item{display:flex;align-items:center;padding:16px;border-bottom:1px solid var(--line);cursor:pointer;}");
+        sb.append(".nav-item:last-child{border-bottom:none;}");
+        sb.append(".nav-item:active{background:rgba(102,126,234,0.12);}");
+        sb.append(".ni-txt{flex:1;}");
+        sb.append(".ni-txt b{display:block;font-size:15px;font-weight:600;color:var(--fg);}");
+        sb.append(".ni-txt i{display:block;font-style:normal;font-size:12px;color:var(--sub);margin-top:4px;}");
+        sb.append(".ni-arrow{color:var(--sub);font-size:20px;margin-left:8px;}");
+        sb.append(".about-hero{text-align:center;padding:26px 0 22px;}");
+        sb.append(".about-hero .ah-name{font-size:26px;font-weight:800;color:var(--fg);letter-spacing:2px;}");
+        sb.append(".about-hero .ah-ver{margin-top:8px;font-size:13px;color:#667eea;font-weight:600;}");
+        sb.append(".about-hero .ah-slogan{margin-top:10px;font-size:12px;color:var(--sub);line-height:1.6;}");
+        sb.append(".about-card{background:var(--card);border-radius:14px;padding:2px 16px;margin-bottom:14px;}");
+        sb.append(".about-card .ac-title{font-size:12px;color:#667eea;font-weight:700;padding:14px 0 6px;letter-spacing:1px;}");
+        sb.append(".about-card .kv{display:flex;padding:11px 0;border-top:1px solid var(--line);font-size:13px;}");
+        sb.append(".about-card .kv:first-of-type{border-top:none;}");
+        sb.append(".about-card .kv span{color:var(--sub);min-width:74px;flex:0 0 auto;}");
+        sb.append(".about-card .kv b{color:var(--fg);font-weight:500;flex:1;word-break:break-all;line-height:1.5;}");
+        sb.append(".about-card .kv b.tap{color:#667eea;cursor:pointer;}");
+        sb.append(".about-card .kv b.tap:active{opacity:0.6;}");
+        sb.append(".about-note{font-size:12px;color:var(--sub);line-height:1.7;padding:0 4px 24px;}");
+
         boolean hasBg = !bgName.isEmpty() && new java.io.File(getFilesDir(), bgName).exists();
         sb.append("</style></head><body class='").append("dark".equals(theme) ? "dark" : "light")
           .append(hasBg ? " hasbg" : "")
@@ -1477,22 +1517,37 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<button class='modal-close' onclick='closeModal()'>关闭</button>");
         sb.append("</div></div>");
 
-        // 设置弹窗
-        sb.append("<div class='modal-bg' id='settingsModal' onclick='closeSettings()'>");
-        sb.append("<div class='settings-modal' onclick='event.stopPropagation()'>");
-        sb.append("<h2>设置</h2>");
-        sb.append("<div class='tab-bar'>");
-        sb.append("<div class='tab active' onclick='switchTab(0)'>账号设置</div>");
-        sb.append("<div class='tab' onclick='switchTab(1)'>通用设置</div>");
+        // ===== 设置页（独立页面，从右侧滑入）=====
+        // 一级：设置列表
+        sb.append("<div class='page' id='pageSettings'>");
+        sb.append("<div class='page-head'><button class='ph-back' onclick='closePage()'>‹</button>");
+        sb.append("<div class='ph-title'>设置</div><div class='ph-pad'></div></div>");
+        sb.append("<div class='page-body'>");
+        sb.append("<div class='nav-card'>");
+        sb.append("<div class='nav-item' onclick='openSub(\"account\")'><div class='ni-txt'><b>账号设置</b>");
+        sb.append("<i>当前登录账号与退出登录</i></div><div class='ni-arrow'>›</div></div>");
+        sb.append("<div class='nav-item' onclick='openSub(\"general\")'><div class='ni-txt'><b>通用设置</b>");
+        sb.append("<i>课表背景、提醒提前时间、提醒权限、课程布局</i></div><div class='ni-arrow'>›</div></div>");
+        sb.append("<div class='nav-item' onclick='openSub(\"about\")'><div class='ni-txt'><b>关于</b>");
+        sb.append("<i>开发信息、开源地址与作者联系方式</i></div><div class='ni-arrow'>›</div></div>");
         sb.append("</div>");
-        // 账号设置
-        sb.append("<div class='tab-content' id='tabAccount'>");
+        sb.append("</div></div>");
+
+        // 二级：账号设置
+        sb.append("<div class='page' id='pageAccount'>");
+        sb.append("<div class='page-head'><button class='ph-back' onclick='closePage()'>‹</button>");
+        sb.append("<div class='ph-title'>账号设置</div><div class='ph-pad'></div></div>");
+        sb.append("<div class='page-body'>");
         sb.append("<div class='settings-item'><div><div class='si-label'>当前账号</div>");
         sb.append("<div class='si-desc'>").append(esc(savedUser.isEmpty() ? "未登录" : savedUser)).append("</div></div></div>");
         sb.append("<button class='logout-btn' onclick='Android.onLogout()'>退出登录</button>");
-        sb.append("</div>");
-        // 通用设置
-        sb.append("<div class='tab-content' id='tabGeneral' style='display:none'>");
+        sb.append("</div></div>");
+
+        // 二级：通用设置
+        sb.append("<div class='page' id='pageGeneral'>");
+        sb.append("<div class='page-head'><button class='ph-back' onclick='closePage()'>‹</button>");
+        sb.append("<div class='ph-title'>通用设置</div><div class='ph-pad'></div></div>");
+        sb.append("<div class='page-body'>");
         // 课表背景：深浅主题切换 + 自定义图片
         sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
         sb.append("<div><div class='si-label'>课表背景</div>");
@@ -1535,7 +1590,45 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<button class='adv-btn' style='margin-top:10px;background:#FFF0F0;color:#e55;' ");
         sb.append("onclick='Android.onResetLayout()'>重置课程布局</button>");
         sb.append("</div>");
+        sb.append("</div></div>");
+
+        // 二级：关于
+        // 版本号直接从系统读取，避免多处硬编码
+        String verName = "1.1.1";
+        try {
+            verName = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception ignored) {
+        }
+        sb.append("<div class='page' id='pageAbout'>");
+        sb.append("<div class='page-head'><button class='ph-back' onclick='closePage()'>‹</button>");
+        sb.append("<div class='ph-title'>关于</div><div class='ph-pad'></div></div>");
+        sb.append("<div class='page-body'>");
+        sb.append("<div class='about-hero'>");
+        sb.append("<div class='ah-name'>石大课表</div>");
+        sb.append("<div class='ah-ver'>版本 v").append(esc(verName)).append("</div>");
+        sb.append("<div class='ah-slogan'>非官方 · 学生业余作品 · 与学校官方及教务部门无关</div>");
         sb.append("</div>");
+        // 开发信息
+        sb.append("<div class='about-card'>");
+        sb.append("<div class='ac-title'>开发信息</div>");
+        sb.append("<div class='kv'><span>开发环境</span><b>Android Studio · Gradle 8.4 · AGP 8.3.2 · JDK 21</b></div>");
+        sb.append("<div class='kv'><span>开发语言</span><b>Java（原生逻辑） + HTML / CSS / JavaScript（界面）</b></div>");
+        sb.append("<div class='kv'><span>技术架构</span><b>WebView 混合架构：原生负责登录、数据与提醒，网页负责课表渲染与交互</b></div>");
+        sb.append("<div class='kv'><span>核心逻辑</span><b>CAS 单点登录 → 教务 DOM 解析课表 → 本地离线存储 → 前台服务定时提醒（悬浮窗 + 响铃）</b></div>");
+        sb.append("<div class='kv'><span>数据存储</span><b>课表与配置存本机，密码经 Android Keystore 加密</b></div>");
+        sb.append("<div class='kv'><span>兼容版本</span><b>Android 7.0 及以上（API 24+）</b></div>");
+        sb.append("</div>");
+        // 作者与开源
+        sb.append("<div class='about-card'>");
+        sb.append("<div class='ac-title'>开源与作者</div>");
+        sb.append("<div class='kv'><span>作者 ID</span><b>m1Su</b></div>");
+        sb.append("<div class='kv'><span>QQ</span><b class='tap' onclick='copyTxt(\"196331872\")'>196331872</b></div>");
+        sb.append("<div class='kv'><span>微信</span><b class='tap' onclick='copyTxt(\"m1SuCode\")'>m1SuCode</b></div>");
+        sb.append("<div class='kv'><span>邮箱</span><b class='tap' onclick='copyTxt(\"19633187@qq.com\")'>19633187@qq.com</b></div>");
+        sb.append("<div class='kv'><span>GitHub</span><b class='tap' onclick='copyTxt(\"https://github.com/DoGeMisu/shzu-schedule\")'>DoGeMisu / shzu-schedule</b></div>");
+        sb.append("<div class='kv'><span>开源协议</span><b>MIT License</b></div>");
+        sb.append("</div>");
+        sb.append("<div class='about-note'>点击 QQ / 微信 / 邮箱 / GitHub 可复制。本项目为在校学生利用课余时间出于学习目的独立开发维护，不收取任何费用，请勿用于商业用途。</div>");
         sb.append("</div></div>");
 
         // 拖动模式底部操作栏
@@ -1681,8 +1774,9 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  if(window.__suppressSwipe||dragEl){window.__suppressSwipe=false;return;}");
         sb.append("  if(dragMode)return;");
         // 详情/设置弹窗打开时不响应滑动切周，避免误触跳周
-        sb.append("  var cm=document.getElementById('courseModal'),sm=document.getElementById('settingsModal');");
-        sb.append("  if((cm&&cm.classList.contains('show'))||(sm&&sm.classList.contains('show')))return;");
+        sb.append("  var cm=document.getElementById('courseModal');");
+        sb.append("  if(cm&&cm.classList.contains('show'))return;");
+        sb.append("  if(pageStack.length)return;");
         sb.append("  touchEndX=e.changedTouches[0].screenX;");
         sb.append("  var dx=touchEndX-touchStartX;");
         sb.append("  if(Math.abs(dx)>80){Android.onWeekChanged(").append(week + "+(dx>0?-1:1)").append(");}");
@@ -1747,9 +1841,24 @@ public class MainActivity extends AppCompatActivity {
         sb.append("function toggleGuide(){var g=document.getElementById('permGuide');if(!g)return;");
         sb.append("  if(g.style.display==='none'){g.textContent=PERM_GUIDE;g.style.display='block';}");
         sb.append("  else g.style.display='none';}");
-        sb.append("function showSettings(){document.getElementById('settingsModal').classList.add('show');");
-        sb.append("if(window.Android&&Android.onSettingsOpened)Android.onSettingsOpened();}");
-        sb.append("function closeSettings(){document.getElementById('settingsModal').classList.remove('show');}");
+        // ===== 设置页导航（独立页面，从右侧滑入）=====
+        sb.append("var pageStack=[];");
+        sb.append("function openPage(id){var p=document.getElementById(id);if(!p)return;");
+        sb.append("  p.classList.add('show');pageStack.push(id);}");
+        sb.append("function closePage(){var id=pageStack.pop();if(!id)return;");
+        sb.append("  var p=document.getElementById(id);if(p)p.classList.remove('show');}");
+        // 系统返回键统一入口：优先关设置页，再关课程详情弹窗，返回'1'表示已消费
+        sb.append("function handleBack(){");
+        sb.append("  if(typeof pageStack!=='undefined'&&pageStack.length){closePage();return '1';}");
+        sb.append("  var cm=document.getElementById('courseModal');");
+        sb.append("  if(cm&&cm.classList.contains('show')){closeModal();return '1';}");
+        sb.append("  return '0';}");
+        sb.append("function openSub(name){");
+        sb.append("  var map={account:'pageAccount',general:'pageGeneral',about:'pageAbout'};");
+        sb.append("  if(map[name])openPage(map[name]);}");
+        sb.append("function showSettings(){openPage('pageSettings');");
+        sb.append("  if(window.Android&&Android.onSettingsOpened)Android.onSettingsOpened();}");
+        sb.append("function copyTxt(t){if(window.Android&&Android.onCopy)Android.onCopy(t);}");
         sb.append("function setAdvance(m){Android.onSetAdvance(m);");
         sb.append("document.querySelectorAll('.adv-min').forEach(function(b){");
         sb.append("b.style.background='';b.style.color='';});");
@@ -1769,15 +1878,6 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  var b=document.getElementById('clearBgBtn');");
         sb.append("  if(b)b.style.display=url?'inline-block':'none';}");
         sb.append("updateThemeBtn('").append("dark".equals(theme) ? "dark" : "light").append("');");
-        sb.append("function switchTab(i){");
-        sb.append("  var acc=document.getElementById('tabAccount'),gen=document.getElementById('tabGeneral');");
-        sb.append("  acc.style.display=i===0?'block':'none';");
-        sb.append("  gen.style.display=i===1?'block':'none';");
-        sb.append("  document.querySelectorAll('.tab').forEach(function(t,idx){t.classList.toggle('active',idx===i);});");
-        // 切换动画：内容淡入 + 轻微右移
-        sb.append("  var cur=i===0?acc:gen;");
-        sb.append("  if(cur){cur.classList.remove('tab-in');void cur.offsetHeight;cur.classList.add('tab-in');}");
-        sb.append("}");
         sb.append("</script>");
         sb.append("</body></html>");
         return sb.toString();
@@ -2111,6 +2211,27 @@ public class MainActivity extends AppCompatActivity {
                 @Override
                 public void run() {
                     refreshPermissionUi();
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void onCopy(String text) {
+            if (text == null || text.isEmpty()) return;
+            final String t = text;
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                            getSystemService(CLIPBOARD_SERVICE);
+                        if (cm != null) {
+                            cm.setPrimaryClip(android.content.ClipData.newPlainText("shzu", t));
+                            Toast.makeText(MainActivity.this, "已复制：" + t, Toast.LENGTH_SHORT).show();
+                        }
+                    } catch (Exception e) {
+                        Log.e(TAG, "copy failed", e);
+                    }
                 }
             });
         }
