@@ -14,15 +14,16 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * 五周课表窗口存储与周次计算
+ * 课表本地存储与周次计算
  *
  * 数据模型(SharedPreferences "schedule_store"/"data"，JSON 覆盖写=删除旧数据):
  * {
  *   week1Monday: 学期第1周周一 00:00 epoch毫秒(基准日)
- *   windowStart/windowEnd: 当前负责的5周窗口
+ *   windowStart/windowEnd: 负责的周次范围(整学期固定为 1..totalWeeks)
  *   totalWeeks: 学期总周数
  *   updatedAt: 抓取时间
  *   courses: [ {day,row,name,teacher,location,weeks} ]
+ *   periodTimes: [ "10:00-11:50", ... ] 节次作息时间表
  *   overrides: { courseKey: {d,r} }  用户拖动调整的位置覆盖
  */
 public class ScheduleStore {
@@ -245,13 +246,13 @@ public class ScheduleStore {
     // ====== 保存（覆盖旧数据 = 删除上次课表） ======
 
     /**
-     * @param parsedWeek      教务页面解析到的当前周次（0=解析失败）
-     * @param parsedTotal     教务页面解析到的学期总周数（0=解析失败）
+     * 保存整学期课表（覆盖旧数据）。
+     *
+     * @param parsedWeek          教务页面解析到的当前周次（0=解析失败）
+     * @param parsedTotal         教务页面解析到的学期总周数（0=解析失败）
      * @param week1MondayOverride 从教学周历接口获取的第1周周一epoch毫秒（0=未获取到）
-     * @param newPeriodTimes  从教务作息数据解析的节次时间段（null=未解析到）
-     * @param oldStart        旧窗口起始周（0=无旧数据）
-     * @param oldEnd          旧窗口结束周（0=无旧数据）
-     * @param ending          本次更新是否由窗口末尾触发（提前更新后五周）
+     * @param newPeriodTimes      从教务作息数据解析的节次时间段（null=未解析到）
+     * @param newCourses          解析出的课程数组
      */
     public void save(Context ctx, int parsedWeek, int parsedTotal, long week1MondayOverride,
                      String[] newPeriodTimes, JSONArray newCourses) {
@@ -328,15 +329,6 @@ public class ScheduleStore {
         c.set(Calendar.HOUR_OF_DAY, 0); c.set(Calendar.MINUTE, 0);
         c.set(Calendar.SECOND, 0); c.set(Calendar.MILLISECOND, 0);
         return c.getTimeInMillis();
-    }
-
-    /**
-     * 是否需要刷新抓取。
-     * 已改为一次性拉取整学期课表并保存本地，不再按五周窗口自动刷新；
-     * 课表更新由用户手动点“刷新课表”触发。
-     */
-    public boolean needsRefresh() {
-        return false;
     }
 
     // ====== 按周过滤课程 ======

@@ -95,7 +95,7 @@ public class MainActivity extends AppCompatActivity {
     private int navToken = 0;                // 导航代际(取消过期回调)
     private boolean showingDisplay = false;   // 正在显示生成的课表HTML
     private boolean parseResultReceived = false; // parseSchedule JS是否已回调结果
-    private ScheduleStore store;               // 五周课表窗口存储
+    private ScheduleStore store;               // 课表本地存储
 
     private final Handler handler = new Handler(Looper.getMainLooper());
 
@@ -136,7 +136,7 @@ public class MainActivity extends AppCompatActivity {
 
         btnRetry.setOnClickListener(v -> startApp());
 
-        // 通知渠道与权限（五周窗口末尾三天提醒）
+        // 通知渠道与权限
         ReminderReceiver.ensureChannel(this);
         if (Build.VERSION.SDK_INT >= 33
                 && ActivityCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS)
@@ -482,16 +482,14 @@ public class MainActivity extends AppCompatActivity {
 
         store = new ScheduleStore(this);
 
-        // 本地有五周数据且未到更新期 → 直接渲染今天所在周（离线秒开）
-        if (store.hasData() && !store.needsRefresh()) {
+        // 本地已存整学期课表 → 直接渲染今天所在周（离线秒开）；
+        // 课表更新由用户手动点「刷新课表」触发，不再自动按窗口刷新
+        if (store.hasData()) {
             int tw = store.todayWeek();
             Log.d(TAG, "startApp: local data ok, rendering week " + tw);
             renderWeekSchedule(tw > 0 ? tw : 1);
             ReminderService.start(this);
             return;
-        }
-        if (store.hasData()) {
-            Log.d(TAG, "startApp: window expired/ending, refreshing from server");
         }
 
         if (savedUser.isEmpty() || savedPass.isEmpty()) {
@@ -1047,7 +1045,7 @@ public class MainActivity extends AppCompatActivity {
                 + " week1Monday=" + parsedWeek1Monday);
 
             if (!hasError && n > 0) {
-                // 解析成功 → 保存五周窗口数据（覆盖旧数据）→ 设提醒 → 渲染今天所在周
+                // 解析成功 → 保存整学期课表（覆盖旧数据）→ 设提醒 → 渲染今天所在周
                 if (store == null) store = new ScheduleStore(this);
                 store.save(this, parsedWeek, parsedTotal, parsedWeek1Monday, parsedTimes, courses);
                 Log.d(TAG, "saved window " + store.getWindowStart() + "-" + store.getWindowEnd()

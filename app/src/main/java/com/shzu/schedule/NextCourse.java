@@ -256,8 +256,11 @@ public final class NextCourse {
             String key = courseKey(c);
             JSONObject o = ov.optJSONObject(key);
             if (o != null) {
-                day = o.optInt("day", day);
-                row = o.optInt("row", row);
+                // 注意：overrides 里存的是短键 d/r（见 ScheduleStore.saveOverrides），
+                // 这里若读 day/row 会永远拿不到值，导致拖过位置的课在小组件里显示错位置。
+                int nd = o.optInt("d", 0), nr = o.optInt("r", 0);
+                if (nd >= 1 && nd <= 7) day = nd;
+                if (nr >= 1 && nr <= 5) row = nr;
             }
         }
         return new int[]{day, row};
