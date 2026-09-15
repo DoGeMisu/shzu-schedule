@@ -74,6 +74,21 @@ public class MainActivity extends AppCompatActivity {
     private TextView loadingText;
     private Button btnRetry;
 
+    /**
+     * 已应用的背景状态缓存。
+     *
+     * onResume() 每次从后台切回来都会调用 applyAppBackground()，而解码一张
+     * 全尺寸背景图 + 重设根布局底色是主线程上的重活。切回前台时系统会先画
+     * 窗口背景（windowBackground），若此时主线程正忙于解码，用户就会先看到
+     * 一帧白底再变成课表 —— 即"切应用回来闪白"。
+     *
+     * 用这两个字段记住"当前已经应用了什么"，没变化就直接返回，既省掉解码也
+     * 避免多余的 setBackgroundColor（每次调用都会触发一次重绘）。
+     */
+    private String appliedBgName = null;
+    private boolean appliedDark = false;
+    private boolean appliedOnce = false;
+
     // ====== 凭据 ======
     private SharedPreferences prefs;
     private String savedUser = "";
@@ -245,22 +260,61 @@ public class MainActivity extends AppCompatActivity {
     private void applyAppBackground() {
         try {
             ScheduleStore s = store != null ? store : new ScheduleStore(this);
-            boolean dark = "dark".equals(s.getTheme());
-            String bgName = s.getBgImage();
+            final boolean dark = "dark".equals(s.getTheme());
+            final String bgName = s.getBgImage();
+
+            // 背景与主题都没变 → 什么都不做。
+            // 这是消除"切回前台闪白"的关键：避免在系统刚恢复窗口的那几帧里
+            // 做解码与重绘。首次进来（appliedOnce=false）必须真正应用一次。
+            if (appliedOnce && bgName.equals(appliedBgName) && dark == appliedDark) return;
+
+            final View root = (View) webView.getParent();
+            final int bgColor = dark ? 0xFF0F1016 : 0xFFFFFFFF;
+            if (root != null && (!appliedOnce || dark != appliedDark)) {
+                root.setBackgroundColor(bgColor);
+            }
+            // 同步窗口背景。切后台再切回时，系统在恢复我们的视图树之前会先画
+            // 窗口背景这一帧；若它始终是主题里写死的白色，深色主题下切回来就会
+            // 先闪一下白。in-app 主题切换不走系统 night mode，所以必须在这里
+            // 手动同步（values-night 只覆盖跟随系统的情况）。
+            if (!appliedOnce || dark != appliedDark) {
+                try {
+                    getWindow().setBackgroundDrawable(
+                        new android.graphics.drawable.ColorDrawable(bgColor));
+                } catch (Exception ignored) {
+                }
+            }
+
             java.io.File f = bgName.isEmpty() ? null : new java.io.File(getFilesDir(), bgName);
             if (f != null && f.exists()) {
-                android.graphics.Bitmap bmp =
-                    android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath());
-                if (bmp != null) {
-                    bgImageView.setImageBitmap(bmp);
-                    bgImageView.setVisibility(View.VISIBLE);
-                }
+                // 异步解码：BitmapFactory.decodeFile 是耗时操作，放在 onResume 的
+                // 主线程上会直接拖住第一帧，表现为白屏一闪
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        final android.graphics.Bitmap bmp =
+                            android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath());
+                        if (bmp == null) return;
+                        handler.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                // 解码期间用户可能又换了背景，丢弃过期结果
+                                String now = store != null ? store.getBgImage() : "";
+                                if (!bgName.equals(now)) return;
+                                bgImageView.setImageBitmap(bmp);
+                                bgImageView.setVisibility(View.VISIBLE);
+                            }
+                        });
+                    }
+                }, "bg-decode").start();
             } else {
                 bgImageView.setImageDrawable(null);
                 bgImageView.setVisibility(View.GONE);
             }
-            View root = (View) webView.getParent();
-            if (root != null) root.setBackgroundColor(dark ? 0xFF0F1016 : 0xFFFFFFFF);
+
+            appliedBgName = bgName;
+            appliedDark = dark;
+            appliedOnce = true;
         } catch (Exception e) {
             Log.e(TAG, "applyAppBackground error", e);
         }

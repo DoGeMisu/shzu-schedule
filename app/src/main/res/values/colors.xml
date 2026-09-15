@@ -11,4 +11,8 @@
     <color name="text_hint">#99FFFFFF</color>
     <color name="error">#FF6B6B</color>
     <color name="success">#4ECDC4</color>
+    <!-- 窗口底色：切后台再切回时系统先画这一帧。
+         浅色主题用白，深色主题见 values-night/colors.xml。
+         与 applyAppBackground() 里根布局的两种底色保持一致，避免切回时闪一下。 -->
+    <color name="window_bg">#FFFFFF</color>
 </resources>
