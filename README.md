@@ -15,6 +15,15 @@ AIGC:
 
 石河子大学课表安卓应用：自动登录学校统一身份认证（CAS），抓取教务系统整学期课表，本地离线渲染，支持课前提醒、深浅主题与自定义背景。
 
+## 📥 下载
+
+| 渠道 | 地址 | 说明 |
+|---|---|---|
+| **Gitee（国内直连）** | https://gitee.com/m1sucode/shzu-schedule/releases | **推荐国内用户使用**，无需代理，下载速度快 |
+| GitHub | https://github.com/DoGeMisu/shzu-schedule/releases | 海外或可正常访问 GitHub 的用户 |
+
+> 两处源码与版本完全同步，功能一致。若 Gitee 打不开，请改用 GitHub，反之亦然。
+
 ![Platform](https://img.shields.io/badge/Platform-Android-3DDC84) ![Language](https://img.shields.io/badge/Language-Java-orange) ![UI](https://img.shields.io/badge/UI-WebView%20HTML%2FCSS%2FJS-blue) ![Version](https://img.shields.io/badge/Version-1.1.2-667eea)
 
 ## ✨ v1.1.2 更新亮点
@@ -119,7 +128,11 @@ AIGC:
 环境要求：JDK 21、Android SDK（compileSdk 34，需含 `platforms/android-34` 与 `build-tools/34.0.0`）、Gradle 8.4 + AGP 8.3.2
 
 ```bash
+# 国内推荐（Gitee，直连）
+git clone https://gitee.com/m1sucode/shzu-schedule.git
+# 或 GitHub
 git clone https://github.com/DoGeMisu/shzu-schedule.git
+
 cd shzu-schedule
 gradle assembleDebug
 # 产物: app/build/outputs/apk/debug/app-debug.apk
