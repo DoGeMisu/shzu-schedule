@@ -1429,6 +1429,12 @@ public class MainActivity extends AppCompatActivity {
         // 有自定义背景图时弹窗半透明（毛玻璃观感）
         sb.append("body.hasbg .settings-modal{background:rgba(255,255,255,0.78);}");
         sb.append("body.hasbg.dark .settings-modal{background:rgba(22,23,34,0.78);}");
+        // 课程详情弹窗同样要半透明。这里的 alpha 必须与 showCourseDetail 里
+        // playOpenAnim 的终点色 paleBg(0.72) 一致：动画结束时 Java 侧会清掉内联
+        // background，改由 CSS 的 --modal 接管，若两处不一致，完全弹出后会"咔"地
+        // 跳成不透明纯白（深色主题则为纯黑）。
+        sb.append("body.hasbg .modal{background:rgba(255,255,255,0.72);}");
+        sb.append("body.hasbg.dark .modal{background:rgba(0,0,0,0.72);}");
         sb.append("body.hasbg .modal-close{background:rgba(102,126,234,0.92);}");
         // 应用主题与自定义背景图
         String theme = store != null ? store.getTheme() : "light";
