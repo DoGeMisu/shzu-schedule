@@ -2,6 +2,16 @@ plugins {
     id 'com.android.application'
 }
 
+// 固定签名：读取项目根目录的 keystore.properties（不入库，见 .gitignore）。
+// 目的是让 assembleDebug 产出的包能直接覆盖安装到已装机型上，
+// 避免签名不一致导致 INSTALL_FAILED_UPDATE_INCOMPATIBLE 或重装丢数据。
+// 若该文件不存在（如他人 clone 后首次构建），则回退到 Gradle 默认调试签名。
+def keystorePropsFile = rootProject.file('keystore.properties')
+def keystoreProps = new Properties()
+if (keystorePropsFile.exists()) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
+}
+
 android {
     namespace 'com.shzu.schedule'
     compileSdk 34
@@ -14,8 +24,27 @@ android {
         versionName "1.1.2"
     }
 
+    signingConfigs {
+        if (keystorePropsFile.exists()) {
+            fixed {
+                storeFile rootProject.file(keystoreProps['storeFile'])
+                storePassword keystoreProps['storePassword']
+                keyAlias keystoreProps['keyAlias']
+                keyPassword keystoreProps['keyPassword']
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            if (keystorePropsFile.exists()) {
+                signingConfig signingConfigs.fixed
+            }
+        }
         release {
+            if (keystorePropsFile.exists()) {
+                signingConfig signingConfigs.fixed
+            }
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
