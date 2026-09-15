@@ -199,6 +199,46 @@ public class MainActivity extends AppCompatActivity {
         applyAppBackground();
         // 从系统权限页返回后刷新设置页权限状态
         refreshPermissionUi();
+        // 同步桌面小组件：用户可能切了周/改了布局/刚同步完课表
+        NextCourseWidgetProvider.refreshAll(this);
+    }
+
+    /**
+     * 主动请求把「下一节课」小组件添加到桌面。
+     *
+     * 国产 ROM 的组件库经常不列出第三方组件（ColorOS 实测如此），
+     * 用 requestPinAppWidget 直接弹系统确认框可以绕开组件库；
+     * OPPO/小米/华为均支持，vivo 需接入原子组件平台才生效。
+     */
+    private void requestAddWidget() {
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                Toast.makeText(this, "系统版本过低，请长按桌面手动添加小组件", Toast.LENGTH_LONG).show();
+                return;
+            }
+            android.appwidget.AppWidgetManager mgr =
+                android.appwidget.AppWidgetManager.getInstance(this);
+            if (!mgr.isRequestPinAppWidgetSupported()) {
+                Toast.makeText(this,
+                    "当前桌面不支持一键添加，请长按桌面空白处，在卡片/小组件里搜索「石大课表」",
+                    Toast.LENGTH_LONG).show();
+                return;
+            }
+            android.content.ComponentName cn =
+                new android.content.ComponentName(this, NextCourseWidgetProvider.class);
+            boolean ok = mgr.requestPinAppWidget(cn, null, null);
+            Log.d(TAG, "requestPinAppWidget -> " + ok);
+            if (!ok) {
+                Toast.makeText(this,
+                    "未能发起添加，请长按桌面空白处，在卡片/小组件里搜索「石大课表」",
+                    Toast.LENGTH_LONG).show();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "requestAddWidget error", e);
+            Toast.makeText(this,
+                "添加失败，请长按桌面空白处，在卡片/小组件里搜索「石大课表」",
+                Toast.LENGTH_LONG).show();
+        }
     }
 
     /** 把主题底色与自定义背景图应用到 Activity 层（WebView 透明，切周不闪） */
@@ -375,6 +415,11 @@ public class MainActivity extends AppCompatActivity {
         // 移动端UA，确保CAS登录页按手机版布局渲染
         s.setUserAgentString("Mozilla/5.0 (Linux; Android 16; Pixel 6) AppleWebKit/537.36 "
             + "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+
+        // 关掉点击时的蓝色/灰色高亮与长按反馈。
+        // CSS 的 -webkit-tap-highlight-color 在部分 ROM 上不生效，这里从 View 层再关一次。
+        webView.setHapticFeedbackEnabled(false);
+        webView.setLongClickable(false);
 
         CookieManager cm = CookieManager.getInstance();
         cm.setAcceptCookie(true);
@@ -1011,6 +1056,8 @@ public class MainActivity extends AppCompatActivity {
                 ReminderService.reload(this);
                 int tw = store.todayWeek();
                 renderWeekSchedule(tw > 0 ? tw : 1);
+                // 新数据落地后同步刷新桌面小组件
+                NextCourseWidgetProvider.refreshAll(this);
                 return;
             }
 
@@ -1207,7 +1254,13 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".course .bell.on svg{fill:#D99400;}");
         sb.append(".course .bell:active{transform:scale(0.85);}");
         sb.append(".course.remind-on{box-shadow:inset 0 0 0 2px rgba(255,214,71,0.92);}");
-        sb.append("*{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;}");
+        // WebView 默认会给可点击元素加一层蓝色/灰色高亮，Android 上尤其明显。
+        // 一律关掉，按压反馈交给各自的 :active 样式。
+        sb.append("*{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;");
+        sb.append("-webkit-tap-highlight-color:transparent;tap-highlight-color:transparent;outline:none;}");
+        // 部分 ROM 的 WebView 仍会画出高亮框，再兜一层
+        sb.append("a,button,div,span,li{-webkit-tap-highlight-color:transparent!important;}");
+        sb.append("html,body{-webkit-tap-highlight-color:transparent;}");
         sb.append(".modal input,.modal textarea{-webkit-user-select:auto;user-select:auto;}");
         sb.append(".grid{display:grid;grid-template-columns:34px repeat(7,1fr);gap:3px;");
         sb.append("flex:1;min-height:0;grid-auto-rows:1fr;background:var(--card2);border-radius:14px;padding:8px;");
@@ -1236,7 +1289,8 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".empty.drop-hint{background:#EEF0FF;}");
         sb.append(".course .name{font-weight:700;margin-bottom:3px;line-height:1.25;");
         sb.append("font-size:12px;color:#fff;}");
-        sb.append(".course .info{font-size:10px;opacity:0.9;line-height:1.4;color:#fff;}");
+        sb.append(".course .info{font-size:10px;opacity:0.95;line-height:1.35;color:#fff;");
+        sb.append("font-weight:600;letter-spacing:0.2px;}");
         sb.append(".empty{background:var(--empty);border-radius:8px;}");
         sb.append(".grid-head{display:grid;grid-template-columns:34px repeat(7,1fr);gap:3px;margin-bottom:4px;padding:0 8px;}");
         // 拖动模式底部操作栏（横向拉长、低高度；拖动中下滑隐藏）
@@ -1252,21 +1306,52 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".db-apply{background:#667eea;color:#fff;flex:2.2;order:2;font-size:14px;}");
         sb.append(".db-cancel{background:#F0F0F5;color:#555;flex:1;order:1;}");
         sb.append(".db-undo{background:#F0F0F5;color:#555;flex:1;order:3;}");
-        sb.append("@keyframes fadeIn{from{opacity:0;transform:translateY(8px);}");
-        sb.append("to{opacity:1;transform:translateY(0);}}");
-        sb.append(".course{animation:fadeIn 0.18s ease-out both;}");
-        // 课程详情弹窗
-        // 弹窗常驻渲染树（用 visibility/opacity 控制显隐），避免首次打开时重新布局造成卡顿
+        // 课程卡片入场动画：由小变大（缩放淡入）
+        // 仅用于课表刷新场景（切周 / 首次加载 / 手动刷新导入）
+        //
+        // fill-mode 必须是 backwards：
+        //   - backwards：动画延迟期间就应用起始帧(opacity:0,scale:.72)，
+        //     否则卡片会先以最终样式整块闪出来、等延迟结束后再从头播，视觉上
+        //     就是"先直接显示 → 消失 → 再放大"
+        //   - 不能用 both/forwards：那会在结束后锁死 transform，
+        //     导致 .dragging 的 scale(1.07) 与 :active 的 scale(0.96) 全部失效
+        sb.append("@keyframes popIn{from{opacity:0;transform:scale(0.72);}");
+        sb.append("to{opacity:1;transform:scale(1);}}");
+        sb.append(".course{animation:popIn 0.22s cubic-bezier(.34,1.4,.64,1) backwards;}");
+        // 拖动落位/撤销：不要入场动画，直接从浮动状态静止落位
+        sb.append(".course.no-anim{animation:none!important;}");
+        // ===== 课程详情弹窗：仿鸿蒙/ColorOS「应用从图标展开成窗口」 =====
+        //
+        // 思路：不做整体缩放。卡片是细高条、弹窗是宽扁块，任何 scale 都会变形。
+        // 改为「窗口生长」：一个面板从卡片矩形(位置/尺寸/圆角)平滑过渡到弹窗矩形，
+        // 内容始终按最终尺寸排版，只在窗口成形后淡入。这样只有边界在动，文字不变形。
+        // 遮罩：显隐与深浅完全交给 CSS 类控制。
+        // 不要在 JS 里设置/清空 background —— 清空后会回落到这里的默认值，
+        // 若默认值与 .show 不同就会出现"页面先暗一下再亮"的闪烁。
         sb.append(".modal-bg{display:flex;align-items:center;justify-content:center;position:fixed;");
-        sb.append("top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.4);z-index:100;");
-        sb.append("visibility:hidden;opacity:0;pointer-events:none;transition:opacity 0.16s ease;}");
-        sb.append(".modal-bg.show{visibility:visible;opacity:1;pointer-events:auto;}");
-        sb.append(".modal{background:var(--modal);border-radius:16px;width:85%;max-width:340px;");
-        sb.append("padding:20px;box-shadow:0 8px 32px rgba(0,0,0,0.3);");
-        sb.append("will-change:transform,opacity;transform:translateZ(0);");
-        sb.append("transition:background-color 0.3s ease;}");
-        sb.append("@keyframes slideUp{from{transform:translateY(30px);opacity:0;}");
-        sb.append("to{transform:translateY(0);opacity:1;}}");
+        sb.append("top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0);z-index:100;");
+        sb.append("visibility:hidden;pointer-events:none;");
+        sb.append("transition:background-color 220ms ease,visibility 0s linear 220ms;}");
+        sb.append(".modal-bg.show{visibility:visible;pointer-events:auto;background:rgba(0,0,0,0.4);");
+        sb.append("transition:background-color 220ms ease,visibility 0s;}");
+
+        // 生长面板：定位用 left/top/width/height（不用 transform，避免与内容缩放纠缠）
+        //
+        // visibility 由 .modal-bg.show 同步驱动，且不参与过渡（0s）：
+        // 关闭时移除 .show 会让面板「同一帧内立刻不可见」，之后清空内联的
+        // left/top/width/height 就不会再露出「弹回居中大尺寸」的一帧。
+        // 若把可见性交给遮罩那 220ms 的延迟过渡，面板会在收缩完成后
+        // 又整块闪回一次（实测 46px → 340px）。
+        sb.append(".modal{position:fixed;background:var(--modal);");
+        sb.append("width:85%;max-width:340px;padding:20px;box-sizing:border-box;");
+        sb.append("box-shadow:0 12px 40px rgba(0,0,0,0.32);");
+        sb.append("will-change:left,top,width,height,border-radius;");
+        sb.append("visibility:hidden;");
+        sb.append("border-radius:18px;overflow:hidden;}");
+        sb.append(".modal-bg.show .modal{visibility:visible;}");
+        // 内容层：始终按最终尺寸渲染，只做透明度
+        sb.append(".modal .m-inner{opacity:1;}");
+
         sb.append(".modal h2{font-size:16px;font-weight:700;margin-bottom:12px;color:var(--fg);}");
         sb.append(".modal .row{display:flex;padding:8px 0;border-bottom:1px solid var(--line);}");
         sb.append(".modal .row .label{color:var(--sub);font-size:13px;min-width:70px;}");
@@ -1489,17 +1574,13 @@ public class MainActivity extends AppCompatActivity {
                         if (k > 0) sb.append("<hr style='border:0;border-top:1px solid rgba(255,255,255,0.3);margin:3px 0'>");
                         sb.append("<div class='name'>").append(esc(nm)).append("</div>");
                     }
-                    String teacher = first.optString("teacher", "").trim();
+                    // 教师不再显示在卡片上（仅详情弹窗保留）；
+                    // 地点列在名称下方，让用户不点开就能看到上课地点
                     String location = first.optString("location", "").trim();
-                    StringBuilder ib = new StringBuilder();
-                    if (!teacher.isEmpty()) ib.append(esc(teacher));
                     if (!location.isEmpty()) {
-                        if (ib.length() > 0) ib.append(" | ");
-                        ib.append(esc(location));
+                        if (location.length() > 24) location = location.substring(0, 24) + "...";
+                        sb.append("<div class='info'>").append(esc(location)).append("</div>");
                     }
-                    String info = ib.toString();
-                    if (info.length() > 40) info = info.substring(0, 40) + "...";
-                    if (!info.isEmpty()) sb.append("<div class='info'>").append(info).append("</div>");
                     sb.append("</div>");
                 } else {
                     // 空格也带位置属性：拖动放置时 swapNodes 能正确交换属性，否则卡片位置被清空导致应用不生效
@@ -1509,13 +1590,14 @@ public class MainActivity extends AppCompatActivity {
         }
         sb.append("</div>");
 
-        // 课程详情弹窗
+        // 课程详情弹窗：外层 .modal 是「生长的窗口」，内层 .m-inner 是内容（不缩放）
         sb.append("<div class='modal-bg' id='courseModal' onclick='closeModal()'>");
         sb.append("<div class='modal' onclick='event.stopPropagation()'>");
+        sb.append("<div class='m-inner'>");
         sb.append("<h2 id='cmTitle'></h2>");
         sb.append("<div id='cmBody'></div>");
         sb.append("<button class='modal-close' onclick='closeModal()'>关闭</button>");
-        sb.append("</div></div>");
+        sb.append("</div></div></div>");
 
         // ===== 设置页（独立页面，从右侧滑入）=====
         // 一级：设置列表
@@ -1560,6 +1642,16 @@ public class MainActivity extends AppCompatActivity {
           .append(";background:#FFF0F0;color:#e55;' ");
         sb.append("onclick='Android.onClearBackground()'>清除图片背景</button>");
         sb.append("</div>");
+        sb.append("</div>");
+        // 桌面小组件：部分 ROM（ColorOS/MIUI 等）组件库里找不到第三方组件，
+        // 提供主动添加入口，直接弹系统确认框，绕开组件库
+        sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
+        sb.append("<div><div class='si-label'>桌面小组件</div>");
+        sb.append("<div class='si-desc'>在桌面显示下一节课的名称与地点，可自由拉伸大小</div></div>");
+        sb.append("<button class='adv-btn' style='margin-top:10px;width:100%;' ");
+        sb.append("onclick='Android.onAddWidget()'>添加到桌面</button>");
+        sb.append("<div class='si-hint' style='margin-top:6px;'>若未弹出确认框，可长按桌面空白处，");
+        sb.append("在「卡片/小组件」里搜索「石大课表」手动添加</div>");
         sb.append("</div>");
         // 提醒提前时间选择器
         int curAdvance = store != null ? store.getAdvanceMinutes() : 15;
@@ -1698,11 +1790,16 @@ public class MainActivity extends AppCompatActivity {
         // 再恢复样式；否则卡片自己挡在触点下方会命中自身导致交换失败弹回
         sb.append("function endDrag(t){");
         sb.append("  var el=dragEl;dragEl=null;");
+        // 落位期间禁用入场动画，否则复位 transform 会让 popIn 重播，出现"上滑/弹入"特效
+        sb.append("  el.classList.add('no-anim');");
         sb.append("  el.classList.remove('dragging');");
         sb.append("  var target=null;");
         sb.append("  if(t){var under=document.elementFromPoint(t.clientX,t.clientY);");
         sb.append("    target=under?under.closest('.course,.empty'):null;}");
-        sb.append("  el.style.transition='';el.style.transform='';el.style.pointerEvents='';");
+        // 直接落位：清掉拖动时的位移/缩放，不做过渡
+        sb.append("  el.style.transition='none';");
+        sb.append("  el.style.transform='';");
+        sb.append("  el.style.pointerEvents='';");
         sb.append("  if(target&&target!==el){");
         sb.append("    swapNodes(el,target);");
         sb.append("    undoStack.push([el,target]);");
@@ -1712,12 +1809,22 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  didDrag=true;");
         sb.append("  var db=document.getElementById('dockbar');");
         sb.append("  if(db)db.classList.remove('hide-drag');");
+        // 下一帧恢复 transition 与动画类，避免影响后续正常刷新
+        sb.append("  requestAnimationFrame(function(){");
+        sb.append("    el.style.transition='';");
+        sb.append("    el.classList.remove('no-anim');");
+        sb.append("  });");
         sb.append("  setTimeout(function(){window.__suppressSwipe=false;},50);");
         sb.append("}");
         sb.append("function undoMove(){");
         sb.append("  if(!undoStack.length)return;");
         sb.append("  var p=undoStack.pop();");
+        // 撤销同样直接落位，不播放入场动画
+        sb.append("  p[0].classList.add('no-anim');p[1].classList.add('no-anim');");
         sb.append("  swapNodes(p[0],p[1]);");
+        sb.append("  requestAnimationFrame(function(){");
+        sb.append("    p[0].classList.remove('no-anim');p[1].classList.remove('no-anim');");
+        sb.append("  });");
         sb.append("  updateUndoBtn();");
         sb.append("}");
         sb.append("function applyMoves(){");
@@ -1764,7 +1871,16 @@ public class MainActivity extends AppCompatActivity {
         sb.append("    if(didDrag){didDrag=false;return;}");
         sb.append("    if(dragMode)return;");
         sb.append("    var d=this.getAttribute('data-detail');");
-        sb.append("    if(d){window.__cardRect=this.getBoundingClientRect();window.__openedCard=this;this.style.opacity='0';Android.onCourseClick(d);}");
+        // 取 rect 前先摘掉入场动画：popIn 进行中时 scale 会让 getBoundingClientRect 返回
+        // 缩放后的矩形，FLIP 起点算错就会导致"卡片放大与弹窗对不上"
+        sb.append("    if(d){");
+        sb.append("      var hadAnim=this.style.animation;");
+        sb.append("      this.style.animation='none';");
+        sb.append("      var rc=this.getBoundingClientRect();");
+        sb.append("      window.__cardRect={left:rc.left,top:rc.top,width:rc.width,height:rc.height};");
+        sb.append("      this.style.animation=hadAnim;");
+        // 卡片不在这里隐藏：窗口先盖住它，等打开动画开始时再淡出，避免中间出现空洞
+        sb.append("      window.__openedCard=this;Android.onCourseClick(d);}");
         sb.append("  });");
         sb.append("});");
         // 触摸滑动切周（拖动中/拖动模式下禁用）
@@ -1793,28 +1909,117 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  card.classList.toggle('remind-on',on);");
         sb.append("  Android.onToggleCourseReminder(keys.join(';;;'),on);");
         sb.append("}");
-        // 弹窗（课程详情：反向缩回卡片，背景色同步还原；设置：直接关闭）
-        sb.append("function closeModal(){");
-        // 卡片放大成弹窗：关掉时把原卡片恢复显示
-        sb.append("  if(window.__openedCard){var oc=window.__openedCard;window.__openedCard=null;");
-        sb.append("oc.style.transition='transform 0.26s ease,opacity 0.26s ease';");
-        sb.append("oc.style.transform='translate(0px,0px) scale(1,1)';oc.style.opacity='1';");
-        sb.append("setTimeout(function(){oc.style.transition='';oc.style.transform='';oc.style.opacity='';oc.style.willChange='';},280);}");
-        sb.append("  var modal=document.getElementById('courseModal');var mEl=document.querySelector('#courseModal .modal');var r=window.__cardRect;");
-        sb.append("  if(r&&r.width>0){");
-        sb.append("    var m=mEl.getBoundingClientRect();");
-        sb.append("    var sx=r.width/m.width;var sy=Math.max(r.height/m.height,0.15);");
-        sb.append("    var dx=(r.left+r.width/2)-(m.left+m.width/2);var dy=(r.top+r.height/2)-(m.top+m.height/2);");
-        // 固定 from 为可插值显式状态，防止上轮 transition/transform 残留导致跳变
+        // ===== 课程详情弹窗：窗口生长动画（仿鸿蒙/ColorOS 应用展开） =====
+        //
+        // 关键点：只动窗口边界(left/top/width/height/border-radius)，不动内容。
+        // 卡片与弹窗长宽比差异极大，任何整体 scale 都会把文字拉变形；
+        // 这里内容按最终尺寸恒定排版，窗口从卡片矩形平滑长到弹窗矩形。
+        //
+        // 时间轴：
+        //   0ms    窗口 = 卡片矩形（圆角同卡片），背景为卡片色，内容 opacity 0
+        //   0-260ms 窗口生长到弹窗矩形，圆角变 18px，背景由卡片色过渡到弹窗底色
+        //   90ms   内容开始淡入（让"窗口先成形、内容再浮现"）
+        //   260ms  收尾，清掉内联样式
+        sb.append("function playOpenAnim(mEl, cardRect, startBg, paleBg){");
+        sb.append("  var inner=mEl.querySelector('.m-inner');");
+        sb.append("  var r=cardRect;");
+        // 先量出弹窗的最终几何：临时归位再测
+        sb.append("  mEl.style.transition='none';");
+        sb.append("  mEl.style.left='';mEl.style.top='';mEl.style.width='';mEl.style.height='';");
+        sb.append("  mEl.style.borderRadius='';mEl.style.background='';");
+        sb.append("  var mr=mEl.getBoundingClientRect();");
+        sb.append("  if(!r||!r.width){return {left:mr.left,top:mr.top,width:mr.width,height:mr.height};}");
+        // 起始：窗口钉在卡片位置，圆角与卡片一致
+        sb.append("  mEl.style.left=r.left+'px';mEl.style.top=r.top+'px';");
+        sb.append("  mEl.style.width=r.width+'px';mEl.style.height=r.height+'px';");
+        sb.append("  mEl.style.borderRadius='10px';");
+        sb.append("  mEl.style.background=startBg;");
+        sb.append("  if(inner){inner.style.transition='none';inner.style.opacity='0';}");
+        sb.append("  mEl.getBoundingClientRect();");
+        // 生长：用自定义缓动贴近系统"展开"手感（先快后慢、末段微收）
+        sb.append("  var ease='cubic-bezier(.22,.9,.28,1)';");
+        sb.append("  mEl.style.transition='left 260ms '+ease+',top 260ms '+ease");
+        sb.append("    +',width 260ms '+ease+',height 260ms '+ease");
+        sb.append("    +',border-radius 260ms '+ease+',background-color 300ms ease';");
+        sb.append("  mEl.style.left=mr.left+'px';mEl.style.top=mr.top+'px';");
+        sb.append("  mEl.style.width=mr.width+'px';mEl.style.height=mr.height+'px';");
+        sb.append("  mEl.style.borderRadius='18px';");
+        sb.append("  mEl.style.background=paleBg;");
+        sb.append("  if(inner){");
+        sb.append("    inner.style.transition='opacity 170ms ease 90ms';");
+        sb.append("    inner.style.opacity='1';");
+        sb.append("  }");
+        // 原卡片同步淡出：窗口起点与卡片完全重合，所以看不出接缝
+        sb.append("  var oc=window.__openedCard;");
+        sb.append("  if(oc){");
+        sb.append("    oc.style.transition='opacity 140ms ease';");
+        sb.append("    oc.style.opacity='0';");
+        sb.append("  }");
+        sb.append("  setTimeout(function(){");
+        // 终点即 CSS 默认的居中位置，清空内联样式不会跳位；
+        // 但仍先关掉 transition 再清，避免复位这一帧被当作过渡起点
         sb.append("    mEl.style.transition='none';");
-        sb.append("    mEl.style.transform='translate(0px,0px) scale(1,1)';");
+        sb.append("    mEl.style.left='';mEl.style.top='';");
+        sb.append("    mEl.style.width='';mEl.style.height='';mEl.style.borderRadius='';");
+        sb.append("    mEl.style.background='';");
+        sb.append("    if(inner){inner.style.transition='';inner.style.opacity='';}");
         sb.append("    mEl.getBoundingClientRect();");
-        sb.append("    mEl.style.transition='transform 0.22s ease-in,opacity 0.22s ease-in,background-color 0.22s ease-in';");
-        sb.append("    mEl.style.transform='translate('+dx+'px,'+dy+'px) scale('+sx+','+sy+')';");
-        sb.append("    mEl.style.opacity='0';");
-        sb.append("    mEl.style.background=(window.__modalColor||'#fff');");
-        sb.append("    setTimeout(function(){modal.classList.remove('show');mEl.style.transition='';mEl.style.transform='';mEl.style.opacity='';mEl.style.background='';},230);");
-        sb.append("  }else{modal.classList.remove('show');mEl.style.background='';}");
+        sb.append("    mEl.style.transition='';");
+        sb.append("  },320);");
+        sb.append("  return mr;");
+        sb.append("}");
+        // 关闭：反向收缩回卡片位置
+        sb.append("function playCloseAnim(mEl, cardRect, startBg, done){");
+        sb.append("  var inner=mEl.querySelector('.m-inner');");
+        sb.append("  var r=cardRect;");
+        sb.append("  if(!r||!r.width){if(done)done();return;}");
+        sb.append("  var mr=mEl.getBoundingClientRect();");
+        sb.append("  mEl.style.transition='none';");
+        sb.append("  mEl.style.left=mr.left+'px';mEl.style.top=mr.top+'px';");
+        sb.append("  mEl.style.width=mr.width+'px';mEl.style.height=mr.height+'px';");
+        sb.append("  mEl.style.borderRadius='18px';");
+        sb.append("  if(inner){inner.style.transition='none';inner.style.opacity='1';}");
+        sb.append("  mEl.getBoundingClientRect();");
+        sb.append("  var ease='cubic-bezier(.4,0,.6,1)';");
+        sb.append("  mEl.style.transition='left 210ms '+ease+',top 210ms '+ease");
+        sb.append("    +',width 210ms '+ease+',height 210ms '+ease");
+        sb.append("    +',border-radius 210ms '+ease+',background-color 210ms ease';");
+        sb.append("  if(inner){inner.style.transition='opacity 90ms ease';inner.style.opacity='0';}");
+        sb.append("  mEl.style.left=r.left+'px';mEl.style.top=r.top+'px';");
+        sb.append("  mEl.style.width=r.width+'px';mEl.style.height=r.height+'px';");
+        sb.append("  mEl.style.borderRadius='10px';");
+        sb.append("  if(startBg)mEl.style.background=startBg;");
+        // 收缩结束后先 done()（移除 .show），此时 .modal 由 CSS 立刻变为不可见，
+        // 再清内联几何样式就不会露出一帧「弹回居中大尺寸」。
+        sb.append("  setTimeout(function(){");
+        sb.append("    if(done)done();");
+        sb.append("    mEl.style.transition='none';");
+        sb.append("    mEl.style.left='';mEl.style.top='';");
+        sb.append("    mEl.style.width='';mEl.style.height='';mEl.style.borderRadius='';");
+        sb.append("    mEl.style.background='';mEl.style.opacity='';");
+        sb.append("    if(inner){inner.style.transition='';inner.style.opacity='';}");
+        sb.append("    mEl.getBoundingClientRect();");
+        sb.append("    mEl.style.transition='';");
+        sb.append("  },250);");
+        sb.append("}");
+        // 弹窗（课程详情：窗口收缩回卡片；设置：直接关闭）
+        sb.append("function closeModal(){");
+        sb.append("  var modal=document.getElementById('courseModal');");
+        sb.append("  var mEl=document.querySelector('#courseModal .modal');");
+        sb.append("  var r=window.__cardRect;");
+        sb.append("  var oc=window.__openedCard;window.__openedCard=null;");
+        // 先把被隐藏的卡片恢复，再让窗口收缩回它
+        sb.append("  if(oc){oc.style.transition='none';oc.style.transform='';oc.style.opacity='1';");
+        sb.append("    oc.getBoundingClientRect();");
+        sb.append("    oc.style.transition='';}");
+        // 注意：拼进 JS 的注释必须用 /* */ —— sb.append 不产生换行，
+        // 用 // 会把该行之后的所有代码全注释掉，导致 "Unexpected end of input"
+        sb.append("  /* 遮罩淡出由 .show 类的 CSS transition 负责，这里只移除类 */");
+        sb.append("  playCloseAnim(mEl, r, window.__modalColor, function(){");
+        sb.append("    modal.classList.remove('show');");
+        sb.append("    if(oc){oc.style.transition='';oc.style.transform='';oc.style.opacity='';oc.style.willChange='';}");
+        sb.append("    window.__cardRect=null;");
+        sb.append("  });");
         sb.append("}");
         sb.append("function updatePermUi(overlay,battery,notify){");
         sb.append("  var list=[");
@@ -2058,6 +2263,8 @@ public class MainActivity extends AppCompatActivity {
                     store.saveOverrides(arr);
                     Log.d(TAG, "overrides applied: " + arr.length() + " courses, re-render week " + week);
                     renderWeekSchedule(week);
+                    // 位置变了，小组件的"下一节课"可能也变了
+                    NextCourseWidgetProvider.refreshAll(MainActivity.this);
                 } catch (Exception e) {
                     Log.e(TAG, "applyMoves error", e);
                 }
@@ -2099,6 +2306,11 @@ public class MainActivity extends AppCompatActivity {
                     }
                 }
             });
+        }
+
+        @JavascriptInterface
+        public void onAddWidget() {
+            handler.post(() -> requestAddWidget());
         }
 
         @JavascriptInterface
@@ -2412,39 +2624,11 @@ public class MainActivity extends AppCompatActivity {
             js.append("b.innerHTML=html;");
             js.append("var modal=document.getElementById('courseModal');");
             js.append("var mEl=document.querySelector('#courseModal .modal');");
-            js.append("modal.classList.add('show');");
             js.append("window.__modalColor='").append(startBg).append("';");
-            // FLIP：从卡片位置/尺寸放大展开成弹窗，背景随放大从课程色减淡为超淡色
-            js.append("var r=window.__cardRect;");
-            js.append("if(r&&r.width>0){");
-            js.append("  var m=mEl.getBoundingClientRect();");
-            js.append("  var sx=r.width/m.width;var sy=Math.max(r.height/m.height,0.15);");
-            js.append("  var dx=(r.left+r.width/2)-(m.left+m.width/2);var dy=(r.top+r.height/2)-(m.top+m.height/2);");
-            // 原卡片同步放大到弹窗尺寸后淡出（像打开App时图标放大展开）
-            js.append("  var card=window.__openedCard;");
-            js.append("  if(card){");
-            js.append("    card.style.transition='none';");
-            js.append("    card.style.transformOrigin='center center';");
-            js.append("    card.style.willChange='transform,opacity';");
-            js.append("    card.style.transform='translate(0px,0px) scale(1,1)';");
-            js.append("    card.style.opacity='1';");
-            js.append("    card.getBoundingClientRect();");
-            js.append("    card.style.transition='transform 0.3s cubic-bezier(.22,.68,.36,1),opacity 0.2s ease 0.16s';");
-            js.append("    card.style.transform='translate('+dx+'px,'+dy+'px) scale('+(1/sx)+','+(1/sy)+')';");
-            js.append("    card.style.opacity='0';");
-            js.append("  }");
-            js.append("  mEl.style.transition='none';");
-            js.append("  mEl.style.transformOrigin='center center';");
-            js.append("  mEl.style.transform='translate('+dx+'px,'+dy+'px) scale('+sx+','+sy+')';");
-            js.append("  mEl.style.opacity='0.25';");
-            js.append("  mEl.style.background='").append(startBg).append("';");
-            js.append("  mEl.getBoundingClientRect();");
-            js.append("  mEl.style.transition='transform 0.28s cubic-bezier(.22,.68,.36,1),opacity 0.24s ease,background-color 0.28s ease';");
-            js.append("  mEl.style.transform='translate(0px,0px) scale(1,1)';");
-            js.append("  mEl.style.opacity='1';");
-            js.append("  mEl.style.background='").append(paleBg).append("';");
-            js.append("  setTimeout(function(){mEl.style.transition='';},330);");
-            js.append("}else{mEl.style.transform='translate(0px,0px) scale(1,1)';mEl.style.opacity='1';mEl.style.background='").append(paleBg).append("';}");
+            // 遮罩深浅由 .show 类经 CSS transition 控制，这里只切换类
+            js.append("modal.classList.add('show');");
+            // 窗口从卡片矩形生长到弹窗矩形（内容不缩放，只淡入；卡片在函数内同步淡出）
+            js.append("playOpenAnim(mEl, window.__cardRect, '").append(startBg).append("', '").append(paleBg).append("');");
             js.append("})()");
 
             webView.evaluateJavascript(js.toString(), null);

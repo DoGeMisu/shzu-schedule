@@ -32,6 +32,7 @@ public class ScheduleStore {
     private static final String KEY_REMINDERS = "course_reminders";  // 已选提醒课程 JSON Set
     private static final String KEY_ADVANCE = "reminder_advance";   // 全局提前量（分钟）
     private static final String KEY_THEME = "theme";                // 课表主题 light/dark
+    private static final String KEY_WIDGET_THEME = "widget_theme";   // 小组件配色 light/dark
     private static final String KEY_BG = "bg_image";                // 自定义背景图文件名
     private static final long DAY = 86400000L;
     private static final int DATA_VERSION = 13; // 递增以清除旧版/测试数据（v13: 清除拖动测试期写入的坏 overrides）
@@ -202,6 +203,25 @@ public class ScheduleStore {
     public void setTheme(String mode) {
         theme = (mode == null || mode.isEmpty()) ? "light" : mode;
         prefs.edit().putString(KEY_THEME, theme).apply();
+    }
+
+    /**
+     * 桌面小组件配色：light / dark。
+     * 独立于 App 主题，由用户在小组件上直接点按钮切换。
+     */
+    public String getWidgetTheme() {
+        return prefs.getString(KEY_WIDGET_THEME, "light");
+    }
+
+    public void setWidgetTheme(String mode) {
+        String v = "dark".equals(mode) ? "dark" : "light";
+        prefs.edit().putString(KEY_WIDGET_THEME, v).apply();
+    }
+
+    public String toggleWidgetTheme() {
+        String next = "dark".equals(getWidgetTheme()) ? "light" : "dark";
+        setWidgetTheme(next);
+        return next;
     }
 
     /** 自定义背景图文件名（空字符串=未设置） */

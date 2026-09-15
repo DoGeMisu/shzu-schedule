@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  小组件元数据。
+  minWidth/minHeight 以 74dp 为 1 格（launcher 网格基准），
+  这里给 2x1，minResize 允许用户拉到 1x1 到 4x2 区间。
+  resizeMode="horizontal|vertical" 即允许像拉大图标那样自由拉伸。
+-->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:minWidth="146dp"
+    android:minHeight="74dp"
+    android:minResizeWidth="74dp"
+    android:minResizeHeight="74dp"
+    android:maxResizeWidth="300dp"
+    android:maxResizeHeight="220dp"
+    android:targetCellWidth="2"
+    android:targetCellHeight="1"
+    android:resizeMode="horizontal|vertical"
+    android:widgetCategory="home_screen"
+    android:initialLayout="@layout/widget_next_course"
+    android:previewLayout="@layout/widget_next_course"
+    android:description="@string/widget_description"
+    android:updatePeriodMillis="1800000" />

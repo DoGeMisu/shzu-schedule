@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  「下一节课」小组件玻璃背景。
+
+  注意：RemoteViews 不暴露 RenderEffect / 实时模糊能力，
+  小组件做不到 CSS backdrop-filter 那种真模糊，只能用
+  半透明白 + 细边框 + 顶部内高光 来模拟玻璃质感。
+  桌面有壁纸时观感接近毛玻璃；纯色壁纸下就是一层半透明卡片。
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 底层：半透明白，透出桌面壁纸 -->
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#59FFFFFF" />
+            <corners android:radius="22dp" />
+        </shape>
+    </item>
+
+    <!-- 上层：极淡的斜向渐变，制造玻璃的厚度与光泽 -->
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:startColor="#38FFFFFF"
+                android:centerColor="#0DFFFFFF"
+                android:endColor="#14000000"
+                android:angle="270" />
+            <corners android:radius="22dp" />
+        </shape>
+    </item>
+
+    <!-- 描边：提亮边缘，玻璃的"棱" -->
+    <item>
+        <shape android:shape="rectangle">
+            <stroke
+                android:width="1dp"
+                android:color="#6BFFFFFF" />
+            <solid android:color="#00000000" />
+            <corners android:radius="22dp" />
+        </shape>
+    </item>
+
+</layer-list>

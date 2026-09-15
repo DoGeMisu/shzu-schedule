@@ -15,9 +15,18 @@ AIGC:
 
 石河子大学课表安卓应用：自动登录学校统一身份认证（CAS），抓取教务系统整学期课表，本地离线渲染，支持课前提醒、深浅主题与自定义背景。
 
-![Platform](https://img.shields.io/badge/Platform-Android-3DDC84) ![Language](https://img.shields.io/badge/Language-Java-orange) ![UI](https://img.shields.io/badge/UI-WebView%20HTML%2FCSS%2FJS-blue) ![Version](https://img.shields.io/badge/Version-1.1.1-667eea)
+![Platform](https://img.shields.io/badge/Platform-Android-3DDC84) ![Language](https://img.shields.io/badge/Language-Java-orange) ![UI](https://img.shields.io/badge/UI-WebView%20HTML%2FCSS%2FJS-blue) ![Version](https://img.shields.io/badge/Version-1.1.2-667eea)
 
-## ✨ v1.1.1 更新亮点
+## ✨ v1.1.2 更新亮点
+
+- 🪟 **桌面小组件（全新）**：主屏直接显示接下来的课程，按时间先后排序，可同时列出多节；课程名用课程配色，下方标注地点与时间
+- 🎨 **小组件玻璃拟态**：半透明磨砂玻璃背景，圆角与系统组件一致，不遮挡壁纸
+- 🌗 **小组件深浅主题**：自带浅色 / 深色两套配色，**随小组件尺寸自动适配**，也可点卡片上的切换按钮手动换
+- 📐 **多尺寸适配**：支持 1×2 / 1×3 / 2×2 等桌面网格，行数随组件高度自动增减
+- 🐛 **修复弹窗闪烁**：打开课程详情时页面「先暗一下再亮」、关闭时「缩小后又闪一下」的问题已修复
+- 🐛 **修复点击高亮**：点卡片和按钮时出现的蓝色背景块已去除
+
+## v1.1.1 更新亮点
 
 - 🛡 **权限体检清单**：设置页一眼看出缺哪项权限（悬浮窗 / 通知 / 后台运行 / 自启动），点任一项直接跳转去开
 - 📱 **机型专属指引**：按小米红米、华为荣耀、OPPO/realme/一加、vivo/iQOO、魅族、三星分别给出**具体设置路径**
@@ -62,6 +71,18 @@ AIGC:
 - 自定义图片背景（相册选取），课程卡片、星期栏、按钮自动半透明，网格无白底
 - 自适应图标 + Android 13 主题图标（Monochrome）适配
 
+### 桌面小组件（v1.1.2 新增）
+
+- **接下来的课程**：主屏直接显示按时间先后排序的后续课程，一门一行
+- **课程配色**：每行课程名使用与课表一致的课程颜色，左侧有同色标记条
+- **地点与时间**：课程名下方标注「地点 · 时间段」，今天 / 明天用相对日期
+- **玻璃拟态**：半透明磨砂背景 + 细描边，圆角 22dp，不遮挡壁纸
+- **深浅自适应**：浅色 / 深色两套配色，按小组件尺寸自动选择，也可点顶部 ◐ 按钮手动切换
+- **多尺寸**：支持 1×2 / 1×3 / 2×2 等网格，高度越大显示行数越多（最多 4 行）
+
+> ⚠️ **注意**：部分国产 ROM（如 ColorOS / 澎湃 OS）会屏蔽第三方应用的小组件，
+> 小组件中心可能不显示「石大课表」。这是系统限制，非应用问题。
+
 ## 技术架构
 
 ```
@@ -69,6 +90,8 @@ AIGC:
 │ MainActivity     CAS登录 / 状态机 / 抓取调度 / HTML生成   │
 │ ScheduleStore    课表数据存取（内存缓存）/ 周次计算       │
 │ reminder/        提醒前台服务 · 悬浮窗 · 权限 · 开机自启   │
+│ NextCourse       下一节课计算（排序 / 配色 / 周次过滤）    │
+│ widget/          桌面小组件 RemoteViews 渲染             │
 │ util/            密码加密(Keystore) · 权限跳转           │
 └────────────────────────┬───────────────────────────────┘
                          │ addJavascriptInterface ↔ evaluateJavascript

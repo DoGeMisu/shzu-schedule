@@ -55,5 +55,17 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
+
+        <!-- 下一节课桌面小组件：支持 1x1 ~ 4x2 自由拉伸 -->
+        <receiver
+            android:name=".NextCourseWidgetProvider"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_next_course_info" />
+        </receiver>
     </application>
 </manifest>

@@ -1,0 +1,235 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  接下来几节课小组件（玻璃拟态 + 多课程列表）。
+
+  固定渲染 4 行，Provider 按实际数量与小组件尺寸控制各行显隐。
+  RemoteViews 不支持动态增删 View，故采用“预留 + GONE”。
+
+  每行：色条 | 课程名 / 地点·时间
+  色条用 TextView 而非 View 标签 —— RemoteViews 只允许白名单控件，
+  用 View 会抛 “Class not allowed to be inflated android.view.View”。
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:gravity="top"
+    android:padding="11dp"
+    android:background="@drawable/widget_bg">
+
+    <!-- 顶栏：状态标签 + 深浅切换按钮 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical">
+
+        <TextView
+            android:id="@+id/widget_label"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:textSize="10sp"
+            android:textColor="#5A6285"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:text="接下来" />
+
+        <TextView
+            android:id="@+id/widget_theme_btn"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:paddingLeft="8dp"
+            android:paddingRight="2dp"
+            android:paddingTop="2dp"
+            android:paddingBottom="2dp"
+            android:textSize="11sp"
+            android:textColor="#4A5170"
+            android:text="◐" />
+    </LinearLayout>
+
+    <!-- ===== 第 1 行 ===== -->
+    <LinearLayout
+        android:id="@+id/row1"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="5dp"
+        android:orientation="horizontal"
+        android:gravity="center_vertical">
+
+        <TextView
+            android:id="@+id/dot1"
+            android:layout_width="3dp"
+            android:layout_height="24dp"
+            android:layout_marginRight="8dp"
+            android:background="#667eea" />
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/name1"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textSize="13sp"
+                android:textStyle="bold"
+                android:textColor="#1F2437"
+                android:maxLines="1"
+                android:ellipsize="end"
+                android:text="" />
+
+            <TextView
+                android:id="@+id/sub1"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textSize="10sp"
+                android:textColor="#5A6285"
+                android:maxLines="1"
+                android:ellipsize="end"
+                android:text="" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- ===== 第 2 行 ===== -->
+    <LinearLayout
+        android:id="@+id/row2"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/dot2"
+            android:layout_width="3dp"
+            android:layout_height="24dp"
+            android:layout_marginRight="8dp"
+            android:background="#667eea" />
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/name2"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textSize="13sp"
+                android:textStyle="bold"
+                android:textColor="#1F2437"
+                android:maxLines="1"
+                android:ellipsize="end"
+                android:text="" />
+
+            <TextView
+                android:id="@+id/sub2"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textSize="10sp"
+                android:textColor="#5A6285"
+                android:maxLines="1"
+                android:ellipsize="end"
+                android:text="" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- ===== 第 3 行 ===== -->
+    <LinearLayout
+        android:id="@+id/row3"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/dot3"
+            android:layout_width="3dp"
+            android:layout_height="24dp"
+            android:layout_marginRight="8dp"
+            android:background="#667eea" />
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/name3"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textSize="13sp"
+                android:textStyle="bold"
+                android:textColor="#1F2437"
+                android:maxLines="1"
+                android:ellipsize="end"
+                android:text="" />
+
+            <TextView
+                android:id="@+id/sub3"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textSize="10sp"
+                android:textColor="#5A6285"
+                android:maxLines="1"
+                android:ellipsize="end"
+                android:text="" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- ===== 第 4 行 ===== -->
+    <LinearLayout
+        android:id="@+id/row4"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/dot4"
+            android:layout_width="3dp"
+            android:layout_height="24dp"
+            android:layout_marginRight="8dp"
+            android:background="#667eea" />
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/name4"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textSize="13sp"
+                android:textStyle="bold"
+                android:textColor="#1F2437"
+                android:maxLines="1"
+                android:ellipsize="end"
+                android:text="" />
+
+            <TextView
+                android:id="@+id/sub4"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textSize="10sp"
+                android:textColor="#5A6285"
+                android:maxLines="1"
+                android:ellipsize="end"
+                android:text="" />
+        </LinearLayout>
+    </LinearLayout>
+
+</LinearLayout>

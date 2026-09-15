@@ -11,4 +11,5 @@
     <string name="no_schedule">未获取到课表数据</string>
     <string name="fetching_schedule">正在获取课表…</string>
     <string name="logging_in">正在登录…</string>
+    <string name="widget_description">显示下一节课的名称与上课地点，可自由拉伸大小</string>
 </resources>

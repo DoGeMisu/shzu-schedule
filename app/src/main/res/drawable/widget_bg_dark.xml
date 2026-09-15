@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  「下一节课」小组件玻璃背景 —— 深色版。
+
+  RemoteViews 不暴露实时模糊能力，用半透明黑 + 细边框 + 光泽渐变模拟玻璃。
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#B3151721" />
+            <corners android:radius="22dp" />
+        </shape>
+    </item>
+
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:startColor="#33FFFFFF"
+                android:centerColor="#0AFFFFFF"
+                android:endColor="#33000000"
+                android:angle="270" />
+            <corners android:radius="22dp" />
+        </shape>
+    </item>
+
+    <item>
+        <shape android:shape="rectangle">
+            <stroke
+                android:width="1dp"
+                android:color="#33FFFFFF" />
+            <solid android:color="#00000000" />
+            <corners android:radius="22dp" />
+        </shape>
+    </item>
+
+</layer-list>
