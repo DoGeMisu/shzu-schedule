@@ -116,7 +116,7 @@ AIGC:
 
 ## 构建
 
-环境要求：JDK 21、Android SDK（compileSdk 34）、Gradle 8.4 + AGP 8.3.2
+环境要求：JDK 21、Android SDK（compileSdk 34，需含 `platforms/android-34` 与 `build-tools/34.0.0`）、Gradle 8.4 + AGP 8.3.2
 
 ```bash
 git clone https://github.com/DoGeMisu/shzu-schedule.git
@@ -125,7 +125,16 @@ gradle assembleDebug
 # 产物: app/build/outputs/apk/debug/app-debug.apk
 ```
 
-> 首次构建请在 `local.properties` 中配置本机 SDK 路径（参考 `sdk.dir=F:\\AndroidEmulator\\android-sdk`，按实际路径修改）。
+> **首次构建必须自行配置 SDK 路径**：在项目根目录新建 `local.properties`，写入本机 Android SDK 的绝对路径（该文件**不入库**，每个人的路径都不同）：
+>
+> ```properties
+> sdk.dir=C\:\\Android\\Sdk
+> ```
+>
+> 注意 Windows 路径需按 Java Properties 规则转义（`\` 写成 `\\`，冒号写成 `\:`）。
+> 也可以用环境变量 `ANDROID_HOME` 代替，或在 Android Studio 中打开项目，IDE 会自动生成该文件。
+>
+> 若报 `Failed to apply plugin 'com.android.internal.application'`，通常是 SDK 路径不对或缺少 `platforms/android-34`、`build-tools/34.0.0`，用 SDK Manager 补齐即可。
 
 ## 隐私与安全
 
