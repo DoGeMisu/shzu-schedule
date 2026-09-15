@@ -1871,15 +1871,19 @@ public class MainActivity extends AppCompatActivity {
         sb.append("    if(didDrag){didDrag=false;return;}");
         sb.append("    if(dragMode)return;");
         sb.append("    var d=this.getAttribute('data-detail');");
-        // 取 rect 前先摘掉入场动画：popIn 进行中时 scale 会让 getBoundingClientRect 返回
-        // 缩放后的矩形，FLIP 起点算错就会导致"卡片放大与弹窗对不上"
+        // 取 rect 时若入场动画(popIn)还在播，scale 会让 getBoundingClientRect
+        // 返回缩放后的矩形，窗口起点就算错了。
+        //
+        // 但不能用「禁用动画再恢复」的办法：恢复的那一刻元素重新匹配 CSS 的
+        // animation 规则，popIn 会连 animation-delay 一起从头播放，首帧 opacity:0 —— 
+        // 表现为「点一下卡片消失」或「卡片又播了一次入场动画」。
+        // 这里改成把动画直接快进到终态并保持，不动 animation 属性。
         sb.append("    if(d){");
-        sb.append("      var hadAnim=this.style.animation;");
-        sb.append("      this.style.animation='none';");
+        sb.append("      if(this.getAnimations){");
+        sb.append("        this.getAnimations().forEach(function(a){try{a.finish();}catch(e){}});");
+        sb.append("      }");
         sb.append("      var rc=this.getBoundingClientRect();");
         sb.append("      window.__cardRect={left:rc.left,top:rc.top,width:rc.width,height:rc.height};");
-        sb.append("      this.style.animation=hadAnim;");
-        // 卡片不在这里隐藏：窗口先盖住它，等打开动画开始时再淡出，避免中间出现空洞
         sb.append("      window.__openedCard=this;Android.onCourseClick(d);}");
         sb.append("  });");
         sb.append("});");
@@ -1936,6 +1940,10 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  mEl.style.background=startBg;");
         sb.append("  if(inner){inner.style.transition='none';inner.style.opacity='0';}");
         sb.append("  mEl.getBoundingClientRect();");
+        // 起点已就位。过渡推迟到下一帧启动：
+        // 调用方会在本函数返回后才 add('show')，若此刻就启动过渡，
+        // 窗口在不可见状态下已经跑掉一部分，露出时动画就不从头开始了。
+        sb.append("  requestAnimationFrame(function(){");
         // 生长：用自定义缓动贴近系统"展开"手感（先快后慢、末段微收）
         sb.append("  var ease='cubic-bezier(.22,.9,.28,1)';");
         sb.append("  mEl.style.transition='left 260ms '+ease+',top 260ms '+ease");
@@ -1949,10 +1957,17 @@ public class MainActivity extends AppCompatActivity {
         sb.append("    inner.style.transition='opacity 170ms ease 90ms';");
         sb.append("    inner.style.opacity='1';");
         sb.append("  }");
-        // 原卡片同步淡出：窗口起点与卡片完全重合，所以看不出接缝
+        sb.append("  });");
+        sb.append("  requestAnimationFrame(function(){");
+        // 原卡片淡出：与窗口生长同时启动，不留延迟。
+        //
+        // 窗口起点被钉成与卡片完全相同的矩形（位置/尺寸/圆角/背景色都一致），
+        // 所以 t=0 这一帧两者像素级重合，此刻交接是零视觉差异的。
+        // 一旦窗口开始变大就会离开卡片原位，若此时卡片还在，那块位置就会
+        // 先露出一个空洞再消失 —— 就是"卡片突然消失"。
         sb.append("  var oc=window.__openedCard;");
         sb.append("  if(oc){");
-        sb.append("    oc.style.transition='opacity 140ms ease';");
+        sb.append("    oc.style.transition='opacity 160ms ease';");
         sb.append("    oc.style.opacity='0';");
         sb.append("  }");
         sb.append("  setTimeout(function(){");
@@ -1966,6 +1981,7 @@ public class MainActivity extends AppCompatActivity {
         sb.append("    mEl.getBoundingClientRect();");
         sb.append("    mEl.style.transition='';");
         sb.append("  },320);");
+        sb.append("  });");
         sb.append("  return mr;");
         sb.append("}");
         // 关闭：反向收缩回卡片位置
@@ -2008,16 +2024,24 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  var mEl=document.querySelector('#courseModal .modal');");
         sb.append("  var r=window.__cardRect;");
         sb.append("  var oc=window.__openedCard;window.__openedCard=null;");
-        // 先把被隐藏的卡片恢复，再让窗口收缩回它
-        sb.append("  if(oc){oc.style.transition='none';oc.style.transform='';oc.style.opacity='1';");
+        // 卡片先设为透明（此刻窗口还盖着它，看不出变化），
+        // 但要与收缩的「末段」重叠渐显，不能等收缩完全结束才开始：
+        // 窗口缩到比卡片小时，卡片原位会先露出空洞，随后才补上 —— 就是"消失再出现"。
+        // 120ms 时窗口已接近卡片尺寸，从这里渐显到 250ms 正好衔接。
+        sb.append("  if(oc){oc.style.transition='none';oc.style.transform='';oc.style.opacity='0';");
         sb.append("    oc.getBoundingClientRect();");
-        sb.append("    oc.style.transition='';}");
+        sb.append("    setTimeout(function(){");
+        sb.append("      oc.style.transition='opacity 130ms ease';oc.style.opacity='1';");
+        sb.append("    },120);}");
         // 注意：拼进 JS 的注释必须用 /* */ —— sb.append 不产生换行，
         // 用 // 会把该行之后的所有代码全注释掉，导致 "Unexpected end of input"
         sb.append("  /* 遮罩淡出由 .show 类的 CSS transition 负责，这里只移除类 */");
         sb.append("  playCloseAnim(mEl, r, window.__modalColor, function(){");
         sb.append("    modal.classList.remove('show');");
-        sb.append("    if(oc){oc.style.transition='';oc.style.transform='';oc.style.opacity='';oc.style.willChange='';}");
+        // 卡片渐显已在 120ms 时启动、250ms 结束，这里只做收尾清理。
+        // 不要再设 opacity/transition —— 会打断正在播放的淡入导致闪跳。
+        sb.append("    if(oc){setTimeout(function(){oc.style.transition='';oc.style.transform='';");
+        sb.append("      oc.style.opacity='';oc.style.willChange='';},140);}");
         sb.append("    window.__cardRect=null;");
         sb.append("  });");
         sb.append("}");
@@ -2625,10 +2649,11 @@ public class MainActivity extends AppCompatActivity {
             js.append("var modal=document.getElementById('courseModal');");
             js.append("var mEl=document.querySelector('#courseModal .modal');");
             js.append("window.__modalColor='").append(startBg).append("';");
-            // 遮罩深浅由 .show 类经 CSS transition 控制，这里只切换类
-            js.append("modal.classList.add('show');");
-            // 窗口从卡片矩形生长到弹窗矩形（内容不缩放，只淡入；卡片在函数内同步淡出）
+            // 先让窗口就位（钉到卡片矩形、内容透明），再显示遮罩并开始生长。
+            // 顺序不能反：若先 add('show')，窗口会以默认/上次残留的几何被画出一帧，
+            // 采样中表现为"弹窗先出现在居中大尺寸，再突然跳到卡片位置"。
             js.append("playOpenAnim(mEl, window.__cardRect, '").append(startBg).append("', '").append(paleBg).append("');");
+            js.append("modal.classList.add('show');");
             js.append("})()");
 
             webView.evaluateJavascript(js.toString(), null);
