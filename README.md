@@ -24,9 +24,17 @@ AIGC:
 
 > 两处源码与版本完全同步，功能一致。若 Gitee 打不开，请改用 GitHub，反之亦然。
 
-![Platform](https://img.shields.io/badge/Platform-Android-3DDC84) ![Language](https://img.shields.io/badge/Language-Java-orange) ![UI](https://img.shields.io/badge/UI-WebView%20HTML%2FCSS%2FJS-blue) ![Version](https://img.shields.io/badge/Version-1.1.2-667eea)
+![Platform](https://img.shields.io/badge/Platform-Android-3DDC84) ![Language](https://img.shields.io/badge/Language-Java-orange) ![UI](https://img.shields.io/badge/UI-WebView%20HTML%2FCSS%2FJS-blue) ![Version](https://img.shields.io/badge/Version-1.1.3-667eea)
 
-## ✨ v1.1.2 更新亮点
+## ✨ v1.1.3 更新亮点
+
+- 🐛 **修复切应用回来闪白**：在澎湃 OS 等机型上切屏或切到其他应用再切回来时界面闪动、深色主题下先闪一下白的问题已修复（背景图改异步解码 + 避免无谓重绘 + 窗口底色跟随主题）
+- 🐛 **修复小组件课程位置**：在课表里拖动调整过位置的课程，桌面小组件现在会同步显示到新位置，不再停留在原始位置
+- 🐛 **修复自定义背景下的课程详情弹窗**：使用自定义背景图时，弹窗弹出动画结束后会跳成不透明纯白，现正确保持半透明毛玻璃
+- 🐛 **修复弹窗闪烁**：打开课程详情时页面「先暗一下再亮」、关闭时「缩小后又闪一下」
+- 🐛 **修复点击高亮**：点卡片和按钮时出现的蓝色背景块已去除
+
+## v1.1.2 更新亮点
 
 - 🪟 **桌面小组件（全新）**：主屏直接显示接下来的课程，按时间先后排序，可同时列出多节；课程名用课程配色，下方标注地点与时间
 - 🎨 **小组件玻璃拟态**：半透明磨砂玻璃背景，圆角与系统组件一致，不遮挡壁纸
