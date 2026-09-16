@@ -1,14 +1,3 @@
----
-AIGC:
-  ContentProducer: '001191110102MAD55U9H0F10002'
-  ContentPropagator: '001191110102MAD55U9H0F10002'
-  Label: '1'
-  ProduceID: 'c28dbd9e-4769-489a-878b-aa3a40977d84'
-  PropagateID: 'c28dbd9e-4769-489a-878b-aa3a40977d84'
-  ReservedCode1: 'b00c8fb0-7ca2-4ef3-aba3-7ac95198bca8'
-  ReservedCode2: 'b00c8fb0-7ca2-4ef3-aba3-7ac95198bca8'
----
-
 # 石大课表 (SHZU Schedule)
 
 > **非官方声明**：本项目**非石河子大学官方软件**，由在校学生利用**课余时间**出于学习目的独立开发维护，与学校官方及教务部门无任何关联。
