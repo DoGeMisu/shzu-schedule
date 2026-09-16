@@ -109,6 +109,15 @@ public class MainActivity extends AppCompatActivity {
     private int emptyScans = 0;              // 课表链接空扫描计数
     private int navToken = 0;                // 导航代际(取消过期回调)
     private boolean showingDisplay = false;   // 正在显示生成的课表HTML
+    /**
+     * 当前是否停留在自绘课表页（持久状态，与 showingDisplay 不同）。
+     *
+     * showingDisplay 只用于"跳过本次 onPageFinished 的解析"，页面加载完就立刻
+     * 清掉了；而返回键需要知道"用户此刻是不是还在课表页"，所以必须单独记一份。
+     * 切周/改布局都会重新 loadDataWithBaseURL 往 WebView 历史里压记录，
+     * 只有靠这个标记才能避免返回键变成"回到上一周"。
+     */
+    private boolean onGeneratedSchedule = false;
     private boolean parseResultReceived = false; // parseSchedule JS是否已回调结果
     private ScheduleStore store;               // 课表本地存储
 
@@ -438,6 +447,15 @@ public class MainActivity extends AppCompatActivity {
                     if (value != null && value.contains("1")) {
                         return; // JS 已关闭顶层页面，返回键到此为止
                     }
+                    // 课表页是我们自己生成的 HTML，切周/改布局都会重新
+                    // loadDataWithBaseURL，每次都会在 WebView 历史里压一条记录。
+                    // 若此时还去 goBack()，返回键就会变成"回到上一周"而不是退出应用。
+                    // 所以只要当前停留在自绘课表页，就直接交给系统处理（退出）。
+                    if (onGeneratedSchedule) {
+                        super.onBackPressed();
+                        return;
+                    }
+                    // 仅 CAS 登录页 / 教务系统页面才回退历史
                     if (webView.canGoBack()) {
                         webView.goBack();
                     } else {
@@ -604,6 +622,10 @@ public class MainActivity extends AppCompatActivity {
             Log.d(TAG, "display page loaded, ignoring");
             return;
         }
+
+        // 加载到了真实的网页（CAS 登录页 / 教务系统）→ 已离开自绘课表页，
+        // 此后返回键应恢复为回退 WebView 历史
+        onGeneratedSchedule = false;
 
         if (url.contains("authserver.shzu.edu.cn")) {
             // ====== CAS 域下（登录页/短信MFA验证页/其他）→ 检测页面类型 ======
@@ -1207,6 +1229,7 @@ public class MainActivity extends AppCompatActivity {
         String html = generateWeekHTML(week, courses);
         hideLoading();
         showingDisplay = true;
+        onGeneratedSchedule = true;
         webView.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null);
     }
 
