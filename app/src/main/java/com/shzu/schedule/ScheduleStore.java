@@ -35,6 +35,7 @@ public class ScheduleStore {
     private static final String KEY_THEME = "theme";                // 课表主题 light/dark
     private static final String KEY_WIDGET_THEME = "widget_theme";   // 小组件配色 light/dark
     private static final String KEY_BG = "bg_image";                // 自定义背景图文件名
+    private static final String KEY_SPLASH_ANIM = "splash_anim";    // 是否播放开屏动画（关闭则启动直达课表）
     private static final long DAY = 86400000L;
     private static final int DATA_VERSION = 13; // 递增以清除旧版/测试数据（v13: 清除拖动测试期写入的坏 overrides）
     private static final int DEFAULT_ADVANCE = 15; // 默认提前15分钟
@@ -51,6 +52,7 @@ public class ScheduleStore {
     private int advanceMinutes = DEFAULT_ADVANCE;
     private String theme = "light";
     private String bgImage = "";
+    private boolean splashAnimEnabled = true;
 
     public ScheduleStore(Context ctx) {
         prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
@@ -89,6 +91,7 @@ public class ScheduleStore {
         advanceMinutes = prefs.getInt(KEY_ADVANCE, DEFAULT_ADVANCE);
         theme = prefs.getString(KEY_THEME, "light");
         bgImage = prefs.getString(KEY_BG, "");
+        splashAnimEnabled = prefs.getBoolean(KEY_SPLASH_ANIM, true);
         try {
             String rj = prefs.getString(KEY_REMINDERS, null);
             if (rj != null) {
@@ -253,6 +256,34 @@ public class ScheduleStore {
     public void setBgImage(String fileName) {
         bgImage = (fileName == null) ? "" : fileName;
         prefs.edit().putString(KEY_BG, bgImage).apply();
+    }
+
+    /** 是否播放开屏动画（默认开启）；关闭后启动直接进入课表 */
+    public boolean isSplashAnimEnabled() {
+        return splashAnimEnabled;
+    }
+
+    public void setSplashAnimEnabled(boolean enabled) {
+        splashAnimEnabled = enabled;
+        prefs.edit().putBoolean(KEY_SPLASH_ANIM, enabled).apply();
+    }
+
+    /**
+     * 课表数据的轻量指纹。
+     * 用于判断「后台预生成的周课表 HTML」是否仍然有效：课程增删改后指纹变化，
+     * 旧缓存立即作废，避免把过期的课表当作新数据渲染出来。
+     */
+    public int getCoursesHash() {
+        if (courses == null) return 0;
+        int h = 1;
+        for (int i = 0; i < courses.length(); i++) {
+            JSONObject c = courses.optJSONObject(i);
+            if (c == null) continue;
+            h = 31 * h + (c.optString("name", "") + "|" + c.optString("teacher", "") + "|"
+                    + c.optString("location", "") + "|" + c.optString("weeks", "") + "|"
+                    + c.optInt("day", 0) + "|" + c.optInt("row", 0)).hashCode();
+        }
+        return h;
     }
 
     /** 清除所有拖动位置覆盖（恢复课程在课表中的原始位置） */

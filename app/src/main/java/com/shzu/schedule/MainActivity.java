@@ -175,7 +175,12 @@ public class MainActivity extends AppCompatActivity {
         }
 
         setupWebView();
-        playSplashAnimation();
+        // 开屏动画可关闭（设置→通用设置）：关闭后启动不再播 Logo 动画，直接进入课表
+        if (new ScheduleStore(this).isSplashAnimEnabled()) {
+            playSplashAnimation();
+        } else {
+            splashOverlay.setVisibility(View.GONE);
+        }
         // 启动课程提醒前台服务（自建定时器，不依赖系统闹钟）
         ReminderService.start(this);
         // 全新安装首次启动：先扫描旧版本残留数据，由用户决定是否清理，再进入启动流程
@@ -578,6 +583,9 @@ public class MainActivity extends AppCompatActivity {
     protected void onPause() {
         super.onPause();
         CookieManager.getInstance().flush();
+        // 退到后台就不必再预热其余周次了（下次回到前台由 renderWeekSchedule 重新排入）
+        handler.removeCallbacks(prewarmStep);
+        prewarmQueue.clear();
     }
 
     @Override
@@ -1388,6 +1396,25 @@ public class MainActivity extends AppCompatActivity {
 
     private int currentDisplayWeek = 1;
 
+    /** 后台预热周数上限：只备邻近几周，避免无意义地占内存 */
+    private static final int PREWARM_MAX_WEEKS = 6;
+    /**
+     * 周课表 HTML 缓存（LRU，只留邻近几周）。
+     *
+     * 启动时只拼装「今天所在周」并立即显示，其余周次交给 prewarmStep 在首帧之后
+     * 后台逐周预生成 —— 页面先出来，之后切周直接命中缓存，不再重新拼装整页 HTML。
+     */
+    private final java.util.LinkedHashMap<Integer, String> weekHtmlCache =
+            new java.util.LinkedHashMap<Integer, String>(8, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(java.util.Map.Entry<Integer, String> eldest) {
+                    return size() > PREWARM_MAX_WEEKS + 1;
+                }
+            };
+    /** 缓存对应的状态指纹：主题/背景/提醒/拖动布局/课表数据变更即整体失效 */
+    private String weekHtmlStateSig = "";
+    private final java.util.ArrayDeque<Integer> prewarmQueue = new java.util.ArrayDeque<>();
+
     private void renderWeekSchedule(int week) {
         if (store == null) store = new ScheduleStore(this);
         if (!store.hasData()) return;
@@ -1395,14 +1422,80 @@ public class MainActivity extends AppCompatActivity {
         int total = store.getTotalWeeks();
         if (total > 0 && week > total) week = total;
         currentDisplayWeek = week;
-        JSONArray courses = store.coursesForWeek(week);
-        Log.d(TAG, "renderWeekSchedule: week=" + week + " courses=" + courses.length());
-        String html = generateWeekHTML(week, courses);
+
+        String sig = scheduleStateSignature();
+        if (!sig.equals(weekHtmlStateSig)) {
+            weekHtmlCache.clear();
+            weekHtmlStateSig = sig;
+        }
+        String html = weekHtmlCache.get(week);
+        boolean fromCache = html != null;
+        if (!fromCache) {
+            html = generateWeekHTML(week, store.coursesForWeek(week));
+            weekHtmlCache.put(week, html);
+        }
+        Log.d(TAG, "renderWeekSchedule: week=" + week + (fromCache ? " (cache hit)" : ""));
         hideLoading();
         showingDisplay = true;
         onGeneratedSchedule = true;
         webView.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null);
+        // 首帧之后再去预热其余周次：启动关键路径上不增加任何额外开销
+        schedulePrewarm(week);
     }
+
+    /**
+     * 渲染状态指纹。
+     *
+     * 周课表 HTML 里烘焙了主题、背景、提醒铃铛状态、拖动后的位置以及课表数据本身，
+     * 任何一项变化都必须让旧缓存作废，否则会渲染出与当前设置不一致的页面。
+     */
+    private String scheduleStateSignature() {
+        if (store == null) return "";
+        JSONObject ov = store.getOverrides();
+        Calendar c = Calendar.getInstance();
+        return store.getTheme() + "|" + store.getBgImage() + "|" + store.getAdvanceMinutes()
+                + "|" + store.getTotalWeeks() + "|" + store.getWeek1Monday()
+                + "|" + store.todayWeek() + "|" + c.get(Calendar.DAY_OF_YEAR)
+                + "|" + (ov == null ? "" : ov.toString().hashCode())
+                + "|" + store.getReminderKeys().hashCode()
+                + "|" + store.getCoursesHash();
+    }
+
+    /** 由近及远排入待预热的周次（本周±1、±2…），等首帧画完再开始 */
+    private void schedulePrewarm(int fromWeek) {
+        handler.removeCallbacks(prewarmStep);
+        prewarmQueue.clear();
+        if (store == null || !store.hasData()) return;
+        int total = store.getTotalWeeks();
+        if (total <= 0) return;
+        for (int d = 1; d <= total && prewarmQueue.size() < PREWARM_MAX_WEEKS; d++) {
+            if (fromWeek + d <= total) prewarmQueue.add(fromWeek + d);
+            if (prewarmQueue.size() >= PREWARM_MAX_WEEKS) break;
+            if (fromWeek - d >= 1) prewarmQueue.add(fromWeek - d);
+        }
+        // 等当前页首帧画完再开工，避免与 WebView 首屏渲染抢主线程
+        handler.postDelayed(prewarmStep, 400);
+    }
+
+    private final Runnable prewarmStep = new Runnable() {
+        @Override
+        public void run() {
+            if (prewarmQueue.isEmpty() || store == null || !store.hasData()) return;
+            String sig = scheduleStateSignature();
+            if (!sig.equals(weekHtmlStateSig)) {
+                weekHtmlCache.clear();
+                weekHtmlStateSig = sig;
+            }
+            Integer w = prewarmQueue.poll();
+            if (w == null) return;
+            if (!weekHtmlCache.containsKey(w)) {
+                weekHtmlCache.put(w, generateWeekHTML(w, store.coursesForWeek(w)));
+                Log.d(TAG, "prewarm week " + w + " ready");
+            }
+            // 一周一帧地做，主线程每次只承担一次拼装的耗时
+            handler.postDelayed(this, 80);
+        }
+    };
 
     private String generateWeekHTML(int week, JSONArray courses) {
         int todayWeek = store.todayWeek();
@@ -1897,6 +1990,14 @@ public class MainActivity extends AppCompatActivity {
         sb.append("onclick='Android.onClearBackground()'>清除图片背景</button>");
         sb.append("</div>");
         sb.append("</div>");
+        // 开屏动画：关闭后启动不再播 Logo 动画，直接进课表（下次启动生效）
+        boolean splashAnimOn = store == null || store.isSplashAnimEnabled();
+        sb.append("<div class='settings-item'><div><div class='si-label'>开屏动画</div>");
+        sb.append("<div class='si-desc'>关闭后启动直接显示课表，下次启动生效</div></div>");
+        sb.append("<div style='display:flex;gap:8px;'>");
+        sb.append("<button class='adv-btn' id='splashOn' onclick='setSplash(1)'>开启</button>");
+        sb.append("<button class='adv-btn' id='splashOff' onclick='setSplash(0)'>关闭</button>");
+        sb.append("</div></div>");
         // 桌面小组件：部分 ROM（ColorOS/MIUI 等）组件库里找不到第三方组件，
         // 提供主动添加入口，直接弹系统确认框，绕开组件库
         sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
@@ -2360,12 +2461,19 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  var l=document.getElementById('themeLight'),d=document.getElementById('themeDark');");
         sb.append("  if(l){l.style.background=m==='dark'?'':'#667eea';l.style.color=m==='dark'?'':'#fff';}");
         sb.append("  if(d){d.style.background=m==='dark'?'#667eea':'';d.style.color=m==='dark'?'#fff':'';}}");
+        // 开屏动画开关（写入后下次启动生效）
+        sb.append("function setSplash(v){Android.onSetSplashAnim(v);updateSplashBtn(v);}");
+        sb.append("function updateSplashBtn(v){");
+        sb.append("  var a=document.getElementById('splashOn'),b=document.getElementById('splashOff');");
+        sb.append("  if(a){a.style.background=v?'#667eea':'';a.style.color=v?'#fff':'';}");
+        sb.append("  if(b){b.style.background=v?'':'#667eea';b.style.color=v?'':'#fff';}}");
         // 自定义图片背景
         sb.append("function applyBg(url){");
         sb.append("  document.body.classList.toggle('hasbg',!!url);");
         sb.append("  var b=document.getElementById('clearBgBtn');");
         sb.append("  if(b)b.style.display=url?'inline-block':'none';}");
         sb.append("updateThemeBtn('").append("dark".equals(theme) ? "dark" : "light").append("');");
+        sb.append("updateSplashBtn(").append(splashAnimOn ? "1" : "0").append(");");
         sb.append("</script>");
         sb.append("</body></html>");
         return sb.toString();
@@ -2636,6 +2744,20 @@ public class MainActivity extends AppCompatActivity {
             store.setTheme(mode);
             applyAppBackground();
             Log.d(TAG, "theme set to " + mode);
+        }
+
+        /** 开屏动画开关：只写配置，本次启动已在播放/已跳过，下次启动生效 */
+        @JavascriptInterface
+        public void onSetSplashAnim(int on) {
+            handler.post(() -> {
+                if (store == null) store = new ScheduleStore(MainActivity.this);
+                final boolean enabled = on == 1;
+                store.setSplashAnimEnabled(enabled);
+                Log.d(TAG, "splash animation " + (enabled ? "enabled" : "disabled"));
+                Toast.makeText(MainActivity.this,
+                    enabled ? "开屏动画已开启，下次启动生效" : "开屏动画已关闭，下次启动直接进入课表",
+                    Toast.LENGTH_SHORT).show();
+            });
         }
 
         @JavascriptInterface
