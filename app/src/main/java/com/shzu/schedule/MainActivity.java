@@ -31,6 +31,7 @@ import android.widget.Button;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 
@@ -120,6 +121,10 @@ public class MainActivity extends AppCompatActivity {
     private boolean onGeneratedSchedule = false;
     private boolean parseResultReceived = false; // parseSchedule JS是否已回调结果
     private ScheduleStore store;               // 课表本地存储
+    private String latestParsedScheduleJson = "";
+    private static final int REQ_EXPORT_CAPTURE = 7314;
+    /** 标记「本次安装已做过旧数据扫描」，避免每次启动重复提示 */
+    private static final String KEY_INSTALL_SCANNED = "install_legacy_scan_done";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
 
@@ -173,7 +178,8 @@ public class MainActivity extends AppCompatActivity {
         playSplashAnimation();
         // 启动课程提醒前台服务（自建定时器，不依赖系统闹钟）
         ReminderService.start(this);
-        startApp();
+        // 全新安装首次启动：先扫描旧版本残留数据，由用户决定是否清理，再进入启动流程
+        if (!checkLegacyDataOnFirstRun()) startApp();
     }
 
     /** 开屏动画：logo淡入放大 → 书法字展开 → 整体淡出 */
@@ -215,6 +221,12 @@ public class MainActivity extends AppCompatActivity {
             Log.e(TAG, "splash animation error", e);
             splashOverlay.setVisibility(View.GONE);
         }
+    }
+
+    private static void addZipEntry(java.util.zip.ZipOutputStream zip, String name, String content) throws java.io.IOException {
+        zip.putNextEntry(new java.util.zip.ZipEntry(name));
+        zip.write((content == null ? "" : content).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        zip.closeEntry();
     }
 
     @Override
@@ -370,6 +382,136 @@ public class MainActivity extends AppCompatActivity {
         if (requestCode == REQ_PICK_BG && resultCode == RESULT_OK
                 && data != null && data.getData() != null) {
             saveBackgroundImage(data.getData());
+        }
+        if (requestCode == REQ_EXPORT_CAPTURE && resultCode == RESULT_OK && data != null && data.getData() != null) {
+            exportScheduleCapture(data.getData());
+        }
+    }
+
+    private void exportScheduleCapture(android.net.Uri uri) {
+        try (java.io.OutputStream raw = getContentResolver().openOutputStream(uri);
+             java.util.zip.ZipOutputStream zip = new java.util.zip.ZipOutputStream(raw)) {
+            if (store == null) store = new ScheduleStore(this);
+            addZipEntry(zip, "parsed-schedule.json", buildDiagnosticParsedJson());
+            java.io.File html = new java.io.File(getFilesDir(), "latest_schedule_capture.html");
+            if (html.exists()) {
+                zip.putNextEntry(new java.util.zip.ZipEntry("jwgl-page.html"));
+                try (java.io.FileInputStream in = new java.io.FileInputStream(html)) {
+                    byte[] buf = new byte[8192]; int n;
+                    while ((n = in.read(buf)) > 0) zip.write(buf, 0, n);
+                }
+                zip.closeEntry();
+            }
+            addZipEntry(zip, "stored-courses.json", store.getAllCourses().toString(2));
+            Toast.makeText(this, "诊断数据已保存", Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Log.e(TAG, "export schedule capture failed", e);
+            Toast.makeText(this, "保存失败：" + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    /**
+     * 诊断包中的解析结果。若本次会话没有真正执行解析（例如启动时直接读本地缓存渲染），
+     * latestParsedScheduleJson 为空，此时用已存课表兜底，
+     * 否则导出的诊断包会缺少最关键的那份数据（此前已出现过 0 字节的情况）。
+     */
+    private String buildDiagnosticParsedJson() {
+        String parsed = latestParsedScheduleJson;
+        if (parsed != null && !parsed.trim().isEmpty()) return parsed;
+        try {
+            JSONObject o = new JSONObject();
+            o.put("courses", store != null ? store.getAllCourses() : new JSONArray());
+            o.put("note", "session-parsed-empty: fallback to stored courses");
+            o.put("totalWeeks", store != null ? store.getTotalWeeks() : 0);
+            o.put("week1Monday", store != null ? store.getWeek1Monday() : 0);
+            o.put("fallbackAt", System.currentTimeMillis());
+            return o.toString(2);
+        } catch (Exception e) {
+            Log.w(TAG, "build diagnostic parsed json failed", e);
+            return "";
+        }
+    }
+
+    /**
+     * 全新安装后的首次启动：扫描上一版本遗留的本地数据。
+     * 换签名后覆盖安装会被系统拒绝，正常流程下用户必须先卸载；
+     * 这里兜底处理「卸载不彻底 / 由备份恢复 / 应用克隆」等残留情况，
+     * 避免旧的、可能不完整的课表继续被渲染，表现为漏课。
+     *
+     * @return true 表示已弹出确认框，由回调决定后续启动流程
+     */
+    private boolean checkLegacyDataOnFirstRun() {
+        if (prefs == null || prefs.getBoolean(KEY_INSTALL_SCANNED, false)) return false;
+        prefs.edit().putBoolean(KEY_INSTALL_SCANNED, true).apply();
+
+        ScheduleStore probe = new ScheduleStore(this);
+        boolean hasCourses = probe.hasData();
+        boolean hasCredential = !prefs.getString("username", "").isEmpty()
+                || !prefs.getString("password_enc", "").isEmpty()
+                || !prefs.getString("password", "").isEmpty();
+        boolean hasBg = hasLegacyBackground();
+        boolean hasCapture = new java.io.File(getFilesDir(), "latest_schedule_capture.html").exists();
+        if (!hasCourses && !hasCredential && !hasBg && !hasCapture) return false;
+
+        StringBuilder detail = new StringBuilder();
+        if (hasCourses) detail.append("· 旧课表数据\n");
+        if (hasCredential) detail.append("· 已保存的账号密码\n");
+        if (hasBg) detail.append("· 自定义背景图\n");
+        if (hasCapture) detail.append("· 上次抓取的页面缓存\n");
+
+        new AlertDialog.Builder(this)
+                .setTitle("检测到旧版本残留数据")
+                .setMessage("本次为全新安装，但发现上一版本留下的数据：\n\n"
+                        + detail
+                        + "\n旧课表可能不完整（表现为某些课程不显示、某些周缺课）。"
+                        + "建议清理后重新登录获取最新课表。")
+                .setPositiveButton("清理并重新获取", (d, w) -> {
+                    purgeLegacyData();
+                    startApp();
+                })
+                .setNegativeButton("保留现有数据", (d, w) -> startApp())
+                .setCancelable(false)
+                .show();
+        return true;
+    }
+
+    /** 是否存在历史自定义背景图（文件名形如 user_bg_<时间戳>.jpg） */
+    private boolean hasLegacyBackground() {
+        java.io.File[] files = getFilesDir().listFiles();
+        if (files == null) return false;
+        for (java.io.File f : files) {
+            if (f.getName().startsWith("user_bg_")) return true;
+        }
+        return false;
+    }
+
+    /** 清理旧版本残留：课表 / 提醒勾选 / 外观 / 账号密码 / 背景图 / 抓取缓存 */
+    private void purgeLegacyData() {
+        try {
+            new ScheduleStore(this).clearAll();
+            prefs.edit().remove("username").remove("password_enc").remove("password").apply();
+            savedUser = "";
+            savedPass = "";
+
+            java.io.File[] files = getFilesDir().listFiles();
+            if (files != null) {
+                for (java.io.File f : files) {
+                    String n = f.getName();
+                    if (n.startsWith("user_bg_") || "latest_schedule_capture.html".equals(n)) {
+                        //noinspection ResultOfMethodCallIgnored
+                        f.delete();
+                    }
+                }
+            }
+
+            // 让后续 startApp() 重新建 store，避免内存里还留着旧课表
+            store = null;
+            ReminderService.reload(this);
+            NextCourseWidgetProvider.refreshAll(this);
+            Toast.makeText(this, "旧数据已清理，请重新登录", Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Log.e(TAG, "purge legacy data failed", e);
+            Toast.makeText(this, "清理失败：" + e.getMessage(), Toast.LENGTH_LONG).show();
         }
     }
 
@@ -885,6 +1027,10 @@ public class MainActivity extends AppCompatActivity {
     private void parseSchedule() {
         String js = "javascript:(function(){"
              + "var result={courses:[],error:null,currentWeek:0,totalWeeks:0,week1Monday:0,periodTimes:null};"
+             + "result.sourceUrl=location.href;"
+             + "result.fetchedAt=new Date().toISOString();"
+             + "result.pageTitle=document.title||'';"
+             + "result.tableStats={tables:document.querySelectorAll('table').length,rows:0,cells:0,kbcontent:document.querySelectorAll('div.kbcontent').length};"
             + "try{"
             // 当前周次/总周数探测（金智周次下拉框）
             + "var zc=document.querySelector('select#zc,select[name=zc]');"
@@ -944,7 +1090,7 @@ public class MainActivity extends AppCompatActivity {
             + "    if(tm)ptRes.push(tm[0]);"
             + "  }"
             + "  if(ptRes.length<3){"
-            + "    var pageTimes=(document.body.innerText||'').match(/\\d{1,2}:\\d{2}\\s*[-–]\\s*\\d{1,2}:\\d{2}/g);"
+            + "    var pageTimes=((document.body.innerText||document.body.textContent)||'').match(/\\d{1,2}:\\d{2}\\s*[-–]\\s*\\d{1,2}:\\d{2}/g);"
             + "    if(pageTimes&&pageTimes.length>=5)ptRes=pageTimes.slice(0,10);"
             + "  }"
             + "  if(ptRes.length>=3)result.periodTimes=ptRes;"
@@ -952,7 +1098,8 @@ public class MainActivity extends AppCompatActivity {
             + "var table=document.querySelector('table.kbtable')"
             + "||document.querySelector('#kbtable')"
             + "||document.querySelector('#xskb_table')"
-            + "||document.querySelector('.kbcjtable');"
+            + "||document.querySelector('.kbcjtable')"
+             + "||document.querySelector('#timetable');"
             // 兜底：找行列数足够的最大表格
             + "if(!table){"
             + "  var tables=document.querySelectorAll('table');"
@@ -973,7 +1120,10 @@ public class MainActivity extends AppCompatActivity {
             + "  return;"
             + "}"
             + "var rows=table.querySelectorAll('tr');"
-            + "for(var i=1;i<rows.length;i++){"
+            + "var rowOffset=1;"
+             + "if(rows.length>0){var first=(rows[0].textContent||'').replace(/\\s+/g,'');if(first.indexOf('周一')<0&&first.indexOf('星期一')<0&&first.indexOf('星期')<0)rowOffset=0;}"
+             + "for(var i=rowOffset;i<rows.length;i++){"
+             + "  var courseRow=i-rowOffset+1;"
             + "  var cells=rows[i].querySelectorAll('td');"
             + "  for(var j=0;j<cells.length&&j<7;j++){"  // td[0]=周一(节次标签是th不是td), j=0→周一, j=6→周日
             + "    var cell=cells[j];"
@@ -985,15 +1135,19 @@ public class MainActivity extends AppCompatActivity {
             + "      if(kbcs[kc].style.display==='none')continue;"
             // 一个kbcontent内可能有多门课程（同一时段不同周次），需逐个提取
             + "      var fonts=kbcs[kc].querySelectorAll('font');"
-            + "      var name='',teacher='',loc='',weeks='',remark='',cnt='',clsInfo='';"
+            + "      var name='',teacher='',loc='',weeks='',remark='',cnt='',cls='';"
             + "      var inCourse=false;"
             + "      for(var f=0;f<fonts.length;f++){"
             + "        var ft=fonts[f];"
             + "        var title=ft.getAttribute('title')||'';"
-            + "        var txt=(ft.textContent||'').trim();"
+            + "        var fname=ft.getAttribute('name')||'';"
+             + "        var txt=(ft.textContent||'').trim();"
             + "        if(!txt)continue;"
             // 属性类标签：教师/教室/周次/备注等
-            + "        if(title==='教师'||title==='老师'){teacher=txt;continue;}"
+            + "        if(fname==='jxlmc'||fname==='tzdbh'||fname==='wkxx'||fname==='xsks')continue;"
+             + "        if(fname==='jxbz'||fname==='bzstr'){remark=txt.replace(/^教学备注[：:]*/,'').replace(/^备注[：:]*/,'').trim();continue;}"
+             + "        if(fname==='ktmcstr'){cls=txt.replace(/^班级[：:]*/,'').trim();var cmb2=cls.match(/(\\d+)\\s*人/);if(cmb2)cnt=cmb2[1];continue;}"
+             + "        if(title==='教师'||title==='老师'){teacher=txt;continue;}"
             + "        if(title.indexOf('周')>=0||title.indexOf('节次')>=0){weeks=txt;continue;}"
             + "        if(title==='教室'||title.indexOf('地点')>=0){loc=txt;continue;}"
             + "        if(title.indexOf('教学楼')>=0){continue;}"
@@ -1007,18 +1161,21 @@ public class MainActivity extends AppCompatActivity {
             + "        }"
             + "        if(title.indexOf('通知')>=0){continue;}"
             + "        if(/\\d+\\s*-\\s*\\d+\\s*周/.test(txt)||/第\\d+周/.test(txt)||txt.indexOf('单周')>=0||txt.indexOf('双周')>=0){weeks=txt;continue;}"
-            + "        if(/楼|室|区|馆|场|苑|厅|号/.test(txt)&&!loc&&title===''){loc=txt;continue;}"
+            // 教室兜底：必须同时含数字，否则"实验室安全教育"这类课程名会被误当教室而丢失
+             + "        if(!loc&&title===''&&txt.length<=16&&/\\d/.test(txt)&&/楼|室|区|馆|场|苑|厅|号|教/.test(txt)){loc=txt;continue;}"
             // 非属性类：可能是课程名或学时信息
             // 学时信息以(开头，如(讲课:56)，不是课程名
-            + "        if(txt.charAt(0)==='('||txt.indexOf('讲课')>=0||txt.indexOf('实践')>=0||txt.indexOf('实验')>=0||txt.indexOf('线上')>=0||txt.indexOf('其它')>=0){continue;}"
+            // 学时信息兜底：只认 "(讲课:16)" / "讲课:16" 这类严格格式。
+             // 旧写法用 contains('实验')/'实践'/'线上' 宽匹配，会把课程名含这些词的课整条丢弃
+             + "        if(/^[（(].*[）)]$/.test(txt)||/(讲课|实践|实验|线上|其它)\\s*[:：]/.test(txt)){continue;}"
             // 新课程名：如果已有课程名，先保存当前课程
             + "        if(name){"
             + "          result.courses.push({"
-            + "            day:j+1,row:i,name:name,teacher:teacher,"
-            + "            location:loc,weeks:weeks,remark:remark,count:cnt,cls:clsInfo,"
+            + "            day:j+1,row:courseRow,name:name,teacher:teacher,"
+            + "            location:loc,weeks:weeks,remark:remark,count:cnt,cls:cls,"
             + "            text:kbcs[kc].textContent.replace(/\\s+/g,' ').trim().substring(0,80)"
             + "          });"
-            + "          name=txt;teacher='';loc='';weeks='';remark='';cnt='';clsInfo='';inCourse=true;"
+            + "          name=txt;teacher='';loc='';weeks='';remark='';cnt='';cls='';inCourse=true;"
             + "          continue;"
             + "        }"
             + "        name=txt;inCourse=true;"
@@ -1026,18 +1183,18 @@ public class MainActivity extends AppCompatActivity {
             // 保存最后一门课程
             + "      if(name&&inCourse){"
             + "        result.courses.push({"
-            + "          day:j+1,row:i,name:name,teacher:teacher,"
+            + "          day:j+1,row:courseRow,name:name,teacher:teacher,"
             + "          location:loc,weeks:weeks,remark:remark,count:cnt,cls:cls,"
             + "          text:kbcs[kc].textContent.replace(/\\s+/g,' ').trim().substring(0,80)"
             + "        });"
             + "      }"
             + "    }"
             // 兜底：无kbcontent时用旧方式提取
-            + "    if(kbcs.length===0){"
+            + "    if(kbcs.length===0&&!cell.getAttribute('colspan')){"
             + "      var text=cell.textContent.trim();"
             + "      if(text&&text.length>2&&text!=='\\u00a0'){"
             + "        result.courses.push({"
-            + "          day:j+1,row:i,"
+            + "          day:j+1,row:courseRow,"
             + "          name:text.substring(0,20),teacher:'',"
             + "          location:'',weeks:'',"
             + "          text:text.replace(/\\s+/g,' ').substring(0,80)"
@@ -1056,6 +1213,19 @@ public class MainActivity extends AppCompatActivity {
             + "}"
             + "})()";
         webView.evaluateJavascript(js, null);
+        // 缓存当前教务页面 DOM 原文，用于排查页面结构变化导致的漏解析。
+        webView.evaluateJavascript("(function(){try{return btoa(unescape(encodeURIComponent(document.documentElement.outerHTML||'')))}catch(e){return ''}})()", value -> {
+            if (value == null || "null".equals(value) || "\"\"".equals(value)) return;
+            try {
+                String encoded = value;
+                if (encoded.startsWith("\"") && encoded.endsWith("\""))
+                    encoded = encoded.substring(1, encoded.length() - 1);
+                if (encoded.length() > 12_000_000) encoded = encoded.substring(0, 12_000_000);
+                byte[] bytes = android.util.Base64.decode(encoded, android.util.Base64.DEFAULT);
+                java.io.File f = new java.io.File(getFilesDir(), "latest_schedule_capture.html");
+                try (java.io.FileOutputStream out = new java.io.FileOutputStream(f)) { out.write(bytes); }
+            } catch (Exception e) { Log.w(TAG, "raw schedule capture failed", e); }
+        });
     }
 
     // ====== 课表展示 ======
@@ -1087,6 +1257,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void displaySchedule(String json) {
         parseResultReceived = true;
+        latestParsedScheduleJson = json == null ? "" : json;
         try {
             JSONObject obj = new JSONObject(json);
             JSONArray courses = obj.optJSONArray("courses");
@@ -1603,7 +1774,9 @@ public class MainActivity extends AppCompatActivity {
         // 课程网格
         sb.append("<div class='grid'>");
 
-        int numRows = Math.min(maxRow, 5);
+        // 行数上限跟随便次时间表：教务课表可能有 6 个大节（如「中午延时」），
+        // 旧实现硬编码 5 会把第 6 节的课解析到却永不渲染
+        int numRows = Math.min(maxRow, Math.max(5, periodTimes.length));
         // 空课周：只显示提示，不渲染空空格子
         if (courses.length() == 0) numRows = 0;
         if (numRows == 0) {
@@ -1762,6 +1935,11 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<div class='si-desc'>如果课表位置看起来不对，可一键恢复课程默认位置</div></div>");
         sb.append("<button class='adv-btn' style='margin-top:10px;background:#FFF0F0;color:#e55;' ");
         sb.append("onclick='Android.onResetLayout()'>重置课程布局</button>");
+        sb.append("</div>");
+        sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
+        sb.append("<div><div class='si-label'>课表数据诊断</div>");
+        sb.append("<div class='si-desc'>保存最近一次教务系统课表页面及解析结果，便于排查漏课。文件可能包含课程和个人信息，请勿公开传播。</div></div>");
+        sb.append("<button class='adv-btn' style='margin-top:10px;width:100%;' onclick='Android.onExportScheduleCapture()'>保存抓取数据</button>");
         sb.append("</div>");
         sb.append("</div></div>");
 
@@ -2458,6 +2636,18 @@ public class MainActivity extends AppCompatActivity {
             store.setTheme(mode);
             applyAppBackground();
             Log.d(TAG, "theme set to " + mode);
+        }
+
+        @JavascriptInterface
+        public void onExportScheduleCapture() {
+            handler.post(() -> {
+                Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType("application/zip");
+                intent.putExtra(Intent.EXTRA_TITLE, "SHZUSchedule-diagnostic-" + System.currentTimeMillis() + ".zip");
+                try { startActivityForResult(intent, REQ_EXPORT_CAPTURE); }
+                catch (Exception e) { Toast.makeText(MainActivity.this, "无法打开文件保存器", Toast.LENGTH_SHORT).show(); }
+            });
         }
 
         @JavascriptInterface

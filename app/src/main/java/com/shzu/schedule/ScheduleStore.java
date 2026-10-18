@@ -136,6 +136,26 @@ public class ScheduleStore {
         courses = null;
     }
 
+    /**
+     * 清空全部本地数据：课表、提醒勾选、提前量、主题、背景图引用。
+     * 用于「全新安装后清理上一版本残留数据」，清空后需重新登录抓取。
+     */
+    public void clearAll() {
+        clear();
+        prefs.edit()
+                .remove(KEY_REMINDERS)
+                .remove(KEY_ADVANCE)
+                .remove(KEY_THEME)
+                .remove(KEY_WIDGET_THEME)
+                .remove(KEY_BG)
+                .apply();
+        periodTimes = null;
+        reminderKeys.clear();
+        advanceMinutes = DEFAULT_ADVANCE;
+        theme = "light";
+        bgImage = "";
+    }
+
     // ====== 课程提醒 ======
 
     /** 获取全局提前量（分钟），默认15 */
@@ -368,42 +388,45 @@ public class ScheduleStore {
 
     /**
      * 判断某课在第week周是否上课
-     * 支持格式： "1-16周"/"1-16(周)"/"3,5,7(周)"/"11(周)"/"单周"/"1-16周(单)"/"3-18(周)[01-02节]" 等
+     * 支持格式： "1-16周"/"1-16(周)"/"3,5,7(周)"/"11(周)"/"单周"/"1-16周(单)"/"3-18(周)[01-02节]"
+     * 以及多段混合："3-4,6-7(周)"、"3,5-10(周)"、"3-6,8-9,12-13(周)"
+     *
+     * 多段周次必须逐段判定、任一段命中即算上课。旧实现用整体正则找第一个区间就 return，
+     * 会把 "3-6,8-9,12-13" 截成 "3-6"、"3,5-10" 截成 "5-10"，
+     * 导致这些周次整门课从课表、小组件、课前提醒中一起消失。
      */
     public static boolean weekMatches(String weeksText, int week) {
         if (weeksText == null || weeksText.trim().isEmpty()) return true;
-        String t = weeksText.trim();
-        // 去掉节次信息 [01-02节]
-        t = t.replaceAll("\\[.*?\\]", "").trim();
+        // 去掉节次信息 [01-02节]，并把全角分隔符统一成半角逗号
+        String t = weeksText.replaceAll("\\[.*?\\]", " ")
+                .replace('，', ',').replace('、', ',').replace('；', ',').replace(';', ',')
+                .trim();
         if (t.isEmpty()) return true;
 
-        // 范围 "1-16周" 或 "1-16(周)"
-        Matcher m = Pattern.compile("(\\d+)\\s*-\\s*(\\d+)").matcher(t);
-        if (m.find()) {
-            int s = Integer.parseInt(m.group(1)), e = Integer.parseInt(m.group(2));
-            if (week < s || week > e) return false;
-            if (t.contains("单")) return week % 2 == 1;
-            if (t.contains("双")) return week % 2 == 0;
-            return true;
-        }
-        // 单周/双周
-        if (t.contains("单周") || t.contains("单")) return week % 2 == 1;
-        if (t.contains("双周") || t.contains("双")) return week % 2 == 0;
-        // "第X周"
-        Matcher m3 = Pattern.compile("第\\s*(\\d+)\\s*周").matcher(t);
-        if (m3.find()) return Integer.parseInt(m3.group(1)) == week;
-        // 逗号列表 "3,5,7,9(周)"
-        if (t.contains(",") || t.contains("，")) {
-            Matcher m2 = Pattern.compile("(\\d+)").matcher(t);
-            while (m2.find()) {
-                if (Integer.parseInt(m2.group(1)) == week) return true;
+        boolean matched = false;
+        for (String raw : t.split(",")) {
+            String seg = raw.trim();
+            if (seg.isEmpty()) continue;
+            // 区间段："3-16" / "3~16" / "3至16"
+            Matcher r = Pattern.compile("(\\d+)\\s*[-~至]\\s*(\\d+)").matcher(seg);
+            if (r.find()) {
+                int from = Integer.parseInt(r.group(1));
+                int to = Integer.parseInt(r.group(2));
+                if (to < from) { int tmp = from; from = to; to = tmp; }
+                if (week >= from && week <= to) { matched = true; break; }
+                continue;
             }
-            return false;
+            // 单值段："9(周)" / "第3周" / "11"
+            Matcher n = Pattern.compile("(\\d+)").matcher(seg);
+            if (n.find() && Integer.parseInt(n.group(1)) == week) { matched = true; break; }
         }
-        // 单个周次 "11(周)" 或 "11周"
-        Matcher m4 = Pattern.compile("^(\\d+)").matcher(t);
-        if (m4.find()) return Integer.parseInt(m4.group(1)) == week;
-        return true; // 无法解析时保守显示
+
+        // 整串不含任何数字（如"单周"/"双周"）：不做区间限制，仅按单双判断
+        if (!matched && Pattern.compile("\\d").matcher(t).find()) return false;
+
+        if (t.contains("单") && week % 2 == 0) return false;
+        if (t.contains("双") && week % 2 == 1) return false;
+        return true;
     }
 
     // ====== 日期格式化 ======
