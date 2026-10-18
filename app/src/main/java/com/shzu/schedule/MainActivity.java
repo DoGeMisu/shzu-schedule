@@ -1,18 +1,11 @@
 package com.shzu.schedule;
 
-import android.app.AlarmManager;
-import android.app.PendingIntent;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.net.http.SslError;
 
-import com.shzu.schedule.reminder.ReminderOverlay;
-import com.shzu.schedule.reminder.ReminderReceiver;
-import com.shzu.schedule.reminder.ReminderService;
 import com.shzu.schedule.util.CryptoHelper;
-import com.shzu.schedule.util.PermissionHelper;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -34,7 +27,6 @@ import android.widget.Toast;
 
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
-import androidx.core.app.ActivityCompat;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -166,15 +158,6 @@ public class MainActivity extends AppCompatActivity {
 
         btnRetry.setOnClickListener(v -> startApp());
 
-        // 通知渠道与权限
-        ReminderReceiver.ensureChannel(this);
-        if (Build.VERSION.SDK_INT >= 33
-                && ActivityCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS)
-                    != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(this,
-                new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 100);
-        }
-
         setupWebView();
         // 开屏动画可关闭（设置→通用设置）：关闭后启动不再播 Logo 动画，直接进入课表
         if (new ScheduleStore(this).isSplashAnimEnabled()) {
@@ -182,8 +165,6 @@ public class MainActivity extends AppCompatActivity {
         } else {
             splashOverlay.setVisibility(View.GONE);
         }
-        // 启动课程提醒前台服务（自建定时器，不依赖系统闹钟）
-        ReminderService.start(this);
         // 全新安装首次启动：先扫描旧版本残留数据，由用户决定是否清理，再进入启动流程
         if (!checkLegacyDataOnFirstRun()) startApp();
     }
@@ -239,8 +220,6 @@ public class MainActivity extends AppCompatActivity {
     protected void onResume() {
         super.onResume();
         applyAppBackground();
-        // 从系统权限页返回后刷新设置页权限状态
-        refreshPermissionUi();
         // 同步桌面小组件：用户可能切了周/改了布局/刚同步完课表
         NextCourseWidgetProvider.refreshAll(this);
     }
@@ -345,25 +324,6 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception e) {
             Log.e(TAG, "applyAppBackground error", e);
         }
-    }
-
-    /** 把悬浮窗/后台运行权限状态同步到设置页 */
-    private void refreshPermissionUi() {
-        final boolean overlay = ReminderOverlay.canDraw(this);
-        final boolean battery = PermissionHelper.isIgnoringBatteryOptimizations(this);
-        final boolean notify = PermissionHelper.hasNotificationPermission(this);
-        handler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (webView == null) return;
-                try {
-                    webView.evaluateJavascript(
-                        "if(window.updatePermUi){updatePermUi(" + overlay + "," + battery + "," + notify + ")}",
-                        null);
-                } catch (Exception ignored) {
-                }
-            }
-        }, 250);
     }
 
     // ====== 自定义图片背景（相册选图） ======
@@ -491,7 +451,7 @@ public class MainActivity extends AppCompatActivity {
         return false;
     }
 
-    /** 清理旧版本残留：课表 / 提醒勾选 / 外观 / 账号密码 / 背景图 / 抓取缓存 */
+    /** 清理旧版本残留：课表 / 外观 / 账号密码 / 背景图 / 抓取缓存 */
     private void purgeLegacyData() {
         try {
             new ScheduleStore(this).clearAll();
@@ -512,7 +472,6 @@ public class MainActivity extends AppCompatActivity {
 
             // 让后续 startApp() 重新建 store，避免内存里还留着旧课表
             store = null;
-            ReminderService.reload(this);
             NextCourseWidgetProvider.refreshAll(this);
             Toast.makeText(this, "旧数据已清理，请重新登录", Toast.LENGTH_LONG).show();
         } catch (Exception e) {
@@ -718,7 +677,6 @@ public class MainActivity extends AppCompatActivity {
             int tw = store.todayWeek();
             Log.d(TAG, "startApp: local data ok, rendering week " + tw);
             renderWeekSchedule(tw > 0 ? tw : 1);
-            ReminderService.start(this);
             startBackgroundRefresh();
             return;
         }
@@ -1501,14 +1459,14 @@ public class MainActivity extends AppCompatActivity {
         new AlertDialog.Builder(this)
                 .setTitle("课表有更新")
                 .setMessage("教务系统的课表与本地不一致（本地 " + oldCount + " 条，最新 " + newCount
-                        + " 条）。\n是否立即更新？更新后提醒与桌面小组件会一起刷新。")
+                        + " 条）。\n是否立即更新？更新后桌面小组件会一起刷新。")
                 .setPositiveButton("立即更新", (d, w) -> applyRefreshedSchedule())
                 .setNegativeButton("稍后", (d, w) -> pendingRefreshJson = null)
                 .setCancelable(true)
                 .show();
     }
 
-    /** 用户确认后：把静默刷新拿到的课表落盘、重算提醒并重渲染 */
+    /** 用户确认后：把静默刷新拿到的课表落盘并重渲染 */
     private void applyRefreshedSchedule() {
         String json = pendingRefreshJson;
         pendingRefreshJson = null;
@@ -1601,19 +1559,19 @@ public class MainActivity extends AppCompatActivity {
             cand[i] = t.replaceAll("\\s+", "");
         }
         String[] merged = mergePeriodTimes(cand);
+        // 剔除 22:20-22:40 这类短时段，否则课表底部会多出一行空节次
+        merged = sanitizePeriodTimes(merged);
         Log.d(TAG, "parsed periodTimes: " + merged.length + " slots: " + String.join(",", merged));
         return merged;
     }
 
-    /** 解析结果落盘 → 重算提醒 → 重渲染本周 → 刷新桌面小组件（主流程与静默刷新共用） */
+    /** 解析结果落盘 → 重渲染本周 → 刷新桌面小组件（主流程与静默刷新共用） */
     private void saveAndRenderParsed(JSONObject obj, JSONArray courses, String[] parsedTimes) {
         if (store == null) store = new ScheduleStore(this);
         store.save(this, obj.optInt("currentWeek", 0), obj.optInt("totalWeeks", 0),
                 obj.optLong("week1Monday", 0), parsedTimes, courses);
         Log.d(TAG, "saved window " + store.getWindowStart() + "-" + store.getWindowEnd()
                 + " week1Monday=" + store.getWeek1Monday() + " todayWeek=" + store.todayWeek());
-        // 课表数据更新 → 重算课程提醒时刻表
-        ReminderService.reload(this);
         int tw = store.todayWeek();
         renderWeekSchedule(tw > 0 ? tw : 1);
         // 新数据落地后同步刷新桌面小组件
@@ -1643,7 +1601,7 @@ public class MainActivity extends AppCompatActivity {
                 + " week1Monday=" + parsedWeek1Monday);
 
             if (!hasError && n > 0) {
-                // 解析成功 → 保存整学期课表（覆盖旧数据）→ 设提醒 → 渲染今天所在周
+                // 解析成功 → 保存整学期课表（覆盖旧数据）→ 渲染今天所在周
                 if (store == null) store = new ScheduleStore(this);
                 saveAndRenderParsed(obj, courses, parsedTimes);
                 return;
@@ -1715,21 +1673,66 @@ public class MainActivity extends AppCompatActivity {
         return Integer.parseInt(p[0]) * 60 + Integer.parseInt(p[1]);
     }
 
+    /**
+     * 清洗作息时间表：丢弃时长过短的「延时/机动」时段。
+     *
+     * 教务页面除了正常大节（约 90~100 分钟），还会挂一条 20 分钟左右的时段
+     * （如 22:20-22:40），旧实现把它当成第 6 大节，导致课表底部凭空多出一行
+     * 「6节 22:20-22:40」。这类时段不可能排课，直接剔除。
+     *
+     * 保留项不足 3 条时原样返回，避免数据异常把整张作息表清空。
+     */
+    private static String[] sanitizePeriodTimes(String[] times) {
+        if (times == null || times.length == 0) return times;
+        java.util.ArrayList<String> keep = new java.util.ArrayList<>();
+        for (String t : times) {
+            if (t == null) continue;
+            String v = t.replaceAll("\\s+", "");
+            if (!v.matches("\\d{1,2}:\\d{2}[-–]\\d{1,2}:\\d{2}")) {
+                keep.add(t);
+                continue;
+            }
+            String[] se = v.split("[-–]");
+            int span = minutesOf(se[1]) - minutesOf(se[0]);
+            if (span >= MIN_PERIOD_MINUTES) keep.add(v);
+            else Log.d(TAG, "periodTimes: drop short slot " + v + " (" + span + "min)");
+        }
+        if (keep.size() < 3 || keep.size() == times.length) return times;
+        return keep.toArray(new String[0]);
+    }
+
     /** 课程排课记录唯一标识（用于拖动位置覆盖）：名称|教师|周次|原day|原row
      *  必须编入教务原始位置：同名称同周次的多条记录（如晚自习排周一~周五及周日5条）key 各不相同，
      *  可独立拖动互不覆盖；而同一门课跨周渲染时原始位置恒定，key 不变，拖动位置对所有周同步生效。
      *  旧格式 override（不含位置后缀）自然失配失效，无需清除数据 */
     private static String courseKey(JSONObject c) {
-        return (c.optString("name", "").replaceAll("\\s+", " ").trim()
-            + "|" + c.optString("teacher", "").replaceAll("\\s+", " ").trim()
-            + "|" + c.optString("weeks", "").replaceAll("\\s+", " ").trim()
-            + "|" + c.optInt("day", 0)
-            + "|" + c.optInt("row", 0));
+        return ScheduleStore.courseKey(c);
     }
 
     // ====== 按周渲染课表 ======
 
     private int currentDisplayWeek = 1;
+
+    /** 课程配色。必须与 NextCourse.COLORS 完全一致，否则小组件与课表页颜色会对不上 */
+    private static final String[] COURSE_COLORS = {
+        "#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4", "#FFA07A",
+        "#DDA0DD", "#87CEEB", "#F0E68C", "#FFB6C1", "#98D8C8",
+        "#B0C4DE", "#DEB887", "#87CEFA", "#90EE90", "#FFD700"
+    };
+    /** 自定义课程可选色：比自动配色更鲜明，便于与教务课程区分 */
+    private static final String[] CUSTOM_COLORS = {
+        "#667EEA", "#F06292", "#26A69A", "#FF8A65", "#7E57C2",
+        "#42A5F5", "#66BB6A", "#FFA726", "#8D6E63", "#78909C"
+    };
+    private static final String[] PERIOD_LABELS = {"1-2节", "3-4节", "5-6节", "7-8节", "9-10节"};
+    private static final String[] DEFAULT_PERIOD_TIMES = {
+        "10:00-11:50", "12:00-13:50", "14:00-15:50", "16:00-17:50", "18:00-19:50"
+    };
+    /** 渲染上限：教务通常 5 大节，自定义课程可落到第 6 节之后 */
+    private static final int MAX_RENDER_ROWS = 8;
+    /** 单个大节的最短时长（分钟）：低于此值的作息条目视为「延时/机动」时段，不占课表行 */
+    private static final int MIN_PERIOD_MINUTES = 25;
+    private static final String[] WEEKDAY_CN = {"", "周一", "周二", "周三", "周四", "周五", "周六", "周日"};
 
     /** 后台预热周数上限：只备邻近几周，避免无意义地占内存 */
     private static final int PREWARM_MAX_WEEKS = 6;
@@ -1746,13 +1749,14 @@ public class MainActivity extends AppCompatActivity {
                     return size() > PREWARM_MAX_WEEKS + 1;
                 }
             };
-    /** 缓存对应的状态指纹：主题/背景/提醒/拖动布局/课表数据变更即整体失效 */
+    /** 缓存对应的状态指纹：主题/背景/拖动布局/课表数据变更即整体失效 */
     private String weekHtmlStateSig = "";
     private final java.util.ArrayDeque<Integer> prewarmQueue = new java.util.ArrayDeque<>();
 
     private void renderWeekSchedule(int week) {
         if (store == null) store = new ScheduleStore(this);
-        if (!store.hasData()) return;
+        // 教务课表为空但用户自己加过课，也要能正常渲染（自定义课程是独立通道）
+        if (!store.hasData() && store.getCustomCourseCount() == 0) return;
         if (week < 1) week = 1;
         int total = store.getTotalWeeks();
         if (total > 0 && week > total) week = total;
@@ -1781,19 +1785,20 @@ public class MainActivity extends AppCompatActivity {
     /**
      * 渲染状态指纹。
      *
-     * 周课表 HTML 里烘焙了主题、背景、提醒铃铛状态、拖动后的位置以及课表数据本身，
+     * 周课表 HTML 里烘焙了主题、背景、拖动后的位置以及课表数据本身，
      * 任何一项变化都必须让旧缓存作废，否则会渲染出与当前设置不一致的页面。
      */
     private String scheduleStateSignature() {
         if (store == null) return "";
         JSONObject ov = store.getOverrides();
         Calendar c = Calendar.getInstance();
-        return store.getTheme() + "|" + store.getBgImage() + "|" + store.getAdvanceMinutes()
+        return store.getTheme() + "|" + store.getBgImage()
                 + "|" + store.getTotalWeeks() + "|" + store.getWeek1Monday()
                 + "|" + store.todayWeek() + "|" + c.get(Calendar.DAY_OF_YEAR)
                 + "|" + (ov == null ? "" : ov.toString().hashCode())
-                + "|" + store.getReminderKeys().hashCode()
-                + "|" + store.getCoursesHash();
+                + "|" + store.getCoursesHash()
+                + "|" + store.getCustomCoursesHash()
+                + "|" + store.getConflictPriority();
     }
 
     /** 由近及远排入待预热的周次（本周±1、±2…），等首帧画完再开始 */
@@ -1832,6 +1837,106 @@ public class MainActivity extends AppCompatActivity {
         }
     };
 
+    /** 应用拖动覆盖后的 (day,row)。教务课程与自定义课程共用同一套规则 */
+    private int[] resolvePosition(JSONObject c, JSONObject ov) {
+        int day = c.optInt("day", 0);
+        int row = c.optInt("row", 0);
+        if (ov != null) {
+            JSONObject o = ov.optJSONObject(courseKey(c));
+            if (o != null) {
+                int nd = o.optInt("d", 0), nr = o.optInt("r", 0);
+                if (nd >= 1 && nd <= 7 && nr >= 1 && nr <= MAX_RENDER_ROWS) {
+                    day = nd;
+                    row = nr;
+                }
+            }
+        }
+        return new int[]{day, row};
+    }
+
+    /** 把一组课程按 (节次,星期) 归档进单元格表，返回这组课程出现的最大节次 */
+    private int collectCells(JSONArray list, JSONObject ov, Map<String, JSONArray> out, int maxRow) {
+        if (list == null) return maxRow;
+        for (int i = 0; i < list.length(); i++) {
+            JSONObject c = list.optJSONObject(i);
+            if (c == null) continue;
+            int[] pos = resolvePosition(c, ov);
+            int day = pos[0], row = pos[1];
+            if (day < 1 || day > 7 || row < 1 || row > MAX_RENDER_ROWS) continue;
+            String key = row + "_" + (day - 1);
+            JSONArray arr = out.get(key);
+            if (arr == null) { arr = new JSONArray(); out.put(key, arr); }
+            arr.put(c);
+            if (row > maxRow) maxRow = row;
+        }
+        return maxRow;
+    }
+
+    /** 把 src 里的对象逐个追加到 dst */
+    private static void appendAll(JSONArray dst, JSONArray src) {
+        if (src == null) return;
+        for (int i = 0; i < src.length(); i++) {
+            JSONObject o = src.optJSONObject(i);
+            if (o != null) dst.put(o);
+        }
+    }
+
+    /**
+     * 课程卡片颜色。
+     * 自定义课程允许用户自选颜色，优先级高于按课名分配；其余沿用同一套色板。
+     */
+    private String courseColor(JSONObject c, Map<String, Integer> colorMap) {
+        String own = c.optString("color", "").trim();
+        if (own.matches("^#[0-9a-fA-F]{6}$")) return own;
+        int idx = colorMap.getOrDefault(c.optString("name", ""), 0);
+        return COURSE_COLORS[idx % COURSE_COLORS.length];
+    }
+
+    /** 打开添加/编辑表单：把初始数据交给页面，由 JS 填表并滑入 */
+    private void showCustomForm(JSONObject data) {
+        try {
+            String json = data == null ? "{}" : data.toString();
+            webView.evaluateJavascript("openCustomForm(" + json + ")", null);
+        } catch (Exception e) {
+            Log.e(TAG, "showCustomForm error", e);
+        }
+    }
+
+    /** 设置页「自定义课程」列表：每条都可点开编辑，右侧可单独删除 */
+    private String buildCustomCourseListHtml() {
+        if (store == null) store = new ScheduleStore(this);
+        JSONArray list = store.getCustomCourses();
+        if (list.length() == 0) {
+            return "<div class='cc-empty'>还没有自定义课程<br>点下方按钮，或回课表点「＋ 加课」再点空白格子</div>";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < list.length(); i++) {
+            JSONObject c = list.optJSONObject(i);
+            if (c == null) continue;
+            String id = c.optString("id", "");
+            String name = esc(c.optString("name", ""));
+            int day = c.optInt("day", 0);
+            int row = c.optInt("row", 0);
+            String weeks = c.optString("weeks", "").trim();
+            String color = c.optString("color", "").trim();
+            if (!color.matches("^#[0-9a-fA-F]{6}$")) color = CUSTOM_COLORS[0];
+            String period = row >= 1 && row <= PERIOD_LABELS.length
+                    ? PERIOD_LABELS[row - 1] : (row * 2 - 1) + "-" + (row * 2) + "节";
+            // 单次卡片周次存的是纯数字（当前周），列表里显示成「仅第 N 周」更直观
+            String weeksText = weeks.isEmpty() ? "每周"
+                    : (weeks.matches("\\d{1,2}") ? "仅第" + weeks + "周" : esc(weeks));
+            String when = (day >= 1 && day <= 7 ? WEEKDAY_CN[day] : "—")
+                    + " " + period + " · " + weeksText;
+            sb.append("<div class='cc-item'>");
+            sb.append("<span class='cc-dot' style='background:").append(color).append("'></span>");
+            sb.append("<div class='cc-txt' onclick='Android.onEditCustom(\"").append(id).append("\")'>");
+            sb.append("<b>").append(name).append("</b><i>").append(when).append("</i></div>");
+            sb.append("<button class='cc-del' onclick='deleteCustom(event,\"").append(id).append("\")'>删除</button>");
+            sb.append("</div>");
+        }
+        return sb.toString();
+    }
+
     private String generateWeekHTML(int week, JSONArray courses) {
         int todayWeek = store.todayWeek();
         int totalWeeks = store.getTotalWeeks();
@@ -1842,52 +1947,59 @@ public class MainActivity extends AppCompatActivity {
         int dw = cal.get(Calendar.DAY_OF_WEEK);
         int todayDow = dw == Calendar.SUNDAY ? 7 : dw - 1;
 
-        // 同课同色：课程名→颜色索引
+        // 用户拖动产生的位置覆盖（教务课程与自定义课程共用同一张表，键由 courseKey 区分）
+        JSONObject ov = store.getOverrides();
+        // 本周的自定义课程：独立通道，与上面的教务课程互不影响
+        JSONArray customs = store.customCoursesForWeek(week);
+
+        // 同课同色：按「教务在前、自定义在后」的顺序分配，与 NextCourse.colorMapFor 保持一致
         Map<String, Integer> colorMap = new HashMap<>();
         int colorIdx = 0;
-
-        // 用户拖动产生的位置覆盖（长按拖动课表后保存的自定义布局）
-        JSONObject ov = store.getOverrides();
-
-        // (节次行,星期) → 课程列表；同格多课合并
-        Map<String, JSONArray> cellMap = new HashMap<>();
-        int maxRow = 0;
         for (int i = 0; i < courses.length(); i++) {
             JSONObject c = courses.optJSONObject(i);
             if (c == null) continue;
-            int row = c.optInt("row", 0);
-            int day = c.optInt("day", 0);
-            // 优先使用用户拖动定义的位置
-            if (ov != null) {
-                JSONObject o = ov.optJSONObject(courseKey(c));
-                if (o != null) {
-                    int nd = o.optInt("d", 0), nr = o.optInt("r", 0);
-                    if (nd >= 1 && nd <= 7 && nr >= 1 && nr <= 5) { day = nd; row = nr; }
-                }
-            }
-            if (row <= 0 || day < 1 || day > 7) continue;
-            if (row > 5) continue; // 最多5节(9-10节)，不显示11-14节
-            String key = row + "_" + (day - 1);
-            JSONArray arr = cellMap.get(key);
-            if (arr == null) { arr = new JSONArray(); cellMap.put(key, arr); }
-            arr.put(c);
-            if (row > maxRow) maxRow = row;
-            // 分配颜色
+            String name = c.optString("name", "");
+            if (!colorMap.containsKey(name)) colorMap.put(name, colorIdx++);
+        }
+        for (int i = 0; i < customs.length(); i++) {
+            JSONObject c = customs.optJSONObject(i);
+            if (c == null) continue;
             String name = c.optString("name", "");
             if (!colorMap.containsKey(name)) colorMap.put(name, colorIdx++);
         }
 
+        // 两路课程各自归档到 (节次,星期) 单元格，之后再按冲突优先级合并
+        Map<String, JSONArray> schoolCells = new HashMap<>();
+        Map<String, JSONArray> customCells = new HashMap<>();
+        int maxRow = collectCells(courses, ov, schoolCells, 0);
+        maxRow = collectCells(customs, ov, customCells, maxRow);
+
+        // 合并：同一格里同时存在教务课与自定义课时标记冲突，并按用户偏好决定谁排在前面
+        boolean schoolFirst = !"custom".equals(store.getConflictPriority());
+        Map<String, JSONArray> cellMap = new HashMap<>();
+        java.util.Set<String> clashCells = new java.util.HashSet<>();
+        java.util.Set<String> allCells = new java.util.LinkedHashSet<>(schoolCells.keySet());
+        allCells.addAll(customCells.keySet());
+        for (String key : allCells) {
+            JSONArray s = schoolCells.get(key);
+            JSONArray cu = customCells.get(key);
+            JSONArray arr = new JSONArray();
+            if (s != null && s.length() > 0 && cu != null && cu.length() > 0) {
+                clashCells.add(key);
+                if (schoolFirst) { appendAll(arr, s); appendAll(arr, cu); }
+                else { appendAll(arr, cu); appendAll(arr, s); }
+            } else if (s != null) {
+                appendAll(arr, s);
+            } else if (cu != null) {
+                appendAll(arr, cu);
+            }
+            if (arr.length() > 0) cellMap.put(key, arr);
+        }
+
         // 节次时间表（从教务作息数据获取，失败时用新疆高校常见作息兜底）
-        String[] periodLabels = {"1-2节", "3-4节", "5-6节", "7-8节", "9-10节"};
-        String[] periodTimes = store != null ? store.getPeriodTimes() : null;
-        String[] defaultTimes = {"10:00-11:50", "12:00-13:50", "14:00-15:50", "16:00-17:50", "18:00-19:50"};
-        if (periodTimes == null) periodTimes = defaultTimes;
-        // 课程颜色（柔和pastel，白底适配）
-        String[] colors = {
-            "#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4", "#FFA07A",
-            "#DDA0DD", "#87CEEB", "#F0E68C", "#FFB6C1", "#98D8C8",
-            "#B0C4DE", "#DEB887", "#87CEFA", "#90EE90", "#FFD700"
-        };
+        // 旧版本曾把「22:20-22:40」这类延时时段一并存下，渲染时再洗一遍，老数据无需重抓即可恢复
+        String[] periodTimes = sanitizePeriodTimes(store.getPeriodTimes());
+        if (periodTimes == null || periodTimes.length == 0) periodTimes = DEFAULT_PERIOD_TIMES;
 
         StringBuilder sb = new StringBuilder();
         sb.append("<!DOCTYPE html><html lang='zh'><head><meta charset='utf-8'>");
@@ -1917,17 +2029,7 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".btns{display:flex;justify-content:center;gap:10px;margin-top:8px;}");
         sb.append(".btn{background:var(--card);border:none;color:var(--fg);font-size:12px;");
         sb.append("border-radius:16px;padding:6px 16px;}");
-        // 课程卡片右上角提醒铃铛：点击即开关该课提醒
-        sb.append(".course .bell{position:absolute;top:5px;right:5px;width:24px;height:24px;");
-        sb.append("border-radius:50%;display:flex;align-items:center;justify-content:center;");
-        sb.append("background:rgba(255,255,255,0.22);z-index:12;");
-        sb.append("transition:transform 0.18s ease,background 0.18s ease;}");
-        sb.append(".course .bell svg{width:15px;height:15px;fill:rgba(255,255,255,0.62);");
-        sb.append("transition:fill 0.18s ease;}");
-        sb.append(".course .bell.on{background:#FFECA8;}");
-        sb.append(".course .bell.on svg{fill:#D99400;}");
-        sb.append(".course .bell:active{transform:scale(0.85);}");
-        sb.append(".course.remind-on{box-shadow:inset 0 0 0 2px rgba(255,214,71,0.92);}");
+        sb.append(".btn-add{background:#667eea;color:#fff;font-weight:600;}");
         // WebView 默认会给可点击元素加一层蓝色/灰色高亮，Android 上尤其明显。
         // 一律关掉，按压反馈交给各自的 :active 样式。
         sb.append("*{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;");
@@ -1966,6 +2068,28 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".course .info{font-size:10px;opacity:0.95;line-height:1.35;color:#fff;");
         sb.append("font-weight:600;letter-spacing:0.2px;}");
         sb.append(".empty{background:var(--empty);border-radius:8px;}");
+        // ===== 与教务课程位置冲突：整格描红，并在右下角挂感叹号 =====
+        // 用 box-shadow 而非 border：卡片高度是按 1fr 分配的，
+        // border 会把内容区压小导致文字被裁，inset 阴影不占布局尺寸。
+        sb.append(".course.conflict{box-shadow:inset 0 0 0 2.5px #FF3B30,0 0 0 1px rgba(255,59,48,0.35);}");
+        sb.append(".course.remind-on.conflict{box-shadow:inset 0 0 0 2.5px #FF3B30,");
+        sb.append("inset 0 0 0 5px rgba(255,214,71,0.92);}");
+        sb.append(".clash-mark{position:absolute;right:4px;bottom:4px;width:15px;height:15px;");
+        sb.append("border-radius:50%;background:#FF3B30;color:#fff;font-size:11px;font-weight:800;");
+        sb.append("line-height:15px;text-align:center;z-index:14;box-shadow:0 1px 4px rgba(0,0,0,0.3);}");
+        // ===== 加课模式：空格子变成可点选的占位 =====
+        sb.append("body.adding .empty{border:2px dashed #667eea;background:rgba(102,126,234,0.10);");
+        sb.append("display:flex;align-items:center;justify-content:center;cursor:pointer;}");
+        sb.append("body.adding .empty::after{content:'+';color:#667eea;font-size:20px;font-weight:700;");
+        sb.append("line-height:1;opacity:0.75;}");
+        sb.append("body.adding .course{opacity:0.55;}");
+        // 顶部提示条
+        sb.append(".addbar{display:none;align-items:center;justify-content:space-between;gap:8px;");
+        sb.append("margin-top:8px;padding:8px 12px;border-radius:12px;background:rgba(102,126,234,0.12);");
+        sb.append("font-size:12px;color:#5A6FD6;font-weight:600;}");
+        sb.append("body.adding .addbar{display:flex;}");
+        sb.append(".addbar button{background:#667eea;color:#fff;border:none;border-radius:8px;");
+        sb.append("padding:5px 10px;font-size:12px;}");
         sb.append(".grid-head{display:grid;grid-template-columns:34px repeat(7,1fr);gap:3px;margin-bottom:4px;padding:0 8px;}");
         // 拖动模式底部操作栏（横向拉长、低高度；拖动中下滑隐藏）
         sb.append(".dockbar{position:fixed;left:50%;bottom:10px;transform:translate(-50%,150%);");
@@ -2058,28 +2182,68 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".settings-item .si-desc{font-size:12px;color:var(--sub);margin-top:2px;}");
         sb.append(".logout-btn{display:block;width:100%;margin-top:20px;background:#FF4444;color:#fff;");
         sb.append("border:none;border-radius:12px;padding:12px;font-size:15px;font-weight:600;}");
-        // 权限清单样式（一眼看出缺哪项）
-        sb.append(".perm-list{margin-top:10px;}");
-        sb.append(".perm-row{display:flex;align-items:flex-start;gap:10px;padding:10px 12px;");
-        sb.append("border-radius:10px;background:var(--card);margin-bottom:8px;cursor:pointer;}");
-        sb.append(".perm-row:active{opacity:0.75;}");
-        sb.append(".perm-row .perm-st{font-size:15px;font-weight:700;width:18px;text-align:center;flex:0 0 auto;}");
-        sb.append(".perm-row.ok .perm-st{color:#3BB273;}");
-        sb.append(".perm-row.bad .perm-st{color:#E5533D;}");
-        sb.append(".perm-row.warn .perm-st{color:#E8A200;}");
-        sb.append(".perm-row .perm-tx{flex:1;font-size:13px;color:var(--fg);line-height:1.35;}");
-        sb.append(".perm-row .perm-tx i{display:block;font-style:normal;font-size:11px;color:var(--sub);margin-top:3px;}");
         // 设置页按钮统一样式（跟随主题，带按压反馈）
         sb.append(".adv-btn{background:var(--card);border:1px solid var(--line);");
         sb.append("border-radius:10px;padding:9px 14px;font-size:13px;color:var(--fg);");
         sb.append("cursor:pointer;transition:background-color 0.2s ease,border-color 0.2s ease;}");
         sb.append(".adv-btn:active{opacity:0.75;}");
-        sb.append(".adv-btn,.perm-btn{background:var(--card);border:1px solid var(--line);");
-        sb.append("border-radius:10px;padding:9px 14px;font-size:13px;color:var(--fg);");
-        sb.append("cursor:pointer;transition:background-color 0.2s ease,border-color 0.2s ease;}");
-        sb.append(".adv-btn:active,.perm-btn:active{opacity:0.75;}");
-        sb.append(".perm-btn.perm-ok{background:#E8F7EE;border-color:#3BB273;color:#2E8B57;font-weight:600;}");
         sb.append(".si-hint{font-size:12px;color:#999;margin-top:8px;line-height:1.5;}");
+        // ===== 单开关按钮（设置项右侧，与文字同一行）=====
+        sb.append(".switch{width:48px;height:28px;border-radius:14px;background:#D8D8E0;border:none;");
+        sb.append("padding:0;position:relative;flex:0 0 auto;cursor:pointer;");
+        sb.append("transition:background-color 0.2s ease;}");
+        sb.append(".switch.on{background:#667eea;}");
+        sb.append(".switch i{position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;");
+        sb.append("background:#fff;box-shadow:0 1px 3px rgba(0,0,0,0.25);");
+        sb.append("transition:left 0.2s cubic-bezier(.3,.8,.4,1);}");
+        sb.append(".switch.on i{left:23px;}");
+        sb.append("body.dark .switch{background:#3A3B4A;}");
+        // ===== 自定义课程：表单与列表 =====
+        sb.append(".cf-label{display:block;font-size:13px;color:var(--sub);margin:14px 0 6px;}");
+        sb.append(".cf-input{width:100%;background:var(--card);border:1px solid var(--line);");
+        sb.append("border-radius:10px;padding:11px 12px;font-size:15px;color:var(--fg);");
+        sb.append("box-sizing:border-box;font-family:inherit;-webkit-appearance:none;}");
+        sb.append(".cf-input:focus{outline:none;border-color:#667eea;}");
+        sb.append(".cf-row{display:flex;gap:10px;}");
+        sb.append(".cf-row>div{flex:1;min-width:0;}");
+        // 重复方式分段选择：仅本周 / 按周次
+        sb.append(".cf-seg{display:flex;gap:8px;}");
+        sb.append(".cf-seg-item{flex:1;background:var(--card);border:1px solid var(--line);");
+        sb.append("color:var(--sub);border-radius:10px;padding:10px 8px;font-size:13px;");
+        sb.append("font-family:inherit;transition:all 0.16s ease;}");
+        sb.append(".cf-seg-item.sel{background:#667eea;border-color:#667eea;color:#fff;font-weight:600;}");
+        sb.append(".cf-colors{display:flex;flex-wrap:wrap;gap:10px;margin-top:4px;}");
+        sb.append(".cf-color{width:30px;height:30px;border-radius:50%;border:none;padding:0;");
+        sb.append("box-shadow:0 0 0 0 #667eea;transition:box-shadow 0.16s ease;}");
+        sb.append(".cf-color.sel{box-shadow:0 0 0 2px var(--bg),0 0 0 4px #667eea;}");
+        sb.append(".cf-actions{display:flex;gap:10px;margin-top:24px;}");
+        sb.append(".cf-save{flex:1;background:#667eea;color:#fff;border:none;border-radius:12px;");
+        sb.append("padding:13px;font-size:15px;font-weight:600;}");
+        sb.append(".cf-del{flex:0 0 auto;background:#FFF0F0;color:#e55;border:none;border-radius:12px;");
+        sb.append("padding:13px 18px;font-size:15px;font-weight:600;}");
+        sb.append(".cf-tip{font-size:11px;color:var(--sub);margin-top:6px;line-height:1.5;}");
+        sb.append(".cc-item{display:flex;align-items:center;gap:10px;padding:12px 0;");
+        sb.append("border-bottom:1px solid var(--line);}");
+        sb.append(".cc-item:last-child{border-bottom:none;}");
+        sb.append(".cc-dot{width:10px;height:10px;border-radius:50%;flex:0 0 auto;}");
+        sb.append(".cc-txt{flex:1;min-width:0;}");
+        sb.append(".cc-txt b{display:block;font-size:14px;font-weight:600;color:var(--fg);");
+        sb.append("white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}");
+        sb.append(".cc-txt i{display:block;font-style:normal;font-size:11px;color:var(--sub);margin-top:3px;}");
+        sb.append(".cc-del{background:transparent;border:none;color:#E5533D;font-size:12px;");
+        sb.append("padding:8px;flex:0 0 auto;}");
+        sb.append(".cc-empty{text-align:center;color:var(--sub);font-size:13px;padding:34px 0;line-height:1.7;}");
+        // 自定义课程详情标签、页面内 toast
+        sb.append(".cb-src{display:inline-block;font-size:10px;font-weight:600;color:#667eea;");
+        sb.append("background:rgba(102,126,234,0.12);border-radius:6px;padding:1px 6px;margin-left:6px;");
+        sb.append("vertical-align:middle;}");
+        sb.append(".cb-clash{font-size:12px;color:#E5533D;background:rgba(255,59,48,0.08);");
+        sb.append("border-radius:8px;padding:8px 10px;margin-top:8px;line-height:1.5;}");
+        sb.append(".toast{position:fixed;left:50%;bottom:84px;transform:translateX(-50%);");
+        sb.append("background:rgba(0,0,0,0.82);color:#fff;padding:9px 16px;border-radius:20px;");
+        sb.append("font-size:13px;opacity:0;pointer-events:none;transition:opacity 0.2s ease;");
+        sb.append("z-index:200;max-width:80%;text-align:center;line-height:1.4;}");
+        sb.append(".toast.show{opacity:1;}");
         // 空课周提示
         sb.append(".emptyweek{grid-column:1/-1;text-align:center;color:var(--sub);font-size:13px;padding:40px 0;}");
         // 自定义图片背景：卡片/控件半透明，文字保持原色
@@ -2179,7 +2343,11 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<div class='btns'>");
         sb.append("<button class='btn' onclick='Android.onRefreshRequested()'>刷新课表</button>");
         sb.append("<button class='btn' onclick='showSettings()'>设置</button>");
+        // 自定义加课入口：紧挨设置，点一下进入「选位模式」，再点空格子即可填写课程
+        sb.append("<button class='btn btn-add' onclick='toggleAddMode()'>＋ 加课</button>");
         sb.append("</div>");
+        sb.append("<div class='addbar'><span>点击空白格子添加自定义课程</span>");
+        sb.append("<button onclick='toggleAddMode()'>取消</button></div>");
         sb.append("</div>");
 
         // 表头（独立网格，不参与课程行高度分配）
@@ -2202,16 +2370,17 @@ public class MainActivity extends AppCompatActivity {
         // 课程网格
         sb.append("<div class='grid'>");
 
-        // 行数上限跟随便次时间表：教务课表可能有 6 个大节（如「中午延时」），
-        // 旧实现硬编码 5 会把第 6 节的课解析到却永不渲染
-        int numRows = Math.min(maxRow, Math.max(5, periodTimes.length));
-        // 空课周：只显示提示，不渲染空空格子
-        if (courses.length() == 0) numRows = 0;
+        // 行数：至少铺满作息时间表（教务可能有 6 大节「中午延时」），
+        // 再按实际课程往上探，上限 MAX_RENDER_ROWS，避免异常数据把网格撑爆
+        int numRows = Math.min(Math.max(5, Math.max(maxRow, periodTimes.length)), MAX_RENDER_ROWS);
+        // 空课周：教务与自定义都没有课时才提示，只渲染提示不画空格子
+        if (courses.length() == 0 && customs.length() == 0) numRows = 0;
         if (numRows == 0) {
             sb.append("<div class='emptyweek'>这一周没有课程</div>");
         }
         for (int row = 1; row <= numRows; row++) {
-            String label = row <= periodLabels.length ? periodLabels[row - 1] : row + "节";
+            String label = row <= PERIOD_LABELS.length
+                    ? PERIOD_LABELS[row - 1] : (row * 2 - 1) + "-" + (row * 2) + "节";
             String time = row <= periodTimes.length ? periodTimes[row - 1] : "";
             // 节次标签竖向排列：每个字符独占一行（1-2节 → 1/−/2/节）
             StringBuilder vLabel = new StringBuilder();
@@ -2224,31 +2393,28 @@ public class MainActivity extends AppCompatActivity {
             sb.append("</div>");
 
             for (int d = 1; d <= 7; d++) {
-                JSONArray arr = cellMap.get(row + "_" + (d - 1));
+                String cellKey = row + "_" + (d - 1);
+                JSONArray arr = cellMap.get(cellKey);
                 if (arr != null && arr.length() > 0) {
                     JSONObject first = arr.optJSONObject(0);
-                    String firstName = first.optString("name", "").replaceAll("\\s+", " ").trim();
-                    int ci = colorMap.getOrDefault(firstName, 0);
-                    String color = colors[ci % colors.length];
+                    String color = courseColor(first, colorMap);
+                    boolean clash = clashCells.contains(cellKey);
                     // 详情包含该格所有课程（同一时段可能有多门重叠课）
-                    String detail = buildCourseDetailArray(arr, week, label, time, color);
-                    // 格内所有课程的标识（拖动/提醒均按整格处理）
+                    String detail = buildCourseDetailArray(arr, week, label, time, color, clash);
+                    // 格内所有课程的标识（拖动按整格处理）
                     StringBuilder keysB = new StringBuilder();
-                    boolean allOn = true;
-                    java.util.Set<String> rk = store.getReminderKeys();
                     for (int k = 0; k < arr.length(); k++) {
                         if (k > 0) keysB.append(";;;");
                         String ck = courseKey(arr.optJSONObject(k));
                         keysB.append(ck.replace("'", "\\'"));
-                        if (!rk.contains(ck)) allOn = false;
                     }
-                    sb.append("<div class='course" + (allOn ? " remind-on" : "") + "' style='--cc:").append(color)
+                    // 与教务课程位置冲突的自定义课：整格描红边，并在右下角挂一个感叹号
+                    sb.append("<div class='course")
+                      .append(clash ? " conflict" : "")
+                      .append("' style='--cc:").append(color)
                       .append(";background:var(--cc);animation-delay:").append((row + d) * 0.05).append("s' data-detail='")
                       .append(detail).append("' data-keys='").append(keysB).append("' data-day='").append(d).append("' data-row='").append(row).append("'>");
-                    // 右上角铃铛：一键开关这一格所有课程的提醒
-                    sb.append("<div class='bell").append(allOn ? " on" : "").append("' onclick='toggleBell(event,this)'>")
-                      .append("<svg viewBox='0 0 24 24'><path d='M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.63-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.64 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z'/></svg>")
-                      .append("</div>");
+                    if (clash) sb.append("<div class='clash-mark'>!</div>");
                     // 显示所有课程名（多门用换行分隔）
                     for (int k = 0; k < arr.length(); k++) {
                         JSONObject cc = arr.optJSONObject(k);
@@ -2266,7 +2432,9 @@ public class MainActivity extends AppCompatActivity {
                     sb.append("</div>");
                 } else {
                     // 空格也带位置属性：拖动放置时 swapNodes 能正确交换属性，否则卡片位置被清空导致应用不生效
-                    sb.append("<div class='empty' data-day='").append(d).append("' data-row='").append(row).append("'></div>");
+                    // data-empty 供「加课模式」识别可点击的空位
+                    sb.append("<div class='empty' data-day='").append(d).append("' data-row='").append(row)
+                      .append("' onclick='onEmptyClick(event,").append(d).append(",").append(row).append(")'></div>");
                 }
             }
         }
@@ -2291,7 +2459,9 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<div class='nav-item' onclick='openSub(\"account\")'><div class='ni-txt'><b>账号设置</b>");
         sb.append("<i>当前登录账号与退出登录</i></div><div class='ni-arrow'>›</div></div>");
         sb.append("<div class='nav-item' onclick='openSub(\"general\")'><div class='ni-txt'><b>通用设置</b>");
-        sb.append("<i>课表背景、提醒提前时间、提醒权限、课程布局</i></div><div class='ni-arrow'>›</div></div>");
+        sb.append("<i>课表背景、开屏动画、桌面小组件、课程布局</i></div><div class='ni-arrow'>›</div></div>");
+        sb.append("<div class='nav-item' onclick='openSub(\"custom\")'><div class='ni-txt'><b>自定义课程</b>");
+        sb.append("<i>管理自己添加的课程，与教务课表互不影响</i></div><div class='ni-arrow'>›</div></div>");
         sb.append("<div class='nav-item' onclick='openSub(\"about\")'><div class='ni-txt'><b>关于</b>");
         sb.append("<i>开发信息、开源地址与作者联系方式</i></div><div class='ni-arrow'>›</div></div>");
         sb.append("</div>");
@@ -2312,6 +2482,8 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<div class='page-head'><button class='ph-back' onclick='closePage()'>‹</button>");
         sb.append("<div class='ph-title'>通用设置</div><div class='ph-pad'></div></div>");
         sb.append("<div class='page-body'>");
+        // 通用设置按使用频率从高到低排列：
+        // 背景/主题 → 开屏动画 → 桌面小组件 → 冲突优先级 → 重置布局 → 数据诊断
         // 课表背景：深浅主题切换 + 自定义图片
         sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
         sb.append("<div><div class='si-label'>课表背景</div>");
@@ -2325,14 +2497,13 @@ public class MainActivity extends AppCompatActivity {
         sb.append("onclick='Android.onClearBackground()'>清除图片背景</button>");
         sb.append("</div>");
         sb.append("</div>");
-        // 开屏动画：关闭后启动不再播 Logo 动画，直接进课表（下次启动生效）
+        // 开屏动画：单个可切换开关，与其他设置项保持同一行布局（关闭后下次启动生效）
         boolean splashAnimOn = store == null || store.isSplashAnimEnabled();
         sb.append("<div class='settings-item'><div><div class='si-label'>开屏动画</div>");
         sb.append("<div class='si-desc'>关闭后启动直接显示课表，下次启动生效</div></div>");
-        sb.append("<div style='display:flex;gap:8px;'>");
-        sb.append("<button class='adv-btn' id='splashOn' onclick='setSplash(1)'>开启</button>");
-        sb.append("<button class='adv-btn' id='splashOff' onclick='setSplash(0)'>关闭</button>");
-        sb.append("</div></div>");
+        sb.append("<button class='switch").append(splashAnimOn ? " on" : "")
+          .append("' id='splashSwitch' onclick='toggleSplash()'><i></i></button>");
+        sb.append("</div>");
         // 桌面小组件：部分 ROM（ColorOS/MIUI 等）组件库里找不到第三方组件，
         // 提供主动添加入口，直接弹系统确认框，绕开组件库
         sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
@@ -2343,28 +2514,16 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<div class='si-hint' style='margin-top:6px;'>若未弹出确认框，可长按桌面空白处，");
         sb.append("在「卡片/小组件」里搜索「石大课表」手动添加</div>");
         sb.append("</div>");
-        // 提醒提前时间选择器
-        int curAdvance = store != null ? store.getAdvanceMinutes() : 15;
+        // 位置冲突时的显示优先级（红框提示不受此项影响，始终显示）
+        String cp = store != null ? store.getConflictPriority() : "school";
         sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
-        sb.append("<div><div class='si-label'>提醒提前时间</div>");
-        sb.append("<div class='si-desc'>上课前提前多久通知</div></div>");
+        sb.append("<div><div class='si-label'>位置冲突时优先显示</div>");
+        sb.append("<div class='si-desc'>自定义课程与教务课程落在同一格时，卡片主色与地点按这里的顺序取值；");
+        sb.append("冲突格始终描红边框</div></div>");
         sb.append("<div style='display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;'>");
-        int[] options = {5, 10, 15, 20, 30, 45, 60};
-        for (int opt : options) {
-            String sel = (opt == curAdvance) ? "style='background:#667eea;color:#fff;'" : "";
-            sb.append("<button class='adv-btn adv-min' onclick='setAdvance(").append(opt).append(")' ")
-              .append(sel).append(">").append(opt).append("分钟</button>");
-        }
+        sb.append("<button class='adv-btn' id='cpSchool' onclick='setConflictPriority(\"school\")'>教务课程优先</button>");
+        sb.append("<button class='adv-btn' id='cpCustom' onclick='setConflictPriority(\"custom\")'>自定义课程优先</button>");
         sb.append("</div></div>");
-        // 提醒权限：清单式，一眼看出缺哪项，点即跳转
-        sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
-        sb.append("<div><div class='si-label'>提醒权限</div>");
-        sb.append("<div class='si-desc'>开启后退出应用、锁屏也能准时弹提醒；点任一项可直接去开启</div></div>");
-        sb.append("<div class='perm-list' id='permList'></div>");
-        sb.append("<div class='si-hint' id='permHint'>权限状态检测中…</div>");
-        sb.append("<button class='adv-btn' style='margin-top:10px;width:100%;' onclick='toggleGuide()'>查看本机设置指引</button>");
-        sb.append("<div class='si-hint' id='permGuide' style='display:none;white-space:pre-line;text-align:left;'></div>");
-        sb.append("</div>");
         // 课程布局
         sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
         sb.append("<div><div class='si-label'>课程布局</div>");
@@ -2376,6 +2535,67 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<div><div class='si-label'>课表数据诊断</div>");
         sb.append("<div class='si-desc'>保存最近一次教务系统课表页面及解析结果，便于排查漏课。文件可能包含课程和个人信息，请勿公开传播。</div></div>");
         sb.append("<button class='adv-btn' style='margin-top:10px;width:100%;' onclick='Android.onExportScheduleCapture()'>保存抓取数据</button>");
+        sb.append("</div>");
+        sb.append("</div></div>");
+
+        // 二级：自定义课程管理
+        sb.append("<div class='page' id='pageCustom'>");
+        sb.append("<div class='page-head'><button class='ph-back' onclick='closePage()'>‹</button>");
+        sb.append("<div class='ph-title'>自定义课程</div><div class='ph-pad'></div></div>");
+        sb.append("<div class='page-body'>");
+        sb.append("<div class='si-hint' style='margin:0 0 12px;'>自定义课程单独存储，刷新教务课表不会覆盖或清空。");
+        sb.append("与教务课程落在同一格时会描红边框提示。</div>");
+        sb.append("<div class='nav-card' style='padding:0 16px;'>").append(buildCustomCourseListHtml()).append("</div>");
+        sb.append("<button class='adv-btn' style='margin-top:16px;width:100%;background:#667eea;color:#fff;");
+        sb.append("border-color:#667eea;font-weight:600;' onclick='Android.onAddCustomFromSettings()'>＋ 添加自定义课程</button>");
+        if (store != null && store.getCustomCourseCount() > 0) {
+            sb.append("<button class='adv-btn' style='margin-top:10px;width:100%;background:#FFF0F0;color:#e55;");
+            sb.append("' onclick='Android.onClearCustomCourses()'>清空全部自定义课程</button>");
+        }
+        sb.append("</div></div>");
+
+        // 二级：添加/编辑自定义课程（表单）
+        sb.append("<div class='page' id='pageCustomEdit'>");
+        sb.append("<div class='page-head'><button class='ph-back' onclick='closePage()'>‹</button>");
+        sb.append("<div class='ph-title' id='cfTitle'>添加课程</div><div class='ph-pad'></div></div>");
+        sb.append("<div class='page-body'>");
+        sb.append("<input type='hidden' id='cfId'>");
+        sb.append("<label class='cf-label'>课程名称 <span style='color:#E5533D'>*</span></label>");
+        sb.append("<input class='cf-input' id='cfName' maxlength='30' placeholder='例如：自习 / 社团活动'>");
+        sb.append("<div class='cf-row'>");
+        sb.append("<div><label class='cf-label'>星期</label><select class='cf-input' id='cfDay'>");
+        for (int d = 1; d <= 7; d++) {
+            sb.append("<option value='").append(d).append("'>").append(WEEKDAY_CN[d]).append("</option>");
+        }
+        sb.append("</select></div>");
+        sb.append("<div><label class='cf-label'>节次</label><select class='cf-input' id='cfRow'>");
+        for (int r = 1; r <= MAX_RENDER_ROWS; r++) {
+            String pl = r <= PERIOD_LABELS.length
+                    ? PERIOD_LABELS[r - 1] : (r * 2 - 1) + "-" + (r * 2) + "节";
+            sb.append("<option value='").append(r).append("'>第").append(pl).append("</option>");
+        }
+        sb.append("</select></div></div>");
+        // 重复方式：仅本周（单次卡片） / 按周次（可填 1-16、3,5,7 等）
+        sb.append("<label class='cf-label'>重复方式</label>");
+        sb.append("<div class='cf-seg'><button class='cf-seg-item' id='cfRepWeek' onclick='pickRepeat(\"week\")'>仅本周一次</button>");
+        sb.append("<button class='cf-seg-item' id='cfRepCustom' onclick='pickRepeat(\"custom\")'>按周次重复</button></div>");
+        sb.append("<div id='cfWeeksBox'>");
+        sb.append("<label class='cf-label'>周次</label>");
+        sb.append("<input class='cf-input' id='cfWeeks' maxlength='40' placeholder='留空表示每周都有'>");
+        sb.append("<div class='cf-tip'>支持 1-16、3,5,7、1-16单 等写法；留空 = 每周</div>");
+        sb.append("</div>");
+        sb.append("<div class='cf-tip' id='cfOnceTip' style='display:none'>只在本周这一格显示一张卡片，其它周不出现</div>");
+        sb.append("<label class='cf-label'>上课地点</label>");
+        sb.append("<input class='cf-input' id='cfLoc' maxlength='30' placeholder='选填'>");
+        sb.append("<label class='cf-label'>授课教师</label>");
+        sb.append("<input class='cf-input' id='cfTeacher' maxlength='20' placeholder='选填'>");
+        sb.append("<label class='cf-label'>备注</label>");
+        sb.append("<input class='cf-input' id='cfRemark' maxlength='60' placeholder='选填'>");
+        sb.append("<label class='cf-label'>卡片颜色</label>");
+        sb.append("<div class='cf-colors' id='cfColors'></div>");
+        sb.append("<div class='cf-actions'>");
+        sb.append("<button class='cf-del' id='cfDelete' style='display:none' onclick='deleteCurrentCustom()'>删除</button>");
+        sb.append("<button class='cf-save' onclick='saveCustom()'>保存</button>");
         sb.append("</div>");
         sb.append("</div></div>");
 
@@ -2400,8 +2620,8 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<div class='ac-title'>开发信息</div>");
         sb.append("<div class='kv'><span>开发环境</span><b>Android Studio · Gradle 8.4 · AGP 8.3.2 · JDK 21</b></div>");
         sb.append("<div class='kv'><span>开发语言</span><b>Java（原生逻辑） + HTML / CSS / JavaScript（界面）</b></div>");
-        sb.append("<div class='kv'><span>技术架构</span><b>WebView 混合架构：原生负责登录、数据与提醒，网页负责课表渲染与交互</b></div>");
-        sb.append("<div class='kv'><span>核心逻辑</span><b>CAS 单点登录 → 教务 DOM 解析课表 → 本地离线存储 → 前台服务定时提醒（悬浮窗 + 响铃）</b></div>");
+        sb.append("<div class='kv'><span>技术架构</span><b>WebView 混合架构：原生负责登录与数据，网页负责课表渲染与交互</b></div>");
+        sb.append("<div class='kv'><span>核心逻辑</span><b>CAS 单点登录 → 教务 DOM 解析课表 → 本地离线存储 → 周课表渲染 + 桌面小组件</b></div>");
         sb.append("<div class='kv'><span>数据存储</span><b>课表与配置存本机，密码经 Android Keystore 加密</b></div>");
         sb.append("<div class='kv'><span>兼容版本</span><b>Android 7.0 及以上（API 24+）</b></div>");
         sb.append("</div>");
@@ -2428,7 +2648,83 @@ public class MainActivity extends AppCompatActivity {
         // JS
         sb.append("<script>");
         sb.append("var CUR_WEEK=").append(week).append(";");
-        sb.append("var PERM_GUIDE=").append(org.json.JSONObject.quote(PermissionHelper.guideText())).append(";");
+        // ===== 轻量 toast（不依赖原生 Toast，错误提示不会打断操作）=====
+        sb.append("function toast(msg){");
+        sb.append("  var t=document.getElementById('toastBox');");
+        sb.append("  if(!t){t=document.createElement('div');t.id='toastBox';t.className='toast';document.body.appendChild(t);}");
+        sb.append("  t.textContent=msg;t.classList.add('show');");
+        sb.append("  clearTimeout(window.__toastTimer);");
+        sb.append("  window.__toastTimer=setTimeout(function(){t.classList.remove('show');},1800);}");
+        // ===== 加课模式：点「＋ 加课」后点空白格子 =====
+        sb.append("var addMode=false;");
+        sb.append("function toggleAddMode(){");
+        sb.append("  addMode=!addMode;");
+        sb.append("  document.body.classList.toggle('adding',addMode);");
+        sb.append("  if(addMode)toast('点一下空白格子，选择位置');}");
+        sb.append("function onEmptyClick(ev,d,r){");
+        sb.append("  if(!addMode)return;");
+        sb.append("  ev.stopPropagation();");
+        sb.append("  addMode=false;");
+        sb.append("  document.body.classList.remove('adding');");
+        sb.append("  Android.onPickCell(d,r);}");
+        // ===== 自定义课程表单 =====
+        sb.append("var CUSTOM_COLORS=[").append(joinQuoted(CUSTOM_COLORS)).append("];");
+        sb.append("var cfSelColor=CUSTOM_COLORS[0];");
+        sb.append("function buildColorPicker(){");
+        sb.append("  var box=document.getElementById('cfColors');if(!box)return;");
+        sb.append("  var h='';");
+        sb.append("  for(var i=0;i<CUSTOM_COLORS.length;i++){");
+        sb.append("    var c=CUSTOM_COLORS[i];");
+        sb.append("    h+='<button class=\"cf-color\" data-c=\"'+c+'\" style=\"background:'+c+'\" onclick=\"pickColor(\\''+c+'\\')\"></button>';}");
+        sb.append("  box.innerHTML=h;}");
+        sb.append("function pickColor(c){cfSelColor=c;");
+        sb.append("  var bs=document.querySelectorAll('.cf-color');");
+        sb.append("  for(var i=0;i<bs.length;i++){bs[i].classList.toggle('sel',bs[i].getAttribute('data-c')===c);}}");
+        sb.append("var cfRepeat='custom';");
+        // 仅本周 / 按周次 互斥切换：选「仅本周」后隐藏周次输入，保存时自动写当前周
+        sb.append("function pickRepeat(v){");
+        sb.append("  cfRepeat=(v==='week')?'week':'custom';");
+        sb.append("  var box=document.getElementById('cfWeeksBox');");
+        sb.append("  var tip=document.getElementById('cfOnceTip');");
+        sb.append("  if(box)box.style.display=cfRepeat==='week'?'none':'block';");
+        sb.append("  if(tip)tip.style.display=cfRepeat==='week'?'block':'none';");
+        sb.append("  var a=document.getElementById('cfRepWeek'),b=document.getElementById('cfRepCustom');");
+        sb.append("  if(a)a.classList.toggle('sel',cfRepeat==='week');");
+        sb.append("  if(b)b.classList.toggle('sel',cfRepeat==='custom');}");
+        sb.append("function openCustomForm(d){");
+        sb.append("  d=d||{};");
+        sb.append("  var g=function(id){return document.getElementById(id);};");
+        sb.append("  g('cfId').value=d.id||'';");
+        sb.append("  g('cfTitle').textContent=d.id?'编辑课程':'添加课程';");
+        sb.append("  g('cfName').value=d.name||'';");
+        sb.append("  g('cfDay').value=String(d.day||1);");
+        sb.append("  g('cfRow').value=String(d.row||1);");
+        sb.append("  var wk=(d.weeks||'').trim();");
+        sb.append("  g('cfWeeks').value=wk;");
+        // 周次恰好是「当前显示周」的单值 → 视为单次卡片，其余走按周次
+        sb.append("  pickRepeat(wk===String(CUR_WEEK)?'week':'custom');");
+        sb.append("  g('cfLoc').value=d.location||'';");
+        sb.append("  g('cfTeacher').value=d.teacher||'';");
+        sb.append("  g('cfRemark').value=d.remark||'';");
+        sb.append("  g('cfDelete').style.display=d.id?'block':'none';");
+        sb.append("  pickColor(d.color||CUSTOM_COLORS[0]);");
+        sb.append("  openPage('pageCustomEdit');}");
+        sb.append("function saveCustom(){");
+        sb.append("  var g=function(id){return document.getElementById(id);};");
+        sb.append("  var name=g('cfName').value.trim();");
+        sb.append("  if(!name){toast('请填写课程名称');g('cfName').focus();return;}");
+        sb.append("  var d={id:g('cfId').value,name:name,");
+        sb.append("    day:parseInt(g('cfDay').value||'1',10),row:parseInt(g('cfRow').value||'1',10),");
+        // 单次卡片：周次直接写当前显示周，卡片只在这一周出现
+        sb.append("    weeks:(cfRepeat==='week'?String(CUR_WEEK):g('cfWeeks').value.trim()),");
+        sb.append("    location:g('cfLoc').value.trim(),");
+        sb.append("    teacher:g('cfTeacher').value.trim(),remark:g('cfRemark').value.trim(),");
+        sb.append("    color:cfSelColor};");
+        sb.append("  Android.onSaveCustom(JSON.stringify(d));}");
+        sb.append("function deleteCurrentCustom(){");
+        sb.append("  var id=document.getElementById('cfId').value;");
+        sb.append("  if(id)Android.onDeleteCustom(id);}");
+        sb.append("function deleteCustom(ev,id){ev.stopPropagation();Android.onDeleteCustom(id);}");
         // ===== 长按拖动调整课程位置 =====
         sb.append("var dragMode=false,dragEl=null,undoStack=[],pressTimer=null;");
         sb.append("var pressX=0,pressY=0,baseR=null,curHint=null,didDrag=false;");
@@ -2564,7 +2860,7 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  },false);");
         sb.append("  el.addEventListener('click',function(){");
         sb.append("    if(didDrag){didDrag=false;return;}");
-        sb.append("    if(dragMode)return;");
+        sb.append("    if(dragMode||addMode)return;");
         sb.append("    var d=this.getAttribute('data-detail');");
         // 取 rect 时若入场动画(popIn)还在播，scale 会让 getBoundingClientRect
         // 返回缩放后的矩形，窗口起点就算错了。
@@ -2587,7 +2883,7 @@ public class MainActivity extends AppCompatActivity {
         sb.append("document.addEventListener('touchstart',function(e){touchStartX=e.changedTouches[0].screenX;},false);");
         sb.append("document.addEventListener('touchend',function(e){");
         sb.append("  if(window.__suppressSwipe||dragEl){window.__suppressSwipe=false;return;}");
-        sb.append("  if(dragMode)return;");
+        sb.append("  if(dragMode||addMode)return;");
         // 详情/设置弹窗打开时不响应滑动切周，避免误触跳周
         sb.append("  var cm=document.getElementById('courseModal');");
         sb.append("  if(cm&&cm.classList.contains('show'))return;");
@@ -2596,18 +2892,6 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  var dx=touchEndX-touchStartX;");
         sb.append("  if(Math.abs(dx)>80){Android.onWeekChanged(").append(week + "+(dx>0?-1:1)").append(");}");
         sb.append("},false);");
-        // ===== 课程卡片铃铛：点击开关该课提醒 =====
-        sb.append("function toggleBell(ev,el){");
-        sb.append("  ev.stopPropagation();");
-        sb.append("  var card=el.closest('.course');");
-        sb.append("  if(!card)return;");
-        sb.append("  var keys=(card.getAttribute('data-keys')||'').split(';;;').filter(function(k){return k;});");
-        sb.append("  if(!keys.length)return;");
-        sb.append("  var on=!el.classList.contains('on');");
-        sb.append("  el.classList.toggle('on',on);");
-        sb.append("  card.classList.toggle('remind-on',on);");
-        sb.append("  Android.onToggleCourseReminder(keys.join(';;;'),on);");
-        sb.append("}");
         // ===== 课程详情弹窗：窗口生长动画（仿鸿蒙/ColorOS 应用展开） =====
         //
         // 关键点：只动窗口边界(left/top/width/height/border-radius)，不动内容。
@@ -2740,31 +3024,18 @@ public class MainActivity extends AppCompatActivity {
         sb.append("    window.__cardRect=null;");
         sb.append("  });");
         sb.append("}");
-        sb.append("function updatePermUi(overlay,battery,notify){");
-        sb.append("  var list=[");
-        sb.append("    {n:'悬浮窗权限',ok:overlay,t:'到点把提醒弹在其他应用之上（最关键）',a:'Android.onRequestOverlay()'},");
-        sb.append("    {n:'通知权限',ok:notify,t:'权限不足时用通知兜底提醒',a:'Android.onRequestNotification()'},");
-        sb.append("    {n:'后台运行',ok:battery,t:'不受系统省电限制，避免被系统冻结',a:'Android.onRequestBattery()'},");
-        sb.append("    {n:'自启动',ok:null,t:'重启手机后自动恢复提醒（系统无接口，需手动确认）',a:'Android.onRequestAutoStart()'}");
-        sb.append("  ];");
-        sb.append("  var h='';");
-        sb.append("  for(var i=0;i<list.length;i++){var it=list[i];");
-        sb.append("    var cls=it.ok===null?'warn':(it.ok?'ok':'bad');");
-        sb.append("    var st=it.ok===null?'!':(it.ok?'\\u2713':'\\u2715');");
-        sb.append("    h+='<div class=\"perm-row '+cls+'\" onclick=\"'+it.a+'\">';");
-        sb.append("    h+='<span class=\"perm-st\">'+st+'</span>';");
-        sb.append("    h+='<span class=\"perm-tx\"><b>'+it.n+'</b><i>'+it.t+'</i></span>';");
-        sb.append("    h+='</div>';}");
-        sb.append("  var pl=document.getElementById('permList');");
-        sb.append("  if(pl)pl.innerHTML=h;");
-        sb.append("  var hint=document.getElementById('permHint');");
-        sb.append("  if(hint){");
-        sb.append("    if(overlay&&notify)hint.textContent='权限已就绪，退出应用也能准时提醒';");
-        sb.append("    else hint.textContent='还差关键权限未开，此时提醒会降级为普通通知（点上方任一项去开启）';");
-        sb.append("  }}");
-        sb.append("function toggleGuide(){var g=document.getElementById('permGuide');if(!g)return;");
-        sb.append("  if(g.style.display==='none'){g.textContent=PERM_GUIDE;g.style.display='block';}");
-        sb.append("  else g.style.display='none';}");
+        // 从详情直接跳到表单/删除时用：立即收起弹窗，不播收缩动画，
+        // 否则弹窗（z-index 100）会在表单页（95）之上多压 250ms
+        sb.append("function closeModalNow(){");
+        sb.append("  var modal=document.getElementById('courseModal');");
+        sb.append("  if(modal)modal.classList.remove('show');");
+        sb.append("  var mEl=document.querySelector('#courseModal .modal');");
+        sb.append("  if(mEl){mEl.style.transition='none';mEl.style.left='';mEl.style.top='';");
+        sb.append("    mEl.style.width='';mEl.style.height='';mEl.style.borderRadius='';mEl.style.background='';}");
+        sb.append("  var oc=window.__openedCard;");
+        sb.append("  if(oc){oc.style.transition='';oc.style.transform='';oc.style.opacity='';}");
+        sb.append("  window.__openedCard=null;window.__cardRect=null;");
+        sb.append("  if(mEl){mEl.getBoundingClientRect();mEl.style.transition='';}}");
         // ===== 设置页导航（独立页面，从右侧滑入）=====
         sb.append("var pageStack=[];");
         sb.append("function openPage(id){var p=document.getElementById(id);if(!p)return;");
@@ -2778,15 +3049,10 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  if(cm&&cm.classList.contains('show')){closeModal();return '1';}");
         sb.append("  return '0';}");
         sb.append("function openSub(name){");
-        sb.append("  var map={account:'pageAccount',general:'pageGeneral',about:'pageAbout'};");
+        sb.append("  var map={account:'pageAccount',general:'pageGeneral',custom:'pageCustom',about:'pageAbout'};");
         sb.append("  if(map[name])openPage(map[name]);}");
-        sb.append("function showSettings(){openPage('pageSettings');");
-        sb.append("  if(window.Android&&Android.onSettingsOpened)Android.onSettingsOpened();}");
+        sb.append("function showSettings(){openPage('pageSettings');}");
         sb.append("function copyTxt(t){if(window.Android&&Android.onCopy)Android.onCopy(t);}");
-        sb.append("function setAdvance(m){Android.onSetAdvance(m);");
-        sb.append("document.querySelectorAll('.adv-min').forEach(function(b){");
-        sb.append("b.style.background='';b.style.color='';});");
-        sb.append("event.target.style.background='#667eea';event.target.style.color='#fff';}");
         // 主题切换（带背景过渡动画）
         sb.append("function setTheme(m){");
         sb.append("  document.body.classList.toggle('dark',m==='dark');");
@@ -2796,28 +3062,44 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  var l=document.getElementById('themeLight'),d=document.getElementById('themeDark');");
         sb.append("  if(l){l.style.background=m==='dark'?'':'#667eea';l.style.color=m==='dark'?'':'#fff';}");
         sb.append("  if(d){d.style.background=m==='dark'?'#667eea':'';d.style.color=m==='dark'?'#fff':'';}}");
-        // 开屏动画开关（写入后下次启动生效）
-        sb.append("function setSplash(v){Android.onSetSplashAnim(v);updateSplashBtn(v);}");
-        sb.append("function updateSplashBtn(v){");
-        sb.append("  var a=document.getElementById('splashOn'),b=document.getElementById('splashOff');");
-        sb.append("  if(a){a.style.background=v?'#667eea':'';a.style.color=v?'#fff':'';}");
-        sb.append("  if(b){b.style.background=v?'':'#667eea';b.style.color=v?'':'#fff';}}");
+        // 开屏动画：单个开关（写入后下次启动生效）
+        sb.append("var splashOn=").append(splashAnimOn ? "true" : "false").append(";");
+        sb.append("function toggleSplash(){");
+        sb.append("  splashOn=!splashOn;");
+        sb.append("  var s=document.getElementById('splashSwitch');");
+        sb.append("  if(s)s.classList.toggle('on',splashOn);");
+        sb.append("  Android.onSetSplashAnim(splashOn?1:0);}");
+        // 冲突优先显示
+        sb.append("function setConflictPriority(v){");
+        sb.append("  updateConflictBtn(v);");
+        sb.append("  Android.onSetConflictPriority(v);}");
+        sb.append("function updateConflictBtn(v){");
+        sb.append("  var s=document.getElementById('cpSchool'),c=document.getElementById('cpCustom');");
+        sb.append("  if(s){s.style.background=v==='school'?'#667eea':'';s.style.color=v==='school'?'#fff':'';}");
+        sb.append("  if(c){c.style.background=v==='custom'?'#667eea':'';c.style.color=v==='custom'?'#fff':'';}}");
         // 自定义图片背景
         sb.append("function applyBg(url){");
         sb.append("  document.body.classList.toggle('hasbg',!!url);");
         sb.append("  var b=document.getElementById('clearBgBtn');");
         sb.append("  if(b)b.style.display=url?'inline-block':'none';}");
         sb.append("updateThemeBtn('").append("dark".equals(theme) ? "dark" : "light").append("');");
-        sb.append("updateSplashBtn(").append(splashAnimOn ? "1" : "0").append(");");
+        sb.append("updateConflictBtn('").append(cp).append("');");
+        sb.append("buildColorPicker();");
         sb.append("</script>");
         sb.append("</body></html>");
         return sb.toString();
     }
 
     /** 单个课程的详情对象 */
-    private JSONObject buildCourseDetailObj(JSONObject c, int week, String periodLabel, String periodTime, String color) {
+    private JSONObject buildCourseDetailObj(JSONObject c, int week, String periodLabel,
+                                           String periodTime, String color, boolean clash) {
         try {
             JSONObject d = new JSONObject();
+            String id = c.optString("id", "");
+            d.put("id", id);
+            // src 决定详情弹窗里是否给出「编辑 / 删除」入口
+            d.put("src", id.isEmpty() ? "school" : "custom");
+            d.put("clash", clash);
             d.put("name", c.optString("name", ""));
             d.put("teacher", c.optString("teacher", ""));
             d.put("location", c.optString("location", ""));
@@ -2825,9 +3107,8 @@ public class MainActivity extends AppCompatActivity {
             d.put("period", periodLabel);
             d.put("time", periodTime);
             d.put("week", "第" + week + "周");
-            String[] wd = {"", "周一", "周二", "周三", "周四", "周五", "周六", "周日"};
             int day = c.optInt("day", 0);
-            d.put("weekday", day >= 1 && day <= 7 ? wd[day] : "");
+            d.put("weekday", day >= 1 && day <= 7 ? WEEKDAY_CN[day] : "");
             d.put("count", c.optString("count", ""));
             d.put("cls", c.optString("cls", ""));
             d.put("remark", c.optString("remark", ""));
@@ -2839,12 +3120,14 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /** 该格所有课程的详情数组（同一时段可能重叠多门课） */
-    private String buildCourseDetailArray(JSONArray arr, int week, String periodLabel, String periodTime, String color) {
+    private String buildCourseDetailArray(JSONArray arr, int week, String periodLabel,
+                                          String periodTime, String color, boolean clash) {
         JSONArray out = new JSONArray();
         for (int i = 0; i < arr.length(); i++) {
             JSONObject c = arr.optJSONObject(i);
             if (c == null) continue;
-            out.put(buildCourseDetailObj(c, week, periodLabel, periodTime, color));
+            // 冲突提示只在第一门课里出现一次，避免同一格重复刷 3 条同样的提示
+            out.put(buildCourseDetailObj(c, week, periodLabel, periodTime, color, clash && i == 0));
         }
         return out.toString().replace("'", "\\'");
     }
@@ -3006,51 +3289,8 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @JavascriptInterface
-        public void onToggleCourseReminder(String keyList, final boolean on) {
-            if (keyList == null || keyList.isEmpty()) return;
-            final String[] ks = keyList.split(";;;");
-            handler.post(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        if (store == null) store = new ScheduleStore(MainActivity.this);
-                        java.util.Set<String> keys = store.getReminderKeys();
-                        for (String k : ks) {
-                            if (k == null || k.isEmpty()) continue;
-                            if (on) keys.add(k); else keys.remove(k);
-                        }
-                        store.saveReminderKeys(keys);
-                        ReminderService.reload(MainActivity.this);
-                        String label = ks.length > 1 ? (ks.length + " 门课程") : ks[0].split("\\|")[0];
-                        Toast.makeText(MainActivity.this,
-                            on ? "已开启「" + label + "」上课提醒（共 " + keys.size() + " 门）"
-                               : "已关闭「" + label + "」上课提醒",
-                            Toast.LENGTH_SHORT).show();
-                        Log.d(TAG, "toggle reminder " + (on ? "on" : "off") + " x" + ks.length);
-                    } catch (Exception e) {
-                        Log.e(TAG, "toggle reminder error", e);
-                    }
-                }
-            });
-        }
-
-        @JavascriptInterface
         public void onAddWidget() {
             handler.post(() -> requestAddWidget());
-        }
-
-        @JavascriptInterface
-        public void onSetAdvance(int minutes) {
-            handler.post(() -> {
-                if (store == null) store = new ScheduleStore(MainActivity.this);
-                store.setAdvanceMinutes(minutes);
-                Log.d(TAG, "advance set to " + minutes + " minutes");
-                // 提前量变了 → 重算提醒时刻表
-                ReminderService.reload(MainActivity.this);
-                Toast.makeText(MainActivity.this,
-                    "提醒提前量已设为 " + minutes + " 分钟",
-                    Toast.LENGTH_SHORT).show();
-            });
         }
 
         @JavascriptInterface
@@ -3062,7 +3302,6 @@ public class MainActivity extends AppCompatActivity {
                         if (store == null) store = new ScheduleStore(MainActivity.this);
                         store.clearOverrides();
                         renderWeekSchedule(currentDisplayWeek);
-                        ReminderService.reload(MainActivity.this);
                         Toast.makeText(MainActivity.this,
                             "已重置课程布局，恢复默认位置", Toast.LENGTH_SHORT).show();
                         Log.d(TAG, "course layout overrides cleared");
@@ -3092,6 +3331,130 @@ public class MainActivity extends AppCompatActivity {
                 Toast.makeText(MainActivity.this,
                     enabled ? "开屏动画已开启，下次启动生效" : "开屏动画已关闭，下次启动直接进入课表",
                     Toast.LENGTH_SHORT).show();
+            });
+        }
+
+        /** 位置冲突时优先显示哪一路课程 */
+        @JavascriptInterface
+        public void onSetConflictPriority(String mode) {
+            handler.post(() -> {
+                if (store == null) store = new ScheduleStore(MainActivity.this);
+                store.setConflictPriority(mode);
+                Log.d(TAG, "conflict priority = " + store.getConflictPriority());
+                renderWeekSchedule(currentDisplayWeek);
+            });
+        }
+
+        /** 加课模式选中了空格子：打开表单并预填位置 */
+        @JavascriptInterface
+        public void onPickCell(int day, int row) {
+            handler.post(() -> {
+                try {
+                    JSONObject blank = new JSONObject();
+                    blank.put("day", Math.max(1, Math.min(7, day)));
+                    blank.put("row", Math.max(1, Math.min(MAX_RENDER_ROWS, row)));
+                    showCustomForm(blank);
+                } catch (Exception e) {
+                    Log.e(TAG, "pick cell error", e);
+                }
+            });
+        }
+
+        /** 设置页里的「添加自定义课程」：没有预选位置，默认周一第 1 大节 */
+        @JavascriptInterface
+        public void onAddCustomFromSettings() {
+            handler.post(() -> {
+                try {
+                    JSONObject blank = new JSONObject();
+                    blank.put("day", 1);
+                    blank.put("row", 1);
+                    showCustomForm(blank);
+                } catch (Exception e) {
+                    Log.e(TAG, "add custom error", e);
+                }
+            });
+        }
+
+        /** 编辑已存在的自定义课程 */
+        @JavascriptInterface
+        public void onEditCustom(String id) {
+            handler.post(() -> {
+                if (store == null) store = new ScheduleStore(MainActivity.this);
+                JSONObject c = store.getCustomCourse(id);
+                if (c == null) { Toast.makeText(MainActivity.this, "课程不存在", Toast.LENGTH_SHORT).show(); return; }
+                showCustomForm(c);
+            });
+        }
+
+        /** 保存自定义课程（新增或编辑） */
+        @JavascriptInterface
+        public void onSaveCustom(String json) {
+            handler.post(() -> {
+                try {
+                    if (store == null) store = new ScheduleStore(MainActivity.this);
+                    JSONObject input = new JSONObject(json == null ? "{}" : json);
+                    boolean isNew = input.optString("id", "").isEmpty();
+                    JSONObject saved = store.saveCustomCourse(input);
+                    if (saved == null) {
+                        Toast.makeText(MainActivity.this, "保存失败：请检查课程名称与位置",
+                            Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    // 表单里刚选的位置必须生效：清掉这门课历史拖动留下的覆盖
+                    store.removeOverride(ScheduleStore.courseKey(saved));
+                    Log.d(TAG, "custom course " + (isNew ? "added" : "updated") + ": "
+                        + saved.optString("name", ""));
+                    NextCourseWidgetProvider.refreshAll(MainActivity.this);
+                    renderWeekSchedule(currentDisplayWeek);
+                    Toast.makeText(MainActivity.this,
+                        isNew ? "已添加自定义课程" : "已保存修改", Toast.LENGTH_SHORT).show();
+                } catch (Exception e) {
+                    Log.e(TAG, "save custom error", e);
+                }
+            });
+        }
+
+        /** 删除单条自定义课程 */
+        @JavascriptInterface
+        public void onDeleteCustom(String id) {
+            handler.post(() -> {
+                try {
+                    if (store == null) store = new ScheduleStore(MainActivity.this);
+                    JSONObject c = store.getCustomCourse(id);
+                    if (c == null) return;
+                    String name = c.optString("name", "");
+                    String key = ScheduleStore.courseKey(c);
+                    // 拖动覆盖是按 key 存的，删课要一并清掉，避免留下孤儿数据
+                    store.removeOverride(key);
+                    store.removeCustomCourse(id);
+                    Log.d(TAG, "custom course removed: " + name);
+                    NextCourseWidgetProvider.refreshAll(MainActivity.this);
+                    renderWeekSchedule(currentDisplayWeek);
+                    Toast.makeText(MainActivity.this, "已删除「" + name + "」", Toast.LENGTH_SHORT).show();
+                } catch (Exception e) {
+                    Log.e(TAG, "delete custom error", e);
+                }
+            });
+        }
+
+        /** 清空全部自定义课程（二次确认，避免误触） */
+        @JavascriptInterface
+        public void onClearCustomCourses() {
+            handler.post(() -> {
+                if (store == null) store = new ScheduleStore(MainActivity.this);
+                final int n = store.getCustomCourseCount();
+                if (n == 0) return;
+                new AlertDialog.Builder(MainActivity.this)
+                    .setTitle("清空自定义课程")
+                    .setMessage("将删除全部 " + n + " 门自定义课程，教务课表不受影响。此操作不可恢复。")
+                    .setNegativeButton("取消", null)
+                    .setPositiveButton("清空", (d, w) -> {
+                        store.clearCustomCourses();
+                        NextCourseWidgetProvider.refreshAll(MainActivity.this);
+                        renderWeekSchedule(currentDisplayWeek);
+                        Toast.makeText(MainActivity.this, "已清空自定义课程", Toast.LENGTH_SHORT).show();
+                    })
+                    .show();
             });
         }
 
@@ -3170,16 +3533,6 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @JavascriptInterface
-        public void onSettingsOpened() {
-            handler.post(new Runnable() {
-                @Override
-                public void run() {
-                    refreshPermissionUi();
-                }
-            });
-        }
-
-        @JavascriptInterface
         public void onCopy(String text) {
             if (text == null || text.isEmpty()) return;
             final String t = text;
@@ -3196,77 +3549,6 @@ public class MainActivity extends AppCompatActivity {
                     } catch (Exception e) {
                         Log.e(TAG, "copy failed", e);
                     }
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void onRequestNotification() {
-            handler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (Build.VERSION.SDK_INT >= 33) {
-                        ActivityCompat.requestPermissions(MainActivity.this,
-                            new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 100);
-                    } else {
-                        PermissionHelper.openAppDetails(MainActivity.this);
-                    }
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void onRequestOverlay() {
-            handler.post(new Runnable() {
-                @Override
-                public void run() {
-                    PermissionHelper.openOverlaySettings(MainActivity.this);
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void onRequestAutoStart() {
-            handler.post(new Runnable() {
-                @Override
-                public void run() {
-                    // 小米/红米优先直达权限编辑页（“后台弹出界面”是提醒能否弹出的关键）
-                    boolean ok = PermissionHelper.isMiui()
-                        ? PermissionHelper.openMiuiPopupPermission(MainActivity.this)
-                        : PermissionHelper.openAutoStartSettings(MainActivity.this);
-                    Toast.makeText(MainActivity.this,
-                        ok ? "如列表中有「石大课表」请允许自启动；找不到说明本机无此开关"
-                           : "未能打开自启动设置，请到系统设置里手动允许",
-                        Toast.LENGTH_LONG).show();
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void onRequestBattery() {
-            handler.post(new Runnable() {
-                @Override
-                public void run() {
-                    PermissionHelper.openBatterySettings(MainActivity.this);
-                }
-            });
-        }
-
-        @JavascriptInterface
-        public void onDebugReminder(final int seconds) {
-            handler.post(new Runnable() {
-                @Override
-                public void run() {
-                    int sec = seconds <= 0 ? 10 : seconds;
-                    if (!ReminderOverlay.canDraw(MainActivity.this)) {
-                        Toast.makeText(MainActivity.this,
-                            "悬浮窗权限未开启，提醒将以通知形式显示",
-                            Toast.LENGTH_LONG).show();
-                    }
-                    ReminderService.debug(MainActivity.this, sec);
-                    Toast.makeText(MainActivity.this,
-                        sec + " 秒后弹出测试提醒，可退回桌面查看",
-                        Toast.LENGTH_SHORT).show();
                 }
             });
         }
@@ -3348,9 +3630,18 @@ public class MainActivity extends AppCompatActivity {
                 String cls = d.optString("cls", "");
                 String remark = d.optString("remark", "");
 
+                String src = d.optString("src", "school");
+                String cid = d.optString("id", "");
+                boolean clash = d.optBoolean("clash", false);
+                boolean isCustom = "custom".equals(src);
+
                 js.append("html+='<div class=\"cblock\">';");
-                // 单门课时弹窗标题已显示课名，不再重复；多门课（重叠）时才分别列出每门
-                if (list.length() > 1) {
+                if (isCustom) {
+                    // 自定义课程始终标出来源，避免和教务课程混淆
+                    js.append("html+='<div style=\"margin-bottom:8px\"><span class=\"cb-src\" ");
+                    js.append("style=\"margin-left:0\">自定义课程</span></div>';");
+                } else if (list.length() > 1) {
+                    // 单门课时弹窗标题已显示课名；多门课（重叠）时才分别列出每门
                     js.append("html+='<div class=\"cb-name\">").append(jss(cName));
                     js.append("<span class=\"cb-tag\">第").append(i + 1).append("门</span>");
                     js.append("</div>';");
@@ -3358,18 +3649,37 @@ public class MainActivity extends AppCompatActivity {
                 js.append("html+='<div class=\"row\"><span class=\"label\">上课时间</span><span class=\"val\">")
                   .append(jss(weekStr)).append(weekday.isEmpty() ? "" : " " + jss(weekday)).append(" ")
                   .append(jss(period)).append(time.isEmpty() ? "" : " " + jss(time)).append("</span></div>';");
-                js.append("html+='<div class=\"row\"><span class=\"label\">教学周次</span><span class=\"val\">").append(jss(weeks)).append("</span></div>';");
+                String weeksShow = weeks.isEmpty() ? (isCustom ? "每周" : "") : weeks;
+                js.append("html+='<div class=\"row\"><span class=\"label\">教学周次</span><span class=\"val\">")
+                  .append(jss(weeksShow)).append("</span></div>';");
                 js.append("html+='<div class=\"row\"><span class=\"label\">上课地点</span><span class=\"val\">")
                   .append(location.isEmpty() ? "\u2014" : jss(location)).append("</span></div>';");
                 js.append("html+='<div class=\"row\"><span class=\"label\">授课教师</span><span class=\"val\">")
                   .append(teacher.isEmpty() ? "\u2014" : jss(teacher)).append("</span></div>';");
-                js.append("html+='<div class=\"row\"><span class=\"label\">教学班级</span><span class=\"val\">")
-                  .append(cls.isEmpty() ? "\u2014" : jss(cls)).append("</span></div>';");
-                if (!count.isEmpty()) {
-                    js.append("html+='<div class=\"row\"><span class=\"label\">选课人数</span><span class=\"val\">").append(jss(count)).append("人</span></div>';");
+                // 教学班级 / 选课人数只有教务系统才有，自定义课程不显示空行
+                if (!isCustom) {
+                    js.append("html+='<div class=\"row\"><span class=\"label\">教学班级</span><span class=\"val\">")
+                      .append(cls.isEmpty() ? "\u2014" : jss(cls)).append("</span></div>';");
+                    if (!count.isEmpty()) {
+                        js.append("html+='<div class=\"row\"><span class=\"label\">选课人数</span><span class=\"val\">")
+                          .append(jss(count)).append("人</span></div>';");
+                    }
                 }
-                js.append("html+='<div class=\"row\"><span class=\"label\">教学备注</span><span class=\"val\">")
+                js.append("html+='<div class=\"row\"><span class=\"label\">备注</span><span class=\"val\">")
                   .append(remark.isEmpty() ? "无内容" : jss(remark)).append("</span></div>';");
+                if (clash) {
+                    js.append("html+='<div class=\"cb-clash\">⚠ 这个时段与另一路课程重叠，卡片已描红边框。")
+                      .append("可在「设置 → 通用设置 → 位置冲突时优先显示」调整卡片主色与地点的取值顺序。</div>';");
+                }
+                if (isCustom && !cid.isEmpty()) {
+                    js.append("html+='<div style=\"display:flex;gap:10px;margin-top:14px\">';");
+                    js.append("html+='<button class=\"adv-btn\" style=\"flex:1\" onclick=\"closeModalNow();Android.onEditCustom(\\'")
+                      .append(jss(cid)).append("\\')\">编辑</button>';");
+                    js.append("html+='<button class=\"adv-btn\" style=\"flex:1;background:#FFF0F0;color:#e55\" ");
+                    js.append("onclick=\"closeModalNow();Android.onDeleteCustom(\\'")
+                      .append(jss(cid)).append("\\')\">删除</button>';");
+                    js.append("html+='</div>';");
+                }
                 js.append("html+='</div>';");
             }
 
@@ -3388,6 +3698,16 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception e) {
             Log.e(TAG, "showCourseDetail error", e);
         }
+    }
+
+    /** 把字符串数组拼成 JS 数组字面量内容：'#a','#b' */
+    private static String joinQuoted(String[] arr) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < arr.length; i++) {
+            if (i > 0) sb.append(",");
+            sb.append("'").append(arr[i]).append("'");
+        }
+        return sb.toString();
     }
 
     /** 拼进 JS 单引号字符串：先 HTML 转义，再转义反斜杠/单引号/换行 */

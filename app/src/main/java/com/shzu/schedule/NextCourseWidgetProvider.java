@@ -89,7 +89,7 @@ public class NextCourseWidgetProvider extends AppWidgetProvider {
         }
     }
 
-    /** 供 App 内部（课表变化、提醒触发）调用，主动刷新所有小组件 */
+    /** 供 App 内部（课表变化、课程增删）调用，主动刷新所有小组件 */
     public static void refreshAll(Context context) {
         try {
             AppWidgetManager mgr = AppWidgetManager.getInstance(context);

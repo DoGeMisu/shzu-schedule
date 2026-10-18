@@ -85,9 +85,9 @@
 
         <ImageView
             android:id="@+id/splashLogo"
-            android:layout_width="130dp"
-            android:layout_height="130dp"
-            android:src="@drawable/splash_logo"
+            android:layout_width="190dp"
+            android:layout_height="190dp"
+            android:src="@drawable/ic_launcher_foreground"
             android:contentDescription="石大课表Logo" />
 
         <ImageView

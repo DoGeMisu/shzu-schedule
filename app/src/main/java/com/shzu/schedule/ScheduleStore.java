@@ -30,15 +30,21 @@ public class ScheduleStore {
 
     private static final String PREFS = "schedule_store";
     private static final String KEY_DATA = "data";
-    private static final String KEY_REMINDERS = "course_reminders";  // 已选提醒课程 JSON Set
-    private static final String KEY_ADVANCE = "reminder_advance";   // 全局提前量（分钟）
     private static final String KEY_THEME = "theme";                // 课表主题 light/dark
     private static final String KEY_WIDGET_THEME = "widget_theme";   // 小组件配色 light/dark
     private static final String KEY_BG = "bg_image";                // 自定义背景图文件名
     private static final String KEY_SPLASH_ANIM = "splash_anim";    // 是否播放开屏动画（关闭则启动直达课表）
+    /**
+     * 用户自己添加的课程。与教务抓取的数据完全分离：
+     * 刷新/覆盖/清空教务课表都不会影响这里，反之亦然。
+     */
+    private static final String KEY_CUSTOM = "custom_courses";
+    /** 位置冲突时哪一路课程显示在前面：school / custom */
+    private static final String KEY_CONFLICT_PRIORITY = "conflict_priority";
+    /** 自定义课程条数上限，防止误操作写入海量数据拖慢渲染 */
+    public static final int MAX_CUSTOM_COURSES = 200;
     private static final long DAY = 86400000L;
     private static final int DATA_VERSION = 13; // 递增以清除旧版/测试数据（v13: 清除拖动测试期写入的坏 overrides）
-    private static final int DEFAULT_ADVANCE = 15; // 默认提前15分钟
 
     private final SharedPreferences prefs;
     /** 内存中的完整数据对象：所有读取都走内存，避免每次重新解析 JSON */
@@ -48,11 +54,13 @@ public class ScheduleStore {
     private JSONArray courses = null;
     private String[] periodTimes = null;      // 节次时间表（每行2节课的时间段）
     private JSONObject overrides = null;      // 拖动位置覆盖表
-    private java.util.Set<String> reminderKeys = new java.util.HashSet<>();
-    private int advanceMinutes = DEFAULT_ADVANCE;
     private String theme = "light";
     private String bgImage = "";
     private boolean splashAnimEnabled = true;
+    /** 自定义课程（独立通道，结构见 normalizeCustom） */
+    private JSONArray customCourses = new JSONArray();
+    /** 冲突时优先显示的来源：school(默认) / custom */
+    private String conflictPriority = "school";
 
     public ScheduleStore(Context ctx) {
         prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
@@ -88,17 +96,16 @@ public class ScheduleStore {
         } catch (Exception ignored) {
         }
         // 轻量配置项一并读入内存
-        advanceMinutes = prefs.getInt(KEY_ADVANCE, DEFAULT_ADVANCE);
         theme = prefs.getString(KEY_THEME, "light");
         bgImage = prefs.getString(KEY_BG, "");
         splashAnimEnabled = prefs.getBoolean(KEY_SPLASH_ANIM, true);
+        conflictPriority = prefs.getString(KEY_CONFLICT_PRIORITY, "school");
+        // 自定义课程走独立键，与 KEY_DATA 互不影响
         try {
-            String rj = prefs.getString(KEY_REMINDERS, null);
-            if (rj != null) {
-                JSONArray arr = new JSONArray(rj);
-                for (int i = 0; i < arr.length(); i++) reminderKeys.add(arr.optString(i, ""));
-            }
+            String cj = prefs.getString(KEY_CUSTOM, null);
+            if (cj != null) customCourses = new JSONArray(cj);
         } catch (Exception ignored) {
+            customCourses = new JSONArray();
         }
     }
 
@@ -140,55 +147,29 @@ public class ScheduleStore {
     }
 
     /**
-     * 清空全部本地数据：课表、提醒勾选、提前量、主题、背景图引用。
+     * 清空全部本地数据：课表、主题、背景图引用、自定义课程。
      * 用于「全新安装后清理上一版本残留数据」，清空后需重新登录抓取。
      */
     public void clearAll() {
         clear();
         prefs.edit()
-                .remove(KEY_REMINDERS)
-                .remove(KEY_ADVANCE)
+                // 提醒功能已移除，顺手清掉旧版本可能留下的键
+                .remove("course_reminders")
+                .remove("reminder_advance")
                 .remove(KEY_THEME)
                 .remove(KEY_WIDGET_THEME)
                 .remove(KEY_BG)
+                .remove(KEY_CUSTOM)
+                .remove(KEY_CONFLICT_PRIORITY)
                 .apply();
         periodTimes = null;
-        reminderKeys.clear();
-        advanceMinutes = DEFAULT_ADVANCE;
         theme = "light";
         bgImage = "";
+        customCourses = new JSONArray();
+        conflictPriority = "school";
     }
 
-    // ====== 课程提醒 ======
-
-    /** 获取全局提前量（分钟），默认15 */
-    public int getAdvanceMinutes() {
-        return advanceMinutes;
-    }
-
-    /** 设置全局提前量（分钟） */
-    public void setAdvanceMinutes(int minutes) {
-        advanceMinutes = minutes;
-        prefs.edit().putInt(KEY_ADVANCE, minutes).apply();
-    }
-
-    /** 获取已选提醒课程的 key 集合（返回副本，读内存缓存） */
-    public java.util.Set<String> getReminderKeys() {
-        return new java.util.HashSet<>(reminderKeys);
-    }
-
-    /** 保存提醒课程 key 集合（全量覆盖） */
-    public void saveReminderKeys(java.util.Set<String> keys) {
-        reminderKeys = new java.util.HashSet<>(keys);
-        JSONArray arr = new JSONArray();
-        for (String k : reminderKeys) arr.put(k);
-        prefs.edit().putString(KEY_REMINDERS, arr.toString()).apply();
-    }
-
-    /** 判断某课程是否已设提醒（纯内存查表） */
-    public boolean isReminder(String courseKey) {
-        return reminderKeys.contains(courseKey);
-    }
+    // ====== 课程位置（拖动覆盖） ======
 
     /** 用户拖动产生的位置覆盖表（courseKey → {d,r}），无则返回null；读内存缓存 */
     public JSONObject getOverrides() {
@@ -206,7 +187,7 @@ public class ScheduleStore {
                 if (m == null) continue;
                 String k = m.optString("k", "");
                 int d = m.optInt("d", 0), r = m.optInt("r", 0);
-                if (k.isEmpty() || d < 1 || d > 7 || r < 1 || r > 5) continue;
+                if (k.isEmpty() || d < 1 || d > 7 || r < 1 || r > 8) continue;
                 JSONObject pos = new JSONObject();
                 pos.put("d", d);
                 pos.put("r", r);
@@ -268,6 +249,188 @@ public class ScheduleStore {
         prefs.edit().putBoolean(KEY_SPLASH_ANIM, enabled).apply();
     }
 
+    // ====== 自定义课程（独立通道） ======
+    //
+    // 结构与教务课程保持字段兼容（name/teacher/location/weeks/day/row），
+    // 便于复用周次判定与渲染；额外多出 id/color/remark 三项。
+    // 唯一键由 MainActivity.courseKey 统一给出，带 "custom:" 前缀，避免与教务课程撞键。
+
+    /** 全部自定义课程（返回副本，外部修改不影响内存） */
+    public JSONArray getCustomCourses() {
+        try {
+            return new JSONArray(customCourses.toString());
+        } catch (Exception e) {
+            return new JSONArray();
+        }
+    }
+
+    public int getCustomCourseCount() {
+        return customCourses.length();
+    }
+
+    /** 按 id 取一条（返回副本），找不到返回 null */
+    public JSONObject getCustomCourse(String id) {
+        if (id == null || id.isEmpty()) return null;
+        for (int i = 0; i < customCourses.length(); i++) {
+            JSONObject o = customCourses.optJSONObject(i);
+            if (o == null || !id.equals(o.optString("id", ""))) continue;
+            try {
+                return new JSONObject(o.toString());
+            } catch (Exception e) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /** 第 week 周有课的自定义课程 */
+    public JSONArray customCoursesForWeek(int week) {
+        JSONArray out = new JSONArray();
+        for (int i = 0; i < customCourses.length(); i++) {
+            JSONObject c = customCourses.optJSONObject(i);
+            if (c == null) continue;
+            if (weekMatches(c.optString("weeks", ""), week)) out.put(c);
+        }
+        return out;
+    }
+
+    /**
+     * 新增或更新一条自定义课程。
+     *
+     * @param input 表单数据；id 为空 = 新增，id 已存在 = 覆盖更新
+     * @return 保存后的课程对象；校验失败返回 null
+     */
+    public JSONObject saveCustomCourse(JSONObject input) {
+        if (input == null) return null;
+        JSONObject c = normalizeCustom(input);
+        if (c == null) return null;
+
+        String id = c.optString("id", "");
+        int hit = -1;
+        for (int i = 0; i < customCourses.length(); i++) {
+            JSONObject o = customCourses.optJSONObject(i);
+            if (o != null && !id.isEmpty() && id.equals(o.optString("id", ""))) {
+                hit = i;
+                break;
+            }
+        }
+        if (hit < 0) {
+            if (customCourses.length() >= MAX_CUSTOM_COURSES) return null;
+            if (id.isEmpty()) {
+                id = "c" + System.currentTimeMillis() + "_" + (int) (Math.random() * 1000);
+                try { c.put("id", id); } catch (Exception ignored) {}
+            }
+            customCourses.put(c);
+        } else {
+            try { customCourses.put(hit, c); } catch (Exception ignored) {}
+        }
+        persistCustom();
+        return c;
+    }
+
+    /** 删除一条自定义课程，返回是否删除成功 */
+    public boolean removeCustomCourse(String id) {
+        if (id == null || id.isEmpty()) return false;
+        JSONArray next = new JSONArray();
+        boolean removed = false;
+        for (int i = 0; i < customCourses.length(); i++) {
+            JSONObject o = customCourses.optJSONObject(i);
+            if (o == null) continue;
+            if (id.equals(o.optString("id", ""))) { removed = true; continue; }
+            next.put(o);
+        }
+        if (removed) {
+            customCourses = next;
+            persistCustom();
+        }
+        return removed;
+    }
+
+    public void clearCustomCourses() {
+        customCourses = new JSONArray();
+        persistCustom();
+    }
+
+    private void persistCustom() {
+        try {
+            prefs.edit().putString(KEY_CUSTOM, customCourses.toString()).apply();
+        } catch (Exception ignored) {
+        }
+    }
+
+    /**
+     * 校验并规范化一条自定义课程。
+     * 课程名必填；星期 1..7、节次 1..8 越界即判失败（位置决定它画在哪一格）。
+     */
+    private static JSONObject normalizeCustom(JSONObject in) {
+        try {
+            String name = in.optString("name", "").replaceAll("\\s+", " ").trim();
+            if (name.isEmpty()) return null;
+            if (name.length() > 30) name = name.substring(0, 30);
+            int day = in.optInt("day", 0);
+            int row = in.optInt("row", 0);
+            if (day < 1 || day > 7 || row < 1 || row > 8) return null;
+
+            JSONObject c = new JSONObject();
+            c.put("id", in.optString("id", ""));
+            c.put("name", name);
+            c.put("teacher", clip(in.optString("teacher", ""), 20));
+            c.put("location", clip(in.optString("location", ""), 30));
+            c.put("weeks", clip(in.optString("weeks", ""), 40));
+            c.put("remark", clip(in.optString("remark", ""), 60));
+            c.put("day", day);
+            c.put("row", row);
+            String color = in.optString("color", "").trim();
+            if (!color.matches("^#[0-9a-fA-F]{6}$")) color = "";
+            c.put("color", color);
+            return c;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static String clip(String s, int max) {
+        String v = s == null ? "" : s.replaceAll("\\s+", " ").trim();
+        return v.length() > max ? v.substring(0, max) : v;
+    }
+
+    /** 冲突时优先显示哪一路：school / custom */
+    public String getConflictPriority() {
+        return "custom".equals(conflictPriority) ? "custom" : "school";
+    }
+
+    public void setConflictPriority(String v) {
+        conflictPriority = "custom".equals(v) ? "custom" : "school";
+        prefs.edit().putString(KEY_CONFLICT_PRIORITY, conflictPriority).apply();
+    }
+
+    /**
+     * 自定义课程指纹（进渲染缓存签名）。
+     * 增删改任何一条都会改变它，从而让后台预热的周页面缓存失效。
+     */
+    public int getCustomCoursesHash() {
+        int h = 1;
+        for (int i = 0; i < customCourses.length(); i++) {
+            JSONObject c = customCourses.optJSONObject(i);
+            if (c == null) continue;
+            h = 31 * h + (c.optString("id", "") + "|" + c.optString("name", "") + "|"
+                    + c.optString("location", "") + "|" + c.optString("weeks", "") + "|"
+                    + c.optString("color", "") + "|" + c.optInt("day", 0) + "|" + c.optInt("row", 0)).hashCode();
+        }
+        return h;
+    }
+
+    /** 教务 + 自定义的合并列表（桌面小组件用，它不关心课程来源） */
+    public JSONArray allCoursesForWeek(int week) {
+        JSONArray out = coursesForWeek(week);
+        JSONArray cu = customCoursesForWeek(week);
+        for (int i = 0; i < cu.length(); i++) {
+            JSONObject o = cu.optJSONObject(i);
+            if (o != null) out.put(o);
+        }
+        return out;
+    }
+
     /**
      * 课表数据的轻量指纹。
      * 用于判断「后台预生成的周课表 HTML」是否仍然有效：课程增删改后指纹变化，
@@ -291,6 +454,22 @@ public class ScheduleStore {
         if (data == null) return;
         data.remove("overrides");
         overrides = null;
+        persist();
+    }
+
+    /**
+     * 删除单门课程的拖动覆盖。
+     * 编辑自定义课程时会改它自身的 day/row，若旧覆盖还留着，
+     * 渲染时会再次盖回旧位置，表现为「改了位置却没生效」。
+     */
+    public void removeOverride(String key) {
+        if (data == null || key == null || key.isEmpty() || overrides == null) return;
+        if (!overrides.has(key)) return;
+        overrides.remove(key);
+        if (overrides.length() == 0) {
+            data.remove("overrides");
+            overrides = null;
+        }
         persist();
     }
 
@@ -424,7 +603,7 @@ public class ScheduleStore {
      *
      * 多段周次必须逐段判定、任一段命中即算上课。旧实现用整体正则找第一个区间就 return，
      * 会把 "3-6,8-9,12-13" 截成 "3-6"、"3,5-10" 截成 "5-10"，
-     * 导致这些周次整门课从课表、小组件、课前提醒中一起消失。
+     * 导致这些周次整门课从课表和桌面小组件中一起消失。
      */
     public static boolean weekMatches(String weeksText, int week) {
         if (weeksText == null || weeksText.trim().isEmpty()) return true;
@@ -460,10 +639,28 @@ public class ScheduleStore {
         return true;
     }
 
+    /**
+     * 课程唯一键。拖动 overrides 等多处调用点必须给出同一结果，
+     * 因此统一收在这里，避免 MainActivity / NextCourse 各写一份后漂移。
+     *
+     * 教务课程：名称|教师|周次|day|row（历史格式，改动会导致已存拖动位置失效，不要动）
+     * 自定义课程：custom:id —— 用稳定 id 而不是内容哈希，
+     *            这样改课名/地点后拖动位置仍然跟着这门课走。
+     */
+    public static String courseKey(JSONObject c) {
+        if (c == null) return "";
+        String id = c.optString("id", "");
+        if (!id.isEmpty()) return "custom:" + id;
+        return c.optString("name", "").replaceAll("\\s+", " ").trim()
+            + "|" + c.optString("teacher", "").replaceAll("\\s+", " ").trim()
+            + "|" + c.optString("weeks", "").replaceAll("\\s+", " ").trim()
+            + "|" + c.optInt("day", 0)
+            + "|" + c.optInt("row", 0);
+    }
+
     // ====== 日期格式化 ======
 
-    public static String fmtDate(long millis) {
-        return new SimpleDateFormat("M月d日", Locale.CHINA).format(new Date(millis));
+    public static String fmtDate(long millis) {        return new SimpleDateFormat("M月d日", Locale.CHINA).format(new Date(millis));
     }
 
     public static String fmtWeekday(long millis) {

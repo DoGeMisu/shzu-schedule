@@ -73,7 +73,7 @@ public final class NextCourse {
      */
     private static java.util.Map<String, String> colorMapFor(ScheduleStore store, int week) {
         java.util.Map<String, String> map = new java.util.HashMap<>();
-        JSONArray list = store.coursesForWeek(week);
+        JSONArray list = store.allCoursesForWeek(week);
         int idx = 0;
         if (list != null) {
             for (int i = 0; i < list.length(); i++) {
@@ -167,7 +167,7 @@ public final class NextCourse {
             int targetWeek = week;
             while (d > 7) { d -= 7; targetWeek++; }
 
-            JSONArray courses = store.coursesForWeek(targetWeek);
+            JSONArray courses = store.allCoursesForWeek(targetWeek);
             if (courses == null || courses.length() == 0) continue;
 
             java.util.Map<String, String> colorMap = colorMapFor(store, targetWeek);
@@ -218,7 +218,7 @@ public final class NextCourse {
                 boolean ongoing = startMin <= afterMinute && (endMin < 0 || endMin > afterMinute);
                 if (ended) continue;
                 Item it = build(c, range, week, cDay, cRow, true);
-                it.color = colorMap.getOrDefault(it.name, COLORS[0]);
+                it.color = pickColor(c, it.name, colorMap);
                 it.minutesUntil = startMin - afterMinute;
                 it.ongoing = ongoing;
                 list.add(it);
@@ -226,7 +226,7 @@ public final class NextCourse {
             }
 
             Item it = build(c, range, week, cDay, cRow, false);
-            it.color = colorMap.getOrDefault(it.name, COLORS[0]);
+            it.color = pickColor(c, it.name, colorMap);
             list.add(it);
         }
 
@@ -239,6 +239,13 @@ public final class NextCourse {
             return Integer.compare(sa, sb);
         });
         return list;
+    }
+
+    /** 自定义课程用自选色，其余按课名映射（与课表页一致） */
+    private static String pickColor(JSONObject c, String name, java.util.Map<String, String> colorMap) {
+        String own = c.optString("color", "").trim();
+        if (!own.isEmpty()) return own;
+        return colorMap.getOrDefault(name, COLORS[0]);
     }
 
     /** 结束时间兜底：没解析出来就按开始时间 +100 分钟估 */
@@ -260,7 +267,7 @@ public final class NextCourse {
                 // 这里若读 day/row 会永远拿不到值，导致拖过位置的课在小组件里显示错位置。
                 int nd = o.optInt("d", 0), nr = o.optInt("r", 0);
                 if (nd >= 1 && nd <= 7) day = nd;
-                if (nr >= 1 && nr <= 5) row = nr;
+                if (nr >= 1 && nr <= 8) row = nr;
             }
         }
         return new int[]{day, row};
@@ -286,14 +293,10 @@ public final class NextCourse {
     }
 
     /**
-     * 课程唯一键。必须与 MainActivity.courseKey 保持一致，
-     * 否则 overrides / 提醒集合会对不上（历史 bug：键不含位置导致互相覆盖，已修为含 day|row）。
+     * 课程唯一键。必须与 MainActivity 保持一致，
+     * 因此直接委托给 ScheduleStore.courseKey（自定义课程带 custom: 前缀）。
      */
     static String courseKey(JSONObject c) {
-        return (c.optString("name", "").replaceAll("\\s+", " ").trim()
-            + "|" + c.optString("teacher", "").replaceAll("\\s+", " ").trim()
-            + "|" + c.optString("weeks", "").replaceAll("\\s+", " ").trim()
-            + "|" + c.optInt("day", 0)
-            + "|" + c.optInt("row", 0));
+        return ScheduleStore.courseKey(c);
     }
 }
