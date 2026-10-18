@@ -19,6 +19,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 import android.view.View;
+import android.view.ViewGroup;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
 import android.webkit.SslErrorHandler;
@@ -589,6 +590,13 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override
+    protected void onDestroy() {
+        // 后台静默刷新用的隐藏 WebView 必须显式释放，否则会泄漏 Activity
+        silentAbort("activity destroy");
+        super.onDestroy();
+    }
+
+    @Override
     public void onBackPressed() {
         // 先问 JS 层：设置页/课程详情弹窗是否消费了本次返回
         webView.evaluateJavascript(
@@ -704,13 +712,14 @@ public class MainActivity extends AppCompatActivity {
 
         store = new ScheduleStore(this);
 
-        // 本地已存整学期课表 → 直接渲染今天所在周（离线秒开）；
-        // 课表更新由用户手动点「刷新课表」触发，不再自动按窗口刷新
+        // 本地已存整学期课表 → 直接渲染今天所在周（离线秒开），
+        // 随后在后台静默拉一次最新课表，有变化才弹窗询问
         if (store.hasData()) {
             int tw = store.todayWeek();
             Log.d(TAG, "startApp: local data ok, rendering week " + tw);
             renderWeekSchedule(tw > 0 ? tw : 1);
             ReminderService.start(this);
+            startBackgroundRefresh();
             return;
         }
 
@@ -850,7 +859,16 @@ public class MainActivity extends AppCompatActivity {
      * 该页URL仍在authserver域名下，不能靠URL区分，必须检测页面DOM。
      */
     private void detectCasPageType() {
-        String js = "(function(){"
+        webView.evaluateJavascript(buildCasTypeJs(), value -> {
+            String type = value == null ? "unknown" : value.replace("\"", "").trim();
+            Log.d(TAG, "CAS page type: " + type);
+            handleCasPageType(type);
+        });
+    }
+
+    /** CAS 页面类型探测脚本（主流程与后台静默刷新共用） */
+    private String buildCasTypeJs() {
+        return "(function(){"
             + "var pwd=document.getElementById('password');"
             + "if(pwd){"
             + "  var cap=document.getElementById('captchaDiv');"
@@ -863,11 +881,6 @@ public class MainActivity extends AppCompatActivity {
             + "||t.indexOf('sms')>=0||t.indexOf('verification')>=0){return 'mfa';}"
             + "return 'unknown';"
             + "})()";
-        webView.evaluateJavascript(js, value -> {
-            String type = value == null ? "unknown" : value.replace("\"", "").trim();
-            Log.d(TAG, "CAS page type: " + type);
-            handleCasPageType(type);
-        });
     }
 
     private void handleCasPageType(String type) {
@@ -918,22 +931,7 @@ public class MainActivity extends AppCompatActivity {
     // ====== 自动登录 ======
 
     private void doAutoLogin() {
-        String js = "javascript:(function(){"
-            + "var d=document.getElementById('pwdLoginDiv');"
-            + "if(d)d.style.display='block';"
-            + "if(typeof showTabHeadAndDiv==='function')showTabHeadAndDiv('userNameLogin',1);"
-            + "setTimeout(function(){"
-            + "var u=document.getElementById('username');"
-            + "if(u)u.value=" + org.json.JSONObject.quote(savedUser) + ";"
-            + "var p=document.getElementById('password');"
-            + "if(p){p.removeAttribute('readonly');p.value=" + org.json.JSONObject.quote(savedPass) + ";}"
-            + "var r=document.getElementById('rememberMe');"
-            + "if(r)r.checked=true;"
-            + "var b=document.getElementById('login_submit');"
-            + "if(b)b.click();"
-            + "},800);"
-            + "})()";
-        webView.evaluateJavascript(js, null);
+        webView.evaluateJavascript(buildAutoLoginJs(savedUser, savedPass), null);
 
         // 超时仅做UI提示；不重置isAutoLogin，防止在短信MFA验证页重复自动提交密码
         handler.postDelayed(() -> {
@@ -943,6 +941,25 @@ public class MainActivity extends AppCompatActivity {
                 hideLoading();
             }
         }, 10000);
+    }
+
+    /** CAS 自动填表登录脚本（主流程与后台静默刷新共用，凭据按 JSON 转义后拼入） */
+    private String buildAutoLoginJs(String user, String pass) {
+        return "javascript:(function(){"
+            + "var d=document.getElementById('pwdLoginDiv');"
+            + "if(d)d.style.display='block';"
+            + "if(typeof showTabHeadAndDiv==='function')showTabHeadAndDiv('userNameLogin',1);"
+            + "setTimeout(function(){"
+            + "var u=document.getElementById('username');"
+            + "if(u)u.value=" + org.json.JSONObject.quote(user) + ";"
+            + "var p=document.getElementById('password');"
+            + "if(p){p.removeAttribute('readonly');p.value=" + org.json.JSONObject.quote(pass) + ";}"
+            + "var r=document.getElementById('rememberMe');"
+            + "if(r)r.checked=true;"
+            + "var b=document.getElementById('login_submit');"
+            + "if(b)b.click();"
+            + "},800);"
+            + "})()";
     }
 
     // ====== 凭据捕获（首次登录） ======
@@ -969,7 +986,13 @@ public class MainActivity extends AppCompatActivity {
      * 在教务首页扫描课表链接。
      * 空结果(非过渡页)时1.6秒后复扫一次，两次都空 → 转入URL猜测。
      */
+    /** 主流程：在教务首页扫描课表链接 */
     private void findScheduleLink() {
+        webView.evaluateJavascript(buildFindLinkJs("Android"), null);
+    }
+
+    /** 课表入口探测脚本；bridge=回调用的 JS 接口名（主流程 Android / 静默刷新 AndroidSilent） */
+    private String buildFindLinkJs(String bridge) {
         String js = "javascript:(function(){"
             + "try{"
             + "var found='';var linkCount=0;"
@@ -1020,19 +1043,26 @@ public class MainActivity extends AppCompatActivity {
             + "  var bodyText=(document.body.innerText||'').trim();"
             + "  if(bodyText.length<50&&linkCount<3){"
             + "    console.log('SCHED_SCAN: transition page, links='+linkCount);"
-            + "    Android.onScheduleLinkFound('TRANSITION');return;"
+            + "    " + bridge + ".onScheduleLinkFound('TRANSITION');return;"
             + "  }"
             + "}"
             + "console.log('SCHED_SCAN: links='+linkCount+' found='+(found||'none')+' body='+(document.body.innerText||'').trim().length);"
-            + "Android.onScheduleLinkFound(found);"
-            + "}catch(e){console.log('SCHED_SCAN error: '+(e&&e.message?e.message:String(e)));Android.onScheduleLinkFound('');}"
+            + bridge + ".onScheduleLinkFound(found);"
+            + "}catch(e){console.log('SCHED_SCAN error: '+(e&&e.message?e.message:String(e)));" + bridge + ".onScheduleLinkFound('');}"
             + "})()";
-        webView.evaluateJavascript(js, null);
+        return js;
     }
 
     // ====== 课表解析 ======
 
+    /** 主流程：解析当前教务页面课表 */
     private void parseSchedule() {
+        webView.evaluateJavascript(buildParseJs("Android"), null);
+        captureScheduleHtml();
+    }
+
+    /** 课表解析脚本；bridge=回调用的 JS 接口名（主流程 Android / 静默刷新 AndroidSilent） */
+    private String buildParseJs(String bridge) {
         String js = "javascript:(function(){"
              + "var result={courses:[],error:null,currentWeek:0,totalWeeks:0,week1Monday:0,periodTimes:null};"
              + "result.sourceUrl=location.href;"
@@ -1124,7 +1154,7 @@ public class MainActivity extends AppCompatActivity {
             + "}"
             + "if(!table||table.rows.length<2){"
             + "  result.error='no_table';"
-            + "  Android.onScheduleParsed(JSON.stringify(result));"
+            + "  " + bridge + ".onScheduleParsed(JSON.stringify(result));"
             + "  return;"
             + "}"
             + "var rows=table.querySelectorAll('tr');"
@@ -1213,15 +1243,18 @@ public class MainActivity extends AppCompatActivity {
             + "}"
             + "if(result.courses.length===0)result.error='empty';"
             + "console.log('SCHED_PARSE: courses='+result.courses.length+' currentWeek='+result.currentWeek+' totalWeeks='+result.totalWeeks+' week1Monday='+result.week1Monday);"
-            + "Android.onScheduleParsed(JSON.stringify(result));"
+            + bridge + ".onScheduleParsed(JSON.stringify(result));"
             + "}catch(e){"
             + "result.error='js_exception:'+(e&&e.message?e.message:String(e));"
             + "console.log('SCHED_PARSE exception: '+result.error);"
-            + "Android.onScheduleParsed(JSON.stringify(result));"
+            + bridge + ".onScheduleParsed(JSON.stringify(result));"
             + "}"
             + "})()";
-        webView.evaluateJavascript(js, null);
-        // 缓存当前教务页面 DOM 原文，用于排查页面结构变化导致的漏解析。
+        return js;
+    }
+
+    /** 缓存当前教务页面 DOM 原文，用于排查页面结构变化导致的漏解析 */
+    private void captureScheduleHtml() {
         webView.evaluateJavascript("(function(){try{return btoa(unescape(encodeURIComponent(document.documentElement.outerHTML||'')))}catch(e){return ''}})()", value -> {
             if (value == null || "null".equals(value) || "\"\"".equals(value)) return;
             try {
@@ -1234,6 +1267,298 @@ public class MainActivity extends AppCompatActivity {
                 try (java.io.FileOutputStream out = new java.io.FileOutputStream(f)) { out.write(bytes); }
             } catch (Exception e) { Log.w(TAG, "raw schedule capture failed", e); }
         });
+    }
+
+    // ====== 后台静默刷新 ======
+
+    /**
+     * 后台静默刷新。
+     *
+     * 启动时先渲染本地缓存（离线秒开），随后用一个不可见的 WebView 复用同一套
+     * 「CAS 自动登录 → 教务首页找入口 → DOM 解析」脚本，再去教务系统取一次最新课表。
+     * 取到后与本地数据比对，确有变化才弹窗询问是否更新 —— 全程不影响用户正在看的课表，
+     * 也不写任何数据（用户点「立即更新」才落盘）。
+     */
+    private WebView silentWebView;
+    private boolean silentRunning = false;
+    private boolean silentOnSchedulePage = false;   // 已进入课表页(含猜测URL)
+    private boolean silentAutoLogged = false;       // 本轮已自动提交过密码
+    private boolean silentParseSent = false;        // 已发出解析请求，等回调
+    private int silentGuessIdx = 0;
+    private int silentToken = 0;
+    private String pendingRefreshJson = null;       // 解析到的新课表，等用户确认
+    private static final long SILENT_TIMEOUT_MS = 45000L;
+
+    /** 启动后台刷新：仅在已有本地课表、且凭证齐全时进行 */
+    private void startBackgroundRefresh() {
+        if (silentRunning) return;
+        if (store == null || !store.hasData()) return;
+        if (savedUser.isEmpty() || savedPass.isEmpty()) return;
+        silentRunning = true;
+        silentOnSchedulePage = false;
+        silentAutoLogged = false;
+        silentParseSent = false;
+        silentGuessIdx = 0;
+        final int token = ++silentToken;
+        Log.d(TAG, "silent refresh start");
+        ensureSilentWebView();
+        silentLoad(JWGL_BASE);
+        // 总超时：到点没拿到结果就安静收场，不在后台留任何东西
+        handler.postDelayed(() -> {
+            if (token == silentToken && silentRunning) silentAbort("timeout");
+        }, SILENT_TIMEOUT_MS);
+    }
+
+    private void ensureSilentWebView() {
+        if (silentWebView != null) return;
+        WebView wv = new WebView(this);
+        WebSettings s = wv.getSettings();
+        s.setJavaScriptEnabled(true);
+        s.setDomStorageEnabled(true);
+        s.setCacheMode(WebSettings.LOAD_DEFAULT);
+        s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        s.setAllowFileAccess(false);
+        s.setAllowContentAccess(false);
+        // 与主 WebView 保持同一 UA，避免教务/ CAS 按浏览器差异返回不同页面
+        s.setUserAgentString(webView.getSettings().getUserAgentString());
+        CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true);
+        wv.addJavascriptInterface(new SilentJsInterface(), "AndroidSilent");
+        wv.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                String u = request.getUrl() == null ? "" : request.getUrl().toString();
+                if (isTrustedUrl(u)) return false;
+                Log.w(TAG, "silent blocked external nav: " + maskUrl(u));
+                return true;
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                handler.post(() -> handleSilentPageFinished(url));
+            }
+
+            @Override
+            public void onReceivedError(WebView view, WebResourceRequest req, WebResourceError err) {
+                super.onReceivedError(view, req, err);
+                // 后台刷新失败就安静收场，绝不能弹错或影响主界面
+                if (req.isForMainFrame()) handler.post(() -> silentAbort("network error"));
+            }
+
+            @Override
+            public void onReceivedSslError(WebView view, SslErrorHandler h, SslError error) {
+                String u = error == null ? "" : error.getUrl();
+                if (isTrustedUrl(u)) h.proceed(); else h.cancel();
+            }
+        });
+        // 透明且不可见，但**必须参与布局**：解析脚本依赖 innerText/表格尺寸，
+        // 用 GONE 或 0dp 会让部分页面取不到文本。
+        ViewGroup root = (ViewGroup) findViewById(android.R.id.content);
+        wv.setAlpha(0f);
+        wv.setVisibility(View.INVISIBLE);
+        wv.setClickable(false);
+        wv.setFocusable(false);
+        root.addView(wv, new android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        silentWebView = wv;
+    }
+
+    private void silentLoad(String url) {
+        if (silentWebView == null) return;
+        Map<String, String> headers = new HashMap<>();
+        headers.put("Accept-Language", "zh-CN,zh;q=0.9");
+        Log.d(TAG, "silent load: " + url);
+        silentWebView.loadUrl(url, headers);
+    }
+
+    private void handleSilentPageFinished(String url) {
+        if (!silentRunning || silentWebView == null || url == null) return;
+        Log.d(TAG, "silent page: " + url);
+        if (url.contains("authserver.shzu.edu.cn")) {
+            silentWebView.evaluateJavascript(buildCasTypeJs(), value -> {
+                if (!silentRunning) return;
+                String type = value == null ? "unknown" : value.replace("\"", "").trim();
+                Log.d(TAG, "silent CAS page: " + type);
+                if ("login".equals(type)) {
+                    if (!silentAutoLogged) {
+                        silentAutoLogged = true;
+                        silentWebView.evaluateJavascript(buildAutoLoginJs(savedUser, savedPass), null);
+                    } else {
+                        silentAbort("login rejected");
+                    }
+                } else {
+                    // 短信/图形验证码等需要人工介入的页面：后台刷新直接放弃，交给用户手动刷新
+                    silentAbort("cas " + type);
+                }
+            });
+            return;
+        }
+        if (!url.contains("jwgl.shzu.edu.cn")) return;
+        if (silentOnSchedulePage) {
+            if (silentParseSent) return;
+            silentParseSent = true;
+            handler.postDelayed(() -> {
+                if (silentRunning && silentWebView != null) {
+                    silentWebView.evaluateJavascript(buildParseJs("AndroidSilent"), null);
+                }
+            }, 800);
+        } else {
+            handler.postDelayed(() -> {
+                if (silentRunning && silentWebView != null && !silentOnSchedulePage) {
+                    silentWebView.evaluateJavascript(buildFindLinkJs("AndroidSilent"), null);
+                }
+            }, 600);
+            // 首页扫描无结果时的兜底：转入预设 URL 猜测
+            handler.postDelayed(() -> {
+                if (silentRunning && !silentOnSchedulePage) {
+                    Log.d(TAG, "silent link-scan timeout, guessing");
+                    handleSilentLink("");
+                }
+            }, 8000);
+        }
+    }
+
+    /** 静默模式下探测到课表入口（found 为空=没找到，TRANSITION=跳板页） */
+    private void handleSilentLink(String found) {
+        if (!silentRunning || silentWebView == null) return;
+        if (found == null) found = "";
+        if ("TRANSITION".equals(found)) {
+            handler.postDelayed(() -> {
+                if (silentRunning && !silentOnSchedulePage) handleSilentLink("");
+            }, 1200);
+            return;
+        }
+        if (!found.isEmpty()) {
+            silentOnSchedulePage = true;
+            silentParseSent = false;
+            silentLoad(found);
+            return;
+        }
+        if (silentGuessIdx < SCHEDULE_URLS.length) {
+            silentOnSchedulePage = true;
+            silentParseSent = false;
+            silentLoad(JWGL_BASE + SCHEDULE_URLS[silentGuessIdx++]);
+        } else {
+            silentAbort("no schedule entry");
+        }
+    }
+
+    private void handleSilentParsed(String json) {
+        if (!silentRunning) return;
+        try {
+            JSONObject obj = new JSONObject(json);
+            JSONArray courses = sanitizeCourses(obj.optJSONArray("courses"));
+            Object errObj = obj.opt("error");
+            boolean hasError = errObj != null && errObj != JSONObject.NULL;
+            int n = courses == null ? 0 : courses.length();
+            Log.d(TAG, "silent parsed: courses=" + n + " error=" + errObj);
+            if (hasError || n == 0) {
+                // 这个页面没有课表 → 换下一个猜测 URL，仍然没有就收场
+                silentParseSent = false;
+                if (silentGuessIdx < SCHEDULE_URLS.length) {
+                    silentLoad(JWGL_BASE + SCHEDULE_URLS[silentGuessIdx++]);
+                } else {
+                    silentAbort("parse empty");
+                }
+                return;
+            }
+            boolean changed = !scheduleDigest(store.getAllCourses()).equals(scheduleDigest(courses));
+            silentAbort("done");
+            Log.d(TAG, "silent refresh: changed=" + changed + " new=" + n);
+            if (changed) {
+                pendingRefreshJson = json;
+                showScheduleUpdatedDialog(n);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "silent parsed exception", e);
+            silentAbort("parse exception");
+        }
+    }
+
+    /** 课表内容指纹：按「星期|节次|课名|教师|地点|周次」排序拼接，与顺序无关 */
+    private static String scheduleDigest(JSONArray list) {
+        if (list == null) return "";
+        java.util.List<String> rows = new java.util.ArrayList<>();
+        for (int i = 0; i < list.length(); i++) {
+            JSONObject c = list.optJSONObject(i);
+            if (c == null) continue;
+            rows.add(c.optInt("day", 0) + "|" + c.optInt("row", 0) + "|"
+                    + normText(c.optString("name", "")) + "|" + normText(c.optString("teacher", "")) + "|"
+                    + normText(c.optString("location", "")) + "|" + normText(c.optString("weeks", "")));
+        }
+        java.util.Collections.sort(rows);
+        return android.text.TextUtils.join("\n", rows);
+    }
+
+    private static String normText(String s) {
+        return s == null ? "" : s.replaceAll("\\s+", " ").trim();
+    }
+
+    private void showScheduleUpdatedDialog(int newCount) {
+        if (isFinishing()) return;
+        if (Build.VERSION.SDK_INT >= 17 && isDestroyed()) return;
+        final int oldCount = store.getAllCourses().length();
+        new AlertDialog.Builder(this)
+                .setTitle("课表有更新")
+                .setMessage("教务系统的课表与本地不一致（本地 " + oldCount + " 条，最新 " + newCount
+                        + " 条）。\n是否立即更新？更新后提醒与桌面小组件会一起刷新。")
+                .setPositiveButton("立即更新", (d, w) -> applyRefreshedSchedule())
+                .setNegativeButton("稍后", (d, w) -> pendingRefreshJson = null)
+                .setCancelable(true)
+                .show();
+    }
+
+    /** 用户确认后：把静默刷新拿到的课表落盘、重算提醒并重渲染 */
+    private void applyRefreshedSchedule() {
+        String json = pendingRefreshJson;
+        pendingRefreshJson = null;
+        if (json == null || json.isEmpty()) return;
+        try {
+            JSONObject obj = new JSONObject(json);
+            JSONArray courses = sanitizeCourses(obj.optJSONArray("courses"));
+            if (courses == null || courses.length() == 0) return;
+            String[] times = parsePeriodTimes(obj.optJSONArray("periodTimes"));
+            saveAndRenderParsed(obj, courses, times);
+            Toast.makeText(this, "课表已更新", Toast.LENGTH_SHORT).show();
+        } catch (Exception e) {
+            Log.e(TAG, "apply refreshed schedule failed", e);
+            Toast.makeText(this, "课表更新失败，请手动刷新", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    /** 收尾：停掉并彻底释放隐藏 WebView（失败路径也必须走到这里） */
+    private void silentAbort(String reason) {
+        if (!silentRunning && silentWebView == null) return;
+        Log.d(TAG, "silent refresh end: " + reason);
+        silentRunning = false;
+        silentToken++;
+        silentOnSchedulePage = false;
+        silentParseSent = false;
+        silentGuessIdx = 0;
+        final WebView wv = silentWebView;
+        silentWebView = null;
+        if (wv == null) return;
+        try {
+            wv.stopLoading();
+            ViewGroup parent = (ViewGroup) wv.getParent();
+            if (parent != null) parent.removeView(wv);
+            wv.destroy();
+        } catch (Exception e) {
+            Log.w(TAG, "silent webview release failed", e);
+        }
+    }
+
+    /** 隐藏 WebView 的桥：只接静默刷新用的两个回调，与主流程的 Android 完全隔离 */
+    private class SilentJsInterface {
+        @JavascriptInterface
+        public void onScheduleParsed(final String json) {
+            handler.post(() -> handleSilentParsed(json));
+        }
+
+        @JavascriptInterface
+        public void onScheduleLinkFound(final String url) {
+            handler.post(() -> handleSilentLink(url));
+        }
     }
 
     // ====== 课表展示 ======
@@ -1263,6 +1588,38 @@ public class MainActivity extends AppCompatActivity {
         return out;
     }
 
+    /**
+     * 校验并规整教务作息时间表：全部符合 HH:mm-HH:mm 才采用，单节课时自动合并为大节。
+     * 主流程与后台静默刷新共用。
+     */
+    private String[] parsePeriodTimes(JSONArray ptArr) {
+        if (ptArr == null || ptArr.length() < 3) return null;
+        String[] cand = new String[ptArr.length()];
+        for (int i = 0; i < ptArr.length(); i++) {
+            String t = ptArr.optString(i, "");
+            if (!t.matches("\\d{1,2}:\\d{2}\\s*[-–]\\s*\\d{1,2}:\\d{2}")) return null;
+            cand[i] = t.replaceAll("\\s+", "");
+        }
+        String[] merged = mergePeriodTimes(cand);
+        Log.d(TAG, "parsed periodTimes: " + merged.length + " slots: " + String.join(",", merged));
+        return merged;
+    }
+
+    /** 解析结果落盘 → 重算提醒 → 重渲染本周 → 刷新桌面小组件（主流程与静默刷新共用） */
+    private void saveAndRenderParsed(JSONObject obj, JSONArray courses, String[] parsedTimes) {
+        if (store == null) store = new ScheduleStore(this);
+        store.save(this, obj.optInt("currentWeek", 0), obj.optInt("totalWeeks", 0),
+                obj.optLong("week1Monday", 0), parsedTimes, courses);
+        Log.d(TAG, "saved window " + store.getWindowStart() + "-" + store.getWindowEnd()
+                + " week1Monday=" + store.getWeek1Monday() + " todayWeek=" + store.todayWeek());
+        // 课表数据更新 → 重算课程提醒时刻表
+        ReminderService.reload(this);
+        int tw = store.todayWeek();
+        renderWeekSchedule(tw > 0 ? tw : 1);
+        // 新数据落地后同步刷新桌面小组件
+        NextCourseWidgetProvider.refreshAll(this);
+    }
+
     private void displaySchedule(String json) {
         parseResultReceived = true;
         latestParsedScheduleJson = json == null ? "" : json;
@@ -1270,21 +1627,7 @@ public class MainActivity extends AppCompatActivity {
             JSONObject obj = new JSONObject(json);
             JSONArray courses = obj.optJSONArray("courses");
             // 节次时间表（从教务页面提取的作息时间，全部合法才存）
-            JSONArray ptArr = obj.optJSONArray("periodTimes");
-            String[] parsedTimes = null;
-            if (ptArr != null && ptArr.length() >= 3) {
-                String[] cand = new String[ptArr.length()];
-                boolean ok = true;
-                for (int i = 0; i < ptArr.length(); i++) {
-                    String t = ptArr.optString(i, "");
-                    if (!t.matches("\\d{1,2}:\\d{2}\\s*[-–]\\s*\\d{1,2}:\\d{2}")) { ok = false; break; }
-                    cand[i] = t.replaceAll("\\s+", "");
-                }
-                if (ok) {
-                    parsedTimes = mergePeriodTimes(cand);
-                    Log.d(TAG, "parsed periodTimes: " + parsedTimes.length + " slots: " + String.join(",", parsedTimes));
-                }
-            }
+            String[] parsedTimes = parsePeriodTimes(obj.optJSONArray("periodTimes"));
             // 注意：optString("error") 会把 JSON null 读成字符串 "null"，必须用 opt + NULL 判断
             Object errObj = obj.opt("error");
             boolean hasError = errObj != null && errObj != JSONObject.NULL;
@@ -1302,15 +1645,7 @@ public class MainActivity extends AppCompatActivity {
             if (!hasError && n > 0) {
                 // 解析成功 → 保存整学期课表（覆盖旧数据）→ 设提醒 → 渲染今天所在周
                 if (store == null) store = new ScheduleStore(this);
-                store.save(this, parsedWeek, parsedTotal, parsedWeek1Monday, parsedTimes, courses);
-                Log.d(TAG, "saved window " + store.getWindowStart() + "-" + store.getWindowEnd()
-                    + " week1Monday=" + store.getWeek1Monday() + " todayWeek=" + store.todayWeek());
-                // 课表数据更新 → 重算课程提醒时刻表
-                ReminderService.reload(this);
-                int tw = store.todayWeek();
-                renderWeekSchedule(tw > 0 ? tw : 1);
-                // 新数据落地后同步刷新桌面小组件
-                NextCourseWidgetProvider.refreshAll(this);
+                saveAndRenderParsed(obj, courses, parsedTimes);
                 return;
             }
 

@@ -13,9 +13,16 @@
 
 > 两处源码与版本完全同步，功能一致。若 Gitee 打不开，请改用 GitHub，反之亦然。
 
-![Platform](https://img.shields.io/badge/Platform-Android-3DDC84) ![Language](https://img.shields.io/badge/Language-Java-orange) ![UI](https://img.shields.io/badge/UI-WebView%20HTML%2FCSS%2FJS-blue) ![Version](https://img.shields.io/badge/Version-1.2.1-667eea)
+![Platform](https://img.shields.io/badge/Platform-Android-3DDC84) ![Language](https://img.shields.io/badge/Language-Java-orange) ![UI](https://img.shields.io/badge/UI-WebView%20HTML%2FCSS%2FJS-blue) ![Version](https://img.shields.io/badge/Version-1.3.0-667eea)
 
-## ✨ v1.2.1 更新亮点
+## ✨ v1.3.0 更新亮点
+
+- 🔄 **自动检查课表更新**：每次打开先用本地缓存秒开，随后在后台静默登录教务系统比对一次课表；**只有真的变了**才弹窗询问是否更新，不会打断正在看的课表
+- 🔒 **后台刷新不影响前台**：静默刷新走独立的隐藏 WebView，页面、提醒、拖动布局都不会被改动；不确认就绝不落盘
+- 🤫 **安静降级**：需要短信验证码、网络异常、找不到课表入口等情况会直接放弃，不弹错、不打扰
+- ⚙️ 沿用 v1.2.1 的开屏动画开关与分周加载
+
+## v1.2.1 更新亮点
 
 - ⚙️ **开屏动画可关闭**：设置 → 通用设置新增开关，关闭后启动**直接进入课表**，不再播放 Logo 动画
 - ⚡ **课表分周加载**：启动只渲染「今天所在周」并立即出图，页面显示后再在后台逐周预生成相邻周次，切周几乎零等待
@@ -74,6 +81,7 @@
 - **拖动调位置**：长按 700ms（含震动反馈）进入拖动模式，松手后可撤销/应用，随时一键重置布局
 - **交互体验**：滑动切周、同课同色、今日高亮、空课周提示、开屏动画（可在设置中关闭）
 - **分周加载**：启动只渲染本周并立即显示，其余周次在页面出图后后台预生成，切周直接复用缓存
+- **自动检查更新**：启动后后台静默比对一次教务课表，有差异才弹窗询问，不打扰正常使用
 
 ### 课前提醒（v1.1.0 重做）
 
