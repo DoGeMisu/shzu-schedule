@@ -1,12 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <!-- 默认策略：禁止明文 HTTP，只信任系统 CA（防止外部站点被降级/中间人） -->
-    <base-config cleartextTrafficPermitted="false">
+    <!--
+      默认策略：允许明文 HTTP，只信任系统 CA。
+
+      为什么必须全局放开明文：更新服务本期是 IPv4 直连
+      http://120.26.246.218:8080（域名 misuhub.top 未完成备案，对接文档 §6 要求本期
+      请求与链接中不出现任何域名）。而 Android 的 <domain> 只匹配主机名、
+      **不支持 IP 字面量** —— 给 IP 单独写 domain-config 不会生效，
+      v1.4.1 就是这样踩的坑（现象是「打开软件不检查更新」）。
+      因此放行只能写在 base-config 上。
+
+      实际暴露面可控：原生 HTTP 请求只有版本接口与其签名下载链接（同一主机）；
+      WebView 导航被 shouldOverrideUrlLoading 限制在校内域名内，H5 页面不加载外部明文资源。
+
+      收紧时机：备案完成、更新服务切到 https://misuhub.top 后，把这里改回
+      cleartextTrafficPermitted="false"，只保留下方校内域名的例外。
+    -->
+    <base-config cleartextTrafficPermitted="true">
         <trust-anchors>
             <certificates src="system" />
         </trust-anchors>
     </base-config>
-    <!-- 仅校内域名放宽：教务系统可能用自签名证书或内网明文 -->
+    <!-- 校内域名：教务系统可能用自签名证书或内网明文 -->
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="true">shzu.edu.cn</domain>
         <trust-anchors>

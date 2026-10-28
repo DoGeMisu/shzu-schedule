@@ -59,12 +59,44 @@ public class MainActivity extends AppCompatActivity {
     };
     private static final int MAX_PARSE_RETRIES = 2;
 
+    // ====== 开屏 ======
+    /** 完整展示时长（logo 推近在同一段时间里完成） */
+    private static final long SPLASH_HOLD_MS = 1800;
+    /** 淡出时长 */
+    private static final long SPLASH_FADE_MS = 500;
+    /** 动画兜底收尾：比 停留+淡出 略晚一点，正常路径由 withEndAction 先收 */
+    private static final long SPLASH_BACKSTOP_MS = SPLASH_HOLD_MS + SPLASH_FADE_MS + 300;
+    /** 系统关闭动画时的静态停留时长 */
+    private static final long SPLASH_NO_ANIM_MS = 700;
+    /** 硬上限：即使首帧始终没来、动画也没跑，也必须在此时收起开屏层 */
+    private static final long SPLASH_HARD_LIMIT_MS = 6000;
+
+    /**
+     * 设置图标：Material Design 官方 settings（filled）路径，24dp 网格。
+     * 不用「⚙」字符（部分 ROM 字体缺字形），也不用线条版齿轮（22px 下齿太多显脏）。
+     */
+    private static final String GEAR_SVG =
+        "<svg width='24' height='24' viewBox='0 0 24 24' fill='currentColor'>"
+        + "<path d='M19.14 12.94c.04-.31.06-.62.06-.94s-.02-.63-.07-.94l2.03-1.58a.5.5 0 0 0"
+        + " .12-.61l-1.92-3.32a.5.5 0 0 0-.59-.22l-2.39.96a7.1 7.1 0 0 0-1.62-.94l-.36-2.54"
+        + "a.48.48 0 0 0-.48-.41h-3.84a.48.48 0 0 0-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94"
+        + "l-2.39-.96a.5.5 0 0 0-.59.22L2.74 8.87a.5.5 0 0 0 .12.61l2.03 1.58c-.05.31-.09.63"
+        + "-.09.94s.02.63.07.94l-2.03 1.58a.5.5 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39"
+        + "-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36"
+        + "-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.5.5 0 0 0"
+        + "-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2z'/></svg>";
+
     // ====== UI ======
     private WebView webView;
     private android.widget.ImageView bgImageView;
     private View loadingOverlay;
     private View errorOverlay;
     private View splashOverlay;
+    /** 开屏是否已起跑 / 是否已收起：两者都用于幂等，防止重复调度或重复收尾 */
+    private boolean splashStarted = false;
+    private boolean splashHidden = false;
+    /** 构造时间戳，仅用于日志里衡量「首帧延迟」与「开屏停留时长」 */
+    private long onCreateAt = System.currentTimeMillis();
     private TextView loadingText;
     private Button btnRetry;
 
@@ -119,6 +151,17 @@ public class MainActivity extends AppCompatActivity {
     /** 标记「本次安装已做过旧数据扫描」，避免每次启动重复提示 */
     private static final String KEY_INSTALL_SCANNED = "install_legacy_scan_done";
 
+    // ====== 自动更新 ======
+    private UpdateManager updateManager;
+    /** 最近一次从服务端拿到的更新信息（含公共内容），供下载与页面渲染复用 */
+    private UpdateManager.Info lastUpdateInfo;
+    private boolean updateChecking = false;
+    private boolean updateDownloading = false;
+    /** 页面点了「立即更新」但还没检查过：检查出结果后自动续上下载 */
+    private boolean pendingAutoDownload = false;
+    /** 保证本次进程只调度一次启动更新流程（startApp 会被重试按钮反复调用） */
+    private boolean updateFlowStarted = false;
+
     private final Handler handler = new Handler(Looper.getMainLooper());
 
     // ====== 生命周期 ======
@@ -159,54 +202,156 @@ public class MainActivity extends AppCompatActivity {
         btnRetry.setOnClickListener(v -> startApp());
 
         setupWebView();
-        // 开屏动画可关闭（设置→通用设置）：关闭后启动不再播 Logo 动画，直接进入课表
+        updateManager = new UpdateManager(this);
+        // 开屏动画可关闭（设置→通用设置）：关闭后启动不再播动画，直接进入课表。
+        //
+        // 注意：**不能在这里直接起跑动画**。onCreate 之后同一根线程上还有
+        // ScheduleStore 解析、generateWeekHTML 拼整页、创建隐藏 WebView 等重活，
+        // 首帧可能被推迟 1~2 秒；若动画此刻已经在计时，第一帧画出来时动画早就
+        // 播完、开屏层也已被移除 —— 用户看到的全程只有白屏，没有 logo。
+        // 因此只登记「首帧之后再起跑」，见 armSplashAfterFirstFrame()。
         if (new ScheduleStore(this).isSplashAnimEnabled()) {
-            playSplashAnimation();
+            armSplashAfterFirstFrame();
         } else {
+            splashHidden = true;
             splashOverlay.setVisibility(View.GONE);
         }
         // 全新安装首次启动：先扫描旧版本残留数据，由用户决定是否清理，再进入启动流程
         if (!checkLegacyDataOnFirstRun()) startApp();
     }
 
-    /** 开屏动画：logo淡入放大 → 书法字展开 → 整体淡出 */
+    /**
+     * 等窗口画出第一帧之后才开始开屏动画。
+     *
+     * 用一次性 OnPreDrawListener 拿「首帧即将提交」的时机，再 post 一次，
+     * 让这一帧真正上屏；从那一刻开始计时，动画才不会被启动期的重活吃掉。
+     *
+     * 另外挂一个 6 秒硬兜底：万一某些 ROM 根本不触发 preDraw（比如窗口一直不可见），
+     * 也必须保证开屏层最终会被收起，不能把用户挡在门外。
+     */
+    private void armSplashAfterFirstFrame() {
+        handler.postDelayed(this::hideSplash, SPLASH_HARD_LIMIT_MS);
+        try {
+            final View decor = getWindow() == null ? null : getWindow().getDecorView();
+            if (decor == null) {
+                playSplashAnimation();
+                return;
+            }
+            decor.getViewTreeObserver().addOnPreDrawListener(
+                new android.view.ViewTreeObserver.OnPreDrawListener() {
+                    @Override
+                    public boolean onPreDraw() {
+                        // 一次性：摘掉监听，避免每帧回调
+                        android.view.ViewTreeObserver vto = decor.getViewTreeObserver();
+                        if (vto.isAlive()) vto.removeOnPreDrawListener(this);
+                        Log.d(TAG, "splash: first frame ready after "
+                                + (System.currentTimeMillis() - onCreateAt) + "ms");
+                        // post 到这一帧提交之后，保证「首帧 = 完整开屏」先被画出来
+                        decor.post(MainActivity.this::playSplashAnimation);
+                        return true;
+                    }
+                });
+        } catch (Exception e) {
+            Log.w(TAG, "arm splash failed, fallback to direct play", e);
+            playSplashAnimation();
+        }
+    }
+
+    /**
+     * 开屏动画：整幅定帧 → logo 轻微推近 → 整体淡出。
+     *
+     * 为什么不再是原来的「logo 从 0 放大淡入 + 标题滑入」：
+     * 那种做法要求动画在首帧之前就开始计时，元素必须先被置成透明；一旦首帧被
+     * 启动期的重活（解析存储、拼整页 HTML、创建隐藏 WebView）推迟，第一帧就是
+     * 一块白板 —— 这正是「不管开关都只有白屏、没有 logo」的成因。
+     * 现在首帧就是完整画面（XML 里 alpha 均为 1），动画只做不会产生空帧的变化。
+     *
+     * 三处稳健化：
+     * 1. 由 armSplashAfterFirstFrame() 在首帧之后触发，计时不含启动耗时；
+     * 2. 系统关掉动画（animator duration scale = 0）时改成「静态停留 + 直接收」，
+     *    不依赖 animator 是否真的会跑；
+     * 3. 收尾统一走幂等的 hideSplash()，并额外挂 Handler 兜底，动画被取消也不会卡住。
+     */
     private void playSplashAnimation() {
+        if (splashStarted || splashHidden) return;
+        splashStarted = true;
+        Log.d(TAG, "splash: start at " + (System.currentTimeMillis() - onCreateAt)
+                + "ms, animatorsEnabled=" + animatorsEnabled()
+                + ", durationScale=" + animatorScale());
         try {
             android.widget.ImageView logo = findViewById(R.id.splashLogo);
-            android.widget.ImageView title = findViewById(R.id.splashTitle);
-            android.widget.TextView subtitle = findViewById(R.id.splashSubtitle);
+            if (logo == null || splashOverlay == null) {
+                hideSplash();
+                return;
+            }
 
-            // Logo: 从小到大 + 淡入
-            logo.setAlpha(0f);
-            logo.setScaleX(0.6f);
-            logo.setScaleY(0.6f);
-            logo.animate().alpha(1f).scaleX(1f).scaleY(1f)
-                .setDuration(700).setStartDelay(100)
-                .setInterpolator(new android.view.animation.OvershootInterpolator(1.2f))
-                .start();
+            // 系统关闭动画：不赌 animator，静态展示一小段再收起
+            //（否则会「一闪而过」，看起来跟没开一样）
+            if (!animatorsEnabled()) {
+                Log.d(TAG, "splash: animators disabled, static hold");
+                handler.postDelayed(this::hideSplash, SPLASH_NO_ANIM_MS);
+                return;
+            }
 
-            // 书法字：延迟入场 + 淡入右移
-            title.setAlpha(0f);
-            title.setTranslationY(30f);
-            title.animate().alpha(1f).translationY(0f)
-                .setDuration(600).setStartDelay(500)
+            // 兜底：无论动画是否被系统取消，到点一定收尾（hideSplash 幂等）
+            handler.postDelayed(this::hideSplash, SPLASH_BACKSTOP_MS);
+
+            float px = (logo.getWidth() > 0 ? logo.getWidth() : logo.getMeasuredWidth()) / 2f;
+            float py = (logo.getHeight() > 0 ? logo.getHeight() : logo.getMeasuredHeight()) / 2f;
+            if (px > 0 && py > 0) {
+                logo.setPivotX(px);
+                logo.setPivotY(py);
+            }
+            logo.animate().scaleX(1.06f).scaleY(1.06f)
+                .setDuration(SPLASH_HOLD_MS)
                 .setInterpolator(new android.view.animation.DecelerateInterpolator())
                 .start();
 
-            // 副标题淡入
-            subtitle.setAlpha(0f);
-            subtitle.animate().alpha(1f)
-                .setDuration(500).setStartDelay(800)
-                .start();
-
-            // 整体开屏 1.8s 后淡出
             splashOverlay.animate().alpha(0f)
-                .setDuration(500).setStartDelay(1800)
-                .withEndAction(() -> splashOverlay.setVisibility(View.GONE))
+                .setDuration(SPLASH_FADE_MS)
+                .setStartDelay(SPLASH_HOLD_MS)
+                .withEndAction(this::hideSplash)
                 .start();
         } catch (Exception e) {
             Log.e(TAG, "splash animation error", e);
-            splashOverlay.setVisibility(View.GONE);
+            hideSplash();
+        }
+    }
+
+    /** 收起开屏层（幂等）：动画结束、Handler 兜底、硬超时都汇总到这里 */
+    private void hideSplash() {
+        if (splashHidden) return;
+        splashHidden = true;
+        try {
+            if (splashOverlay != null) {
+                splashOverlay.animate().cancel();
+                splashOverlay.setVisibility(View.GONE);
+            }
+            Log.d(TAG, "splash: hidden at " + (System.currentTimeMillis() - onCreateAt) + "ms");
+        } catch (Exception e) {
+            Log.w(TAG, "hideSplash failed", e);
+        }
+    }
+
+    /** 系统是否允许播放动画（开发者选项「动画时长缩放」被关、省电模式都可能返回 false） */
+    private boolean animatorsEnabled() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                return android.animation.ValueAnimator.areAnimatorsEnabled();
+            } catch (Exception e) {
+                return true;
+            }
+        }
+        return true;
+    }
+
+    /** 动画时长缩放系数，仅用于日志诊断 */
+    private float animatorScale() {
+        try {
+            return android.provider.Settings.Global.getFloat(getContentResolver(),
+                    android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f);
+        } catch (Exception e) {
+            return -1f;
         }
     }
 
@@ -283,12 +428,15 @@ public class MainActivity extends AppCompatActivity {
             // 窗口背景这一帧；若它始终是主题里写死的白色，深色主题下切回来就会
             // 先闪一下白。in-app 主题切换不走系统 night mode，所以必须在这里
             // 手动同步（values-night 只覆盖跟随系统的情况）。
+            // 状态栏与窗口背景同步：in-app 主题切换不走系统 night mode，
+            // 主题 XML 里只能给静态默认值，深色主题下必须在这里手动改，否则顶部会留一条亮色带。
             if (!appliedOnce || dark != appliedDark) {
                 try {
                     getWindow().setBackgroundDrawable(
                         new android.graphics.drawable.ColorDrawable(bgColor));
                 } catch (Exception ignored) {
                 }
+                applyStatusBar(dark);
             }
 
             java.io.File f = bgName.isEmpty() ? null : new java.io.File(getFilesDir(), bgName);
@@ -327,6 +475,26 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ====== 自定义图片背景（相册选图） ======
+
+    /**
+     * 状态栏配色：跟随页面底色，不再用品牌紫（原本是一条与页面割裂的色带）。
+     * 浅色主题白底 + 深色图标，深色主题深底 + 浅色图标。
+     */
+    private void applyStatusBar(boolean dark) {
+        try {
+            android.view.Window w = getWindow();
+            w.setStatusBarColor(dark ? 0xFF0F1016 : 0xFFFFFFFF);
+            View dv = w.getDecorView();
+            int flags = dv.getSystemUiVisibility();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                if (dark) flags &= ~View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+                else flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            }
+            dv.setSystemUiVisibility(flags);
+        } catch (Exception e) {
+            Log.w(TAG, "applyStatusBar failed", e);
+        }
+    }
 
     private static final int REQ_PICK_BG = 2001;
 
@@ -480,6 +648,298 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    // ==================== 自动更新 ====================
+
+    /** 启动更新流程：只调度一次，两个动作都延迟到课表首屏之后执行 */
+    private void startUpdateFlowOnce() {
+        if (updateFlowStarted) return;
+        updateFlowStarted = true;
+        // 安装完成后的「更新内容」弹窗：等开屏/课表稳定后再弹
+        handler.postDelayed(this::maybeShowPostUpdateLog, 1600);
+        // 静默自动检查：24 小时节流，失败静默，不阻塞启动
+        handler.postDelayed(this::maybeAutoCheckUpdate, 3200);
+    }
+
+    /** 本地 versionName */
+    private String currentVersionName() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception e) {
+            return "0";
+        }
+    }
+
+    /** 往课表页注入 JS（WebView 未就绪时静默忽略） */
+    private void evalJs(final String js) {
+        if (webView == null || js == null) return;
+        handler.post(() -> {
+            try {
+                if (webView != null) webView.evaluateJavascript(js, null);
+            } catch (Exception ignored) {
+            }
+        });
+    }
+
+    /** 生成 JS 字符串字面量（含 </script> 防护） */
+    private static String jsString(String s) {
+        if (s == null) s = "";
+        return JSONObject.quote(s
+                .replace("<", "\\u003c")
+                .replace(">", "\\u003e")
+                .replace("&", "\\u0026"));
+    }
+
+    /**
+     * 安装完成后的「更新内容」弹窗。
+     *
+     * 判定：检测到新版本时先把 changelog 暂存进 prefs；用户装完重启后，
+     * 当前版本号与暂存的版本号一致 → 弹出该版本更新内容，然后清掉暂存，
+     * 保证只弹一次。装到一半退出、或装了别的渠道包都不弹。
+     */
+    private void maybeShowPostUpdateLog() {
+        if (store == null) return;
+        final String cur = currentVersionName();
+        if (cur.equals(store.getLogShownVersion())) return;
+
+        final String pendingVer = store.getPendingUpdateVersion();
+        final String log = store.getPendingUpdateLog();
+        if (log.isEmpty()) {
+            // 没有走本渠道更新（首次安装/其他来源）：只记录已见版本，不弹
+            store.setLogShownVersion(cur);
+            return;
+        }
+        if (!pendingVer.isEmpty() && !pendingVer.equals(cur)) {
+            // 下载了但没安装，或装了别的版本：先不弹，等真正装上
+            return;
+        }
+        store.setLogShownVersion(cur);
+        store.clearPendingUpdateLog();
+        // 新版本已经跑起来，临时安装包没有保留价值
+        if (updateManager != null) updateManager.clearDownloadedApk();
+        showPostUpdateLogDialog(cur, log);
+    }
+
+    /** 更新内容弹窗（安装完成后弹出） */
+    private void showPostUpdateLogDialog(final String version, final String log) {
+        try {
+            new AlertDialog.Builder(this)
+                    .setTitle("已更新到 v" + version)
+                    .setMessage(log)
+                    .setPositiveButton("知道了", null)
+                    .setCancelable(true)
+                    .show();
+        } catch (Exception e) {
+            Log.w(TAG, "show post update log failed", e);
+        }
+    }
+
+    /** 检查更新的三种场景 */
+    private static final int UPD_AUTO = 0;    // 每次进入软件：静默检查，有更新才弹窗
+    private static final int UPD_PAGE = 1;    // 每次进入「检查更新」页：静默刷新页面
+    private static final int UPD_MANUAL = 2;  // 用户点「检查更新」：有提示
+
+    /** 每次进入软件都检查一次更新（不再做 24 小时节流） */
+    private void maybeAutoCheckUpdate() {
+        checkUpdate(UPD_AUTO);
+    }
+
+    /**
+     * 统一的更新检查。
+     *
+     * 触发时机有三个：每次启动（UPD_AUTO）、每次进入「检查更新」页（UPD_PAGE）、
+     * 用户手动点检查（UPD_MANUAL）。三者只有「要不要打扰用户」不同，
+     * 请求与结果处理完全一致，避免三份逻辑各写一遍而行为漂移。
+     */
+    private void checkUpdate(final int mode) {
+        if (updateManager == null) return;
+        if (updateChecking) {
+            // 已经有一次检查在进行：进行中的那次会把结果推回页面，不必再发一次
+            if (mode == UPD_MANUAL) {
+                Toast.makeText(this, "正在检查，请稍候", Toast.LENGTH_SHORT).show();
+            }
+            return;
+        }
+        updateChecking = true;
+        if (mode != UPD_AUTO) evalJs("setUpdateLoading(true)");
+        final String cur = currentVersionName();
+        new Thread(() -> {
+            final UpdateManager.Info info = updateManager.checkForUpdate(cur);
+            handler.post(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                updateChecking = false;
+                if (mode != UPD_AUTO) evalJs("setUpdateLoading(false)");
+                if (info == null || info.httpCode == UpdateManager.ERR_NETWORK) {
+                    // 断网/超时：不写时间戳，下次进入还会再试
+                    Log.d(TAG, "update check failed: network unavailable");
+                    if (mode == UPD_MANUAL) {
+                        Toast.makeText(this, "检查失败：" + UpdateManager.httpErrorMessage(
+                                info == null ? UpdateManager.ERR_NETWORK : info.httpCode),
+                                Toast.LENGTH_SHORT).show();
+                    }
+                    return;
+                }
+                store.setUpdateLastCheck(System.currentTimeMillis());
+                if (!info.ok()) {
+                    // 401 属于配置问题（密钥失效），只记日志不打扰用户
+                    Log.w(TAG, "update check: HTTP " + info.httpCode + " " + info.error);
+                    if (mode == UPD_MANUAL) {
+                        String tip = info.isConfigError()
+                                ? "更新服务密钥失效，请安装最新版本"
+                                : "检查失败：" + UpdateManager.httpErrorMessage(info.httpCode);
+                        Toast.makeText(this, tip, Toast.LENGTH_SHORT).show();
+                    }
+                    return;
+                }
+                // 公共内容（公告）随版本接口一起回来，有变化才落盘
+                if (info.content != null && !info.content.equals(store.getUpdateLastContent())) {
+                    store.setUpdateLastContent(info.content);
+                }
+                lastUpdateInfo = info;
+                Log.d(TAG, "update check done: mode=" + mode + " latest=" + info.latestVersion
+                        + " available=" + info.updateAvailable);
+                // 页面正好开着就把最新数据推上去
+                evalJs("renderUpdateInfo(" + updateInfoJson(info) + ")");
+                if (mode == UPD_PAGE) {
+                    // 就在「检查更新」页上，页面自己会显示状态，不必再弹窗或提示
+                    return;
+                }
+                if (!info.updateAvailable) {
+                    if (mode == UPD_MANUAL) {
+                        Toast.makeText(this, "当前已是最新版本 v" + cur, Toast.LENGTH_SHORT).show();
+                    }
+                    return;
+                }
+                showUpdateDialog(info, info.forceUpdate);
+                // 用户先点了「立即更新」才发起检查：拿到结果直接续上下载
+                if (mode == UPD_MANUAL && pendingAutoDownload) {
+                    pendingAutoDownload = false;
+                    startDownloadUpdate(info);
+                }
+            });
+        }, "update-check-" + mode).start();
+    }
+    /**
+     * 把 Info 序列化成**JS 对象字面量**（页面里直接当对象用：o.latest_version）。
+     * 只需转义 &lt; &gt; &amp;，防止 changelog 里的标记提前闭合 &lt;script&gt;；
+     * 不要再用 JSONObject.quote 包一层字符串 —— 那样注入的是字符串，
+     * 页面取 o.xxx 全是 undefined，会渲染成空态。
+     */
+    private String updateInfoJson(UpdateManager.Info info) {
+        if (info == null) return "null";
+        try {
+            JSONObject o = new JSONObject();
+            o.put("update_available", info.updateAvailable);
+            o.put("latest_version", info.latestVersion == null ? "" : info.latestVersion);
+            o.put("changelog", info.changelog == null ? "" : info.changelog);
+            o.put("content", info.content == null ? "" : info.content);
+            o.put("force_update", info.forceUpdate);
+            o.put("released_at", info.releasedAt == null ? "" : info.releasedAt);
+            o.put("size", info.size);
+            return o.toString()
+                    .replace("<", "\\u003c")
+                    .replace(">", "\\u003e")
+                    .replace("&", "\\u0026");
+        } catch (Exception e) {
+            return "null";
+        }
+    }
+
+    /**
+     * 更新提示弹窗（旧版本收到更新信息时）。
+     * 同时展示最新版更新内容与服务端公共内容；force_update 时不可取消、只能更新。
+     */
+    private void showUpdateDialog(final UpdateManager.Info info, final boolean force) {
+        try {
+            StringBuilder msg = new StringBuilder();
+            if (info.changelog != null && !info.changelog.trim().isEmpty()) {
+                msg.append("【更新内容】\n").append(info.changelog.trim()).append("\n");
+            }
+            if (info.content != null && !info.content.trim().isEmpty()) {
+                if (msg.length() > 0) msg.append("\n");
+                msg.append("【公告】\n").append(info.content.trim());
+            }
+            if (msg.length() == 0) {
+                msg.append("暂无更新说明");
+            }
+            AlertDialog.Builder b = new AlertDialog.Builder(this)
+                    .setTitle("发现新版本 v" + info.latestVersion)
+                    .setMessage(msg.toString())
+                    .setPositiveButton("立即更新", (d, w) -> startDownloadUpdate(info))
+                    .setNegativeButton(force ? null : "稍后", null);
+            if (force) b.setCancelable(false);
+            b.show();
+            // 暂存更新内容：安装完成、下次启动时弹「更新内容」
+            store.setPendingUpdateLog(info.latestVersion, info.changelog == null ? "" : info.changelog);
+        } catch (Exception e) {
+            Log.w(TAG, "show update dialog failed", e);
+        }
+    }
+
+    /** 下载并安装更新包 */
+    private void startDownloadUpdate(final UpdateManager.Info info) {
+        if (updateManager == null || info == null) return;
+        if (!info.ok()) {
+            Toast.makeText(this, "更新信息无效，请重新检查更新", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (updateDownloading) {
+            Toast.makeText(this, "正在下载，请稍候", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (!updateManager.canInstall()) {
+            new AlertDialog.Builder(this)
+                    .setTitle("需要安装权限")
+                    .setMessage("安装新版本需要允许本应用「安装未知应用」。点击去设置，打开后返回再点一次「立即更新」。")
+                    .setPositiveButton("去设置", (d, w) -> updateManager.openInstallPermissionPage())
+                    .setNegativeButton("取消", null)
+                    .show();
+            return;
+        }
+        updateDownloading = true;
+        evalJs("setUpdateDownloading(true)");
+        updateManager.downloadAndVerify(info, new UpdateManager.ProgressListener() {
+            @Override
+            public void onProgress(long done, long total) {
+                int pct = total > 0 ? (int) (done * 100 / total) : 0;
+                evalJs("setUpdateProgress(" + pct + ")");
+            }
+
+            @Override
+            public void onFinished(java.io.File apk) {
+                updateDownloading = false;
+                evalJs("setUpdateDownloading(false)");
+                Log.d(TAG, "update downloaded: " + apk.getAbsolutePath()
+                        + " (" + apk.length() + " bytes)");
+                boolean ok = updateManager.installApk(apk);
+                if (!ok) {
+                    Toast.makeText(MainActivity.this,
+                            "已下载完成，但无法调起安装器", Toast.LENGTH_LONG).show();
+                }
+            }
+
+            @Override
+            public void onFailed(String reason) {
+                updateDownloading = false;
+                evalJs("setUpdateDownloading(false)");
+                Toast.makeText(MainActivity.this, reason, Toast.LENGTH_LONG).show();
+            }
+
+            @Override
+            public void onCancelled() {
+                updateDownloading = false;
+                evalJs("setUpdateDownloading(false)");
+                Toast.makeText(MainActivity.this, "已取消下载", Toast.LENGTH_SHORT).show();
+            }
+        });
+    }
+
+    /** 取消下载（进度条上的「取消下载」按钮） */
+    private void cancelDownloadUpdate() {
+        if (updateManager != null) updateManager.cancelDownload();
+        updateDownloading = false;
+        evalJs("setUpdateDownloading(false)");
+    }
+
     /** 读取相册选中的图片，压缩后存到应用私有目录，并应用到课表背景 */
     private void saveBackgroundImage(final android.net.Uri uri) {
         new Thread(new Runnable() {
@@ -552,6 +1012,17 @@ public class MainActivity extends AppCompatActivity {
     protected void onDestroy() {
         // 后台静默刷新用的隐藏 WebView 必须显式释放，否则会泄漏 Activity
         silentAbort("activity destroy");
+        releaseStudentWv();
+        // 教室查询用的隐藏 WebView 同理
+        try {
+            if (classroomWv != null) {
+                ViewGroup p = (ViewGroup) classroomWv.getParent();
+                if (p != null) p.removeView(classroomWv);
+                classroomWv.destroy();
+                classroomWv = null;
+            }
+        } catch (Exception ignored) {
+        }
         super.onDestroy();
     }
 
@@ -670,6 +1141,9 @@ public class MainActivity extends AppCompatActivity {
         navToken++;
 
         store = new ScheduleStore(this);
+        // 启动更新流程（只调度一次）：安装完成后的更新内容弹窗 + 每天一次的静默检查。
+        // 挂在这里而不是 onCreate，是为了让 legacy 数据清理弹窗先走完，避免两个弹窗叠在一起。
+        startUpdateFlowOnce();
 
         // 本地已存整学期课表 → 直接渲染今天所在周（离线秒开），
         // 随后在后台静默拉一次最新课表，有变化才弹窗询问
@@ -677,7 +1151,14 @@ public class MainActivity extends AppCompatActivity {
             int tw = store.todayWeek();
             Log.d(TAG, "startApp: local data ok, rendering week " + tw);
             renderWeekSchedule(tw > 0 ? tw : 1);
-            startBackgroundRefresh();
+            // 静默刷新要 new 一个隐藏 WebView（几百毫秒的主线程开销）：
+            // 开屏还在展示时做这件事会把推近动画卡住，所以等开屏收起后再开始；
+            // 开屏被关掉时（splashHidden 已为 true）只需要让开首帧，700ms 足够。
+            long bgDelay = splashHidden ? 700 : SPLASH_BACKSTOP_MS;
+            handler.postDelayed(this::startBackgroundRefresh, bgDelay);
+            // 姓名/学号在教务首页的「个人设置」iframe 里，课表页没有；
+            // 升级安装后旧会话仍有效、不会经过首页，所以这里主动去首页抓一次。
+            handler.postDelayed(() -> ensureStudentInfo(false), bgDelay + 600);
             return;
         }
 
@@ -762,6 +1243,12 @@ public class MainActivity extends AppCompatActivity {
                        .remove("password").apply();
                 pendingUser = null;
                 pendingPass = null;
+            }
+
+            // 顺手读一次学生资料（姓名/学号），只存本机；失败不影响下面任何流程
+            try {
+                webView.evaluateJavascript(buildStudentInfoJs(), null);
+            } catch (Exception ignored) {
             }
 
             final int token = ++navToken;
@@ -1013,6 +1500,120 @@ public class MainActivity extends AppCompatActivity {
 
     // ====== 课表解析 ======
 
+    /**
+     * 从教务页读取姓名与学号（只在本机保存，不上传）。
+     *
+     * 金智教务各校皮肤差异很大，这里按「常见 id/class → 正文正则」两级兜底：
+     * 先试已知容器，再退化到“学号：xxx / 姓名：xxx / 欢迎您，xxx”这类文本。
+     * 取不到就回调空串，不抛错、不影响课表解析。
+     */
+    /**
+     * 从教务页读取姓名与学号（只在本机保存，不上传）。
+     *
+     * 实测（石大 jsxsd）：直接打开课表页时，文档里**没有任何**姓名/学号 ——
+     * 学生信息在教务的框架（frameset/iframe）头部里，顶层 document 取不到。
+     * 因此这里会递归扫描同源子框架，并在每个文档里按「已知容器 → 标签取值 → 正文正则」三级尝试。
+     * 仍然取不到就回空串，不影响课表解析。
+     */
+    private String buildStudentInfoJs() {
+        return "javascript:(function(){try{" + studentScanJsBody()
+            + "scanDoc(document,0);"
+            + "Android.onStudentInfo(JSON.stringify({name:name,sid:sid}));"
+            + "}catch(e){try{Android.onStudentInfo('{}');}catch(e2){}}})()";
+    }
+
+    /**
+     * 带重试的版本：iframe 是异步加载的，扫一次常常还太早（个人设置那个 iframe 还没到）。
+     * 这里每隔 600ms 重扫一次，拿到姓名就停，最多试 maxTries 次。
+     */
+    private String buildStudentInfoRetryJs(int maxTries) {
+        return "javascript:(function(){try{" + studentScanJsBody()
+            + "var tries=0;"
+            + "function run(){"
+            + "  try{scanDoc(document,0);}catch(e){}"
+            + "  if(name||tries>=" + maxTries + "){"
+            + "    Android.onStudentInfo(JSON.stringify({name:name,sid:sid}));return;}"
+            + "  tries++;setTimeout(run,600);}"
+            + "run();"
+            + "}catch(e){try{Android.onStudentInfo('{}');}catch(e2){}}})()";
+    }
+
+    /** 姓名/学号的扫描逻辑（供上面两种驱动复用） */
+    private String studentScanJsBody() {
+        return ""
+            + "var name='',sid='';"
+            + "function txt(el){return el?(el.textContent||'').replace(/\\s+/g,' ').trim():'';}"
+            + "function pick(d,sel){try{return txt(d.querySelector(sel));}catch(e){return '';}}"
+            // 校园表单里「姓名」后面常跟的是另一个字段名（性别/电话…），这些词不能当姓名
+            + "var BAD=/^(性别|电话|手机|民族|政治|面貌|学院|专业|班级|年级|学号|姓名|出生|籍贯|地址|邮箱|"
+            + "身份证|学制|层次|入学|考生|培养|辅导员|校区|照片|保存|修改|返回|打印)$/;"
+            + "function cleanName(s){"
+            + "  if(!s)return '';"
+            + "  var r=(s||'').replace(/\\d{6,20}/g,' ')"
+            + "    .replace(/欢迎[您]?|同学|老师|上午好|下午好|晚上好|您好|退出|登录|姓\\s*名|学\\s*号/g,' ')"
+            + "    .replace(/[：:，,]/g,' ').trim();"
+            + "  var m=r.match(/([\\u4e00-\\u9fa5]{2,4})/);"
+            + "  if(!m)return '';"
+            + "  return BAD.test(m[1])?'':m[1];"
+            + "}"
+            + "function parseMix(s){"
+            + "  if(!s)return;"
+            + "  if(!sid){var m=s.match(/(\\d{6,20})/);if(m)sid=m[1];}"
+            + "  if(!name)name=cleanName(s);"
+            + "}"
+            // 个人信息表里姓名/学号通常在 <input value="...">，文本节点是空的
+            + "function byInput(d){"
+            + "  var ins=d.querySelectorAll('input');"
+            + "  for(var i=0;i<ins.length;i++){"
+            + "    var el=ins[i];var v=(el.value||'').trim();if(!v)continue;"
+            + "    var k=((el.name||'')+' '+(el.id||'')+' '+(el.getAttribute&&el.getAttribute('title')||'')).toLowerCase();"
+            + "    if(!name&&/(^|\\s)(xm|realname|username|xingming)(\\s|$)/.test(k)){"
+            + "      var n=cleanName(v);if(n)name=n;}"
+            + "    if(!sid&&/(^|\\s)(xh|sid|stuid|usercode|xuehao)(\\s|$)/.test(k)){"
+            + "      var m=v.match(/(\\d{6,20})/);if(m)sid=m[1];}"
+            + "  }"
+            + "}"
+            // 「姓名 | 张三」「学号 | 2026...」这种标签+取值的表格结构
+            + "function byLabel(d){"
+            + "  var els=d.querySelectorAll('td,th,span,div,label,b,strong,a,li');"
+            + "  for(var i=0;i<els.length;i++){"
+            + "    var raw=txt(els[i]);"
+            + "    if(!raw||raw.length>8)continue;"
+            + "    var t=raw.replace(/\\s/g,'');"
+            + "    var isName=t.indexOf('姓名')>=0;"
+            + "    var isId=t.indexOf('学号')>=0||t.indexOf('帐号')>=0||t.indexOf('账号')>=0;"
+            + "    if(!isName&&!isId)continue;"
+            + "    var v=txt(els[i].nextElementSibling);"
+            + "    if(!v&&els[i].parentElement)v=txt(els[i].parentElement.nextElementSibling);"
+            + "    if(isName){if(!name)name=cleanName(v);}"
+            + "    else if(!sid){var m=(v||'').match(/(\\d{6,20})/);if(m)sid=m[1];}"
+            + "  }"
+            + "}"
+            + "function scanDoc(d,depth){"
+            + "  if(!d||depth>2)return;"
+            + "  var sels=['#Top1_divLoginName','#session_user_name','#sessionUserKey','.userName',"
+            + "    '#userName','.user-name','#Top1_trLoginName','.top-user','.user-info','.header-user',"
+            + "    '.Nsb_top_menu_nc','#Top1_divTop'];"
+            + "  for(var i=0;i<sels.length&&!(name&&sid);i++)parseMix(pick(d,sels[i]));"
+            + "  byLabel(d);"
+            + "  byInput(d);"
+            + "  var body=txt(d.body);"
+            + "  if(body){"
+            + "    if(!sid){var m1=body.match(/(?:学号|帐号|账号)[:： ]?([0-9]{6,20})/);if(m1)sid=m1[1];}"
+            // 必须带冒号：校园表单里「姓名」后面常常紧跟另一个字段名（性别/电话），
+            // 少一个冒号就会把「电话」当成姓名。
+            + "    if(!name){var m2=body.match(/(?:学生姓名|姓名)[:：]\\s*([\\u4e00-\\u9fa5]{2,4})/);if(m2)name=m2[1];}"
+            + "    if(!name){var m3=body.match(/欢迎[您]?[，,:： ]*([\\u4e00-\\u9fa5]{2,4})/);if(m3)name=m3[1];}"
+            + "  }"
+            + "  var fs=d.querySelectorAll('iframe,frame');"
+            + "  for(var j=0;j<fs.length;j++){"
+            + "    var cd=null;try{cd=fs[j].contentDocument;}catch(e){}"
+            + "    if(cd)scanDoc(cd,depth+1);"
+            + "  }"
+            + "}"
+            ;
+    }
+
     /** 主流程：解析当前教务页面课表 */
     private void parseSchedule() {
         webView.evaluateJavascript(buildParseJs("Android"), null);
@@ -1213,6 +1814,16 @@ public class MainActivity extends AppCompatActivity {
 
     /** 缓存当前教务页面 DOM 原文，用于排查页面结构变化导致的漏解析 */
     private void captureScheduleHtml() {
+        capturePageHtml("latest_schedule_capture.html");
+    }
+
+
+    /**
+     * 把当前页面 DOM 存到 files/<fileName>，用于事后排查。
+     * 除了课表页，教务首页也会存一份：学生姓名/学号到底在哪个节点、哪个框架里，
+     * 只能靠真实页面确认，猜选择器没有意义。
+     */
+    private void capturePageHtml(final String fileName) {
         webView.evaluateJavascript("(function(){try{return btoa(unescape(encodeURIComponent(document.documentElement.outerHTML||'')))}catch(e){return ''}})()", value -> {
             if (value == null || "null".equals(value) || "\"\"".equals(value)) return;
             try {
@@ -1221,9 +1832,9 @@ public class MainActivity extends AppCompatActivity {
                     encoded = encoded.substring(1, encoded.length() - 1);
                 if (encoded.length() > 12_000_000) encoded = encoded.substring(0, 12_000_000);
                 byte[] bytes = android.util.Base64.decode(encoded, android.util.Base64.DEFAULT);
-                java.io.File f = new java.io.File(getFilesDir(), "latest_schedule_capture.html");
+                java.io.File f = new java.io.File(getFilesDir(), fileName);
                 try (java.io.FileOutputStream out = new java.io.FileOutputStream(f)) { out.write(bytes); }
-            } catch (Exception e) { Log.w(TAG, "raw schedule capture failed", e); }
+            } catch (Exception e) { Log.w(TAG, "page capture failed: " + fileName, e); }
         });
     }
 
@@ -1238,6 +1849,21 @@ public class MainActivity extends AppCompatActivity {
      * 也不写任何数据（用户点「立即更新」才落盘）。
      */
     private WebView silentWebView;
+
+    // ====== 查询教室：用隐藏 WebView 借教务自己的联动逻辑 ======
+    // 教室查询页的校区→教学楼是 AJAX 联动、结果由 fcenter 框架承载，
+    // 与其在客户端复刻一套（易随校方改版失效），不如让教务页面自己算，我们只取值。
+    private WebView classroomWv;
+    /** 专门用来抓姓名/学号的隐藏 WebView（打开教务首页） */
+    private WebView studentWv;
+    /** 用户点了「重新获取资料」：抓完要给出结果提示 */
+    private boolean studentInfoManual = false;
+    /** 当前查询来源：room=查询教室，empty=找空教室（决定结果渲染到哪个页面） */
+    private String classroomMode = "room";
+    /** 查询序号：只接受最后一次提交的回调，避免切换功能后旧结果串台 */
+    private int classroomSeq = 0;
+    private boolean classroomLoaded = false;
+    private boolean classroomOptionsPending = false;
     private boolean silentRunning = false;
     private boolean silentOnSchedulePage = false;   // 已进入课表页(含猜测URL)
     private boolean silentAutoLogged = false;       // 本轮已自动提交过密码
@@ -1402,6 +2028,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void handleSilentParsed(String json) {
+        // 静默刷新能进课表页，但姓名在首页的 iframe 里，这里顺带补抓
+        handler.postDelayed(() -> ensureStudentInfo(false), 500);
         if (!silentRunning) return;
         try {
             JSONObject obj = new JSONObject(json);
@@ -1425,7 +2053,7 @@ public class MainActivity extends AppCompatActivity {
             Log.d(TAG, "silent refresh: changed=" + changed + " new=" + n);
             if (changed) {
                 pendingRefreshJson = json;
-                showScheduleUpdatedDialog(n);
+                showScheduleUpdatedDialog(n, countOverlaps(courses));
             }
         } catch (Exception e) {
             Log.w(TAG, "silent parsed exception", e);
@@ -1452,14 +2080,102 @@ public class MainActivity extends AppCompatActivity {
         return s == null ? "" : s.replaceAll("\\s+", " ").trim();
     }
 
-    private void showScheduleUpdatedDialog(int newCount) {
+    /**
+     * 新课表与自定义课程的「撞格」统计结果。
+     * example 形如「第5周 周一 3-4节」，只用于弹窗里给一个可核对的例子。
+     */
+    private static class OverlapStat {
+        int count = 0;
+        String example = "";
+    }
+
+    /** 节次标签（1..8 → 1-2节 / 3-4节 …），越界时按「第 2n-1 ~ 2n 节」兜底 */
+    private static String periodLabelOf(int row) {
+        return row >= 1 && row <= PERIOD_LABELS.length
+                ? PERIOD_LABELS[row - 1] : (row * 2 - 1) + "-" + (row * 2) + "节";
+    }
+
+    /**
+     * 统计新课表会**新增**多少处与自定义课程的重叠。
+     *
+     * 两个要点：
+     * 1. 逐周判定：自定义课可能只在第 12 周，而新课表同格的教务课只在 1-8 周，不算重叠。
+     * 2. 只报「新增」：用户本来就主动叠加在教务课上的，更新前后都重叠，不该再报一次；
+     *    因此同时对**本地现有课表**与**新课表**建「周 → 占格集合」，只有
+     *    「新课表有、本地没有」才计入。
+     */
+    private OverlapStat countOverlaps(JSONArray newCourses) {
+        OverlapStat st = new OverlapStat();
+        if (store == null || newCourses == null || newCourses.length() == 0) return st;
+
+        int totalWeeks = store.getTotalWeeks();
+        if (totalWeeks <= 0) totalWeeks = ScheduleStore.maxWeekOf(newCourses);
+        if (totalWeeks <= 0) return st;
+
+        Map<Integer, java.util.Set<String>> oldCells = cellsByWeek(store.getAllCourses(), totalWeeks);
+        Map<Integer, java.util.Set<String>> newCells = cellsByWeek(newCourses, totalWeeks);
+
+        JSONObject ov = store.getOverrides();
+        JSONArray customs = store.getCustomCourses();
+        for (int i = 0; i < customs.length(); i++) {
+            JSONObject c = customs.optJSONObject(i);
+            if (c == null) continue;
+            int[] pos = resolvePosition(c, ov);
+            int day = pos[0], row = pos[1];
+            if (day < 1 || day > 7 || row < 1 || row > MAX_RENDER_ROWS) continue;
+            String key = row + "_" + (day - 1);
+            String weeks = c.optString("weeks", "");
+            for (int w = 1; w <= totalWeeks; w++) {
+                if (!ScheduleStore.weekMatches(weeks, w)) continue;
+                if (!newCells.get(w).contains(key)) continue;
+                if (oldCells.get(w).contains(key)) break;   // 原本就重叠，静默
+                st.count++;
+                if (st.example.isEmpty()) {
+                    st.example = "第" + w + "周 " + WEEKDAY_CN[day] + " " + periodLabelOf(row);
+                }
+                break;
+            }
+        }
+        return st;
+    }
+
+    /** 把课程数组展开成「周 → 占格集合」，键与渲染时一致：row_(day-1) */
+    private static Map<Integer, java.util.Set<String>> cellsByWeek(JSONArray list, int totalWeeks) {
+        Map<Integer, java.util.Set<String>> map = new HashMap<>();
+        for (int w = 1; w <= totalWeeks; w++) map.put(w, new java.util.HashSet<>());
+        if (list == null) return map;
+        for (int i = 0; i < list.length(); i++) {
+            JSONObject c = list.optJSONObject(i);
+            if (c == null) continue;
+            int day = c.optInt("day", 0), row = c.optInt("row", 0);
+            if (day < 1 || day > 7 || row < 1 || row > MAX_RENDER_ROWS) continue;
+            String key = row + "_" + (day - 1);
+            String weeks = c.optString("weeks", "");
+            for (int w = 1; w <= totalWeeks; w++) {
+                if (ScheduleStore.weekMatches(weeks, w)) map.get(w).add(key);
+            }
+        }
+        return map;
+    }
+
+    private void showScheduleUpdatedDialog(int newCount, OverlapStat stat) {
         if (isFinishing()) return;
         if (Build.VERSION.SDK_INT >= 17 && isDestroyed()) return;
         final int oldCount = store.getAllCourses().length();
+        StringBuilder msg = new StringBuilder();
+        msg.append("教务系统的课表与本地不一致（本地 ").append(oldCount)
+           .append(" 条，最新 ").append(newCount).append(" 条）。");
+        if (stat != null && stat.count > 0) {
+            msg.append("\n\n其中 ").append(stat.count).append(" 门自定义课程会被新课表撞上（此前不重叠）");
+            if (!stat.example.isEmpty()) {
+                msg.append("，如 ").append(stat.example).append(stat.count > 1 ? " 等" : "");
+            }
+            msg.append("。更新后这些格子会以红色描边提示；你自己叠加的仍为琥珀色。");
+        }
+        msg.append("\n\n是否立即更新？更新后桌面小组件会一起刷新。");
         new AlertDialog.Builder(this)
                 .setTitle("课表有更新")
-                .setMessage("教务系统的课表与本地不一致（本地 " + oldCount + " 条，最新 " + newCount
-                        + " 条）。\n是否立即更新？更新后桌面小组件会一起刷新。")
+                .setMessage(msg.toString())
                 .setPositiveButton("立即更新", (d, w) -> applyRefreshedSchedule())
                 .setNegativeButton("稍后", (d, w) -> pendingRefreshJson = null)
                 .setCancelable(true)
@@ -1476,8 +2192,12 @@ public class MainActivity extends AppCompatActivity {
             JSONArray courses = sanitizeCourses(obj.optJSONArray("courses"));
             if (courses == null || courses.length() == 0) return;
             String[] times = parsePeriodTimes(obj.optJSONArray("periodTimes"));
+            // 落盘前先算重叠（落盘后 store 里就是新课表，拿不到「新数据 vs 自定义课」的对比）
+            OverlapStat stat = countOverlaps(courses);
             saveAndRenderParsed(obj, courses, times);
-            Toast.makeText(this, "课表已更新", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, stat.count > 0
+                    ? "课表已更新，新增 " + stat.count + " 处与自定义课程的重叠（红色标记）"
+                    : "课表已更新", Toast.LENGTH_SHORT).show();
         } catch (Exception e) {
             Log.e(TAG, "apply refreshed schedule failed", e);
             Toast.makeText(this, "课表更新失败，请手动刷新", Toast.LENGTH_SHORT).show();
@@ -1516,6 +2236,411 @@ public class MainActivity extends AppCompatActivity {
         @JavascriptInterface
         public void onScheduleLinkFound(final String url) {
             handler.post(() -> handleSilentLink(url));
+        }
+    }
+
+    // ====== 学生资料（姓名/学号）抓取 ======
+
+    /**
+     * 抓姓名/学号：单独开一个隐藏 WebView 打开教务首页。
+     *
+     * 为什么必须走首页：姓名在首页 iframe「个人设置」(grsz_xggrxx.do) 的表单里，
+     * **课表页本身没有这个 iframe**。升级安装后旧会话仍有效，App 直接进课表页，
+     * 永远不经过首页 → 抓不到姓名，只能退出重登才恢复。
+     */
+    private void ensureStudentInfo(final boolean force) {
+        if (store == null || savedUser.isEmpty()) return;
+        if (!force && !store.getStudentName().isEmpty()
+                && savedUser.equals(store.getStudentOwner())) {
+            return;   // 已有且归属当前账号
+        }
+        if (studentWv != null) {
+            if (!force) return;   // 已经在抓了
+            releaseStudentWv();
+        }
+        try {
+            WebView wv = new WebView(this);
+            WebSettings st = wv.getSettings();
+            st.setJavaScriptEnabled(true);
+            st.setDomStorageEnabled(true);
+            st.setUserAgentString(webView.getSettings().getUserAgentString());
+            st.setAllowFileAccess(false);
+            st.setAllowContentAccess(false);
+            wv.addJavascriptInterface(new JsInterface(), "Android");
+            wv.setWebViewClient(new WebViewClient() {
+                @Override
+                public void onPageFinished(WebView v, String url) {
+                    super.onPageFinished(v, url);
+                    Log.d(TAG, "student info page: " + url);
+                    if (url != null && url.contains("jwgl.shzu.edu.cn")) {
+                        // 「个人设置」iframe 还要再等一会儿，靠重试兜住
+                        v.evaluateJavascript(buildStudentInfoRetryJs(14), null);
+                    }
+                }
+
+                @Override
+                public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                    String u = r.getUrl() == null ? "" : r.getUrl().toString();
+                    return !isTrustedUrl(u);
+                }
+            });
+            ViewGroup root = (ViewGroup) findViewById(android.R.id.content);
+            wv.setAlpha(0f);
+            wv.setVisibility(View.INVISIBLE);
+            wv.setClickable(false);
+            wv.setFocusable(false);
+            root.addView(wv, new android.widget.FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+            studentWv = wv;
+            Map<String, String> h = new HashMap<>();
+            h.put("Accept-Language", "zh-CN,zh;q=0.9");
+            // 走教务根地址：它会跳到「石河子大学教务一体化系统」框架首页，
+            // 那页面上直接挂着「个人设置」的 iframe（/jsxsd/grsz/grsz_xggrxx.do），
+            // 姓名就在那个表单里。直接请求 xsMain 之类的子页面反而会拿到「错误提示页面」。
+            wv.loadUrl(JWGL_BASE, h);
+            // 兜底：最多等 25 秒，超时就放弃（不影响其他功能）
+            handler.postDelayed(this::releaseStudentWv, 25000);
+            Log.d(TAG, "student info: capture started");
+        } catch (Exception e) {
+            Log.w(TAG, "student info capture start failed", e);
+        }
+    }
+
+    /** 释放抓姓名用的隐藏 WebView */
+    private void releaseStudentWv() {
+        final WebView wv = studentWv;
+        studentWv = null;
+        if (wv == null) return;
+        try {
+            wv.stopLoading();
+            ViewGroup parent = (ViewGroup) wv.getParent();
+            if (parent != null) parent.removeView(wv);
+            wv.destroy();
+        } catch (Exception e) {
+            Log.w(TAG, "student info webview release failed", e);
+        }
+    }
+
+    // ====== 查询教室实现 ======
+
+    /** 隐藏 WebView 载入教务「教室课表查询」页（与主 WebView 共用 Cookie 会话） */
+    private void ensureClassroomWebView() {
+        if (classroomWv != null) return;
+        WebView wv = new WebView(this);
+        WebSettings s = wv.getSettings();
+        s.setJavaScriptEnabled(true);
+        s.setDomStorageEnabled(true);
+        s.setCacheMode(WebSettings.LOAD_DEFAULT);
+        s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        s.setAllowFileAccess(false);
+        s.setAllowContentAccess(false);
+        s.setUserAgentString(webView.getSettings().getUserAgentString());
+        CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true);
+        wv.addJavascriptInterface(new ClassroomBridge(), "AndroidClassroom");
+        wv.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageFinished(WebView v, String url) {
+                super.onPageFinished(v, url);
+                if (url != null && url.contains("kbxx_classroom") && !classroomLoaded) {
+                    classroomLoaded = true;
+                    Log.d(TAG, "classroom page ready");
+                    // 页面自带的 initJc 是异步 AJAX，稍等再取节次选项
+                    handler.postDelayed(() -> {
+                        if (classroomWv != null) classroomWv.evaluateJavascript(CLS_SNAPSHOT_JS, null);
+                    }, 900);
+                }
+            }
+
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                String u = r.getUrl() == null ? "" : r.getUrl().toString();
+                return !isTrustedUrl(u);
+            }
+
+            @Override
+            public void onReceivedSslError(WebView v, SslErrorHandler h, SslError e) {
+                h.proceed();   // 校内域名，与主 WebView 策略一致
+            }
+        });
+        ViewGroup root = (ViewGroup) findViewById(android.R.id.content);
+        wv.setAlpha(0f);
+        wv.setVisibility(View.INVISIBLE);
+        wv.setClickable(false);
+        wv.setFocusable(false);
+        root.addView(wv, new android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        classroomWv = wv;
+    }
+
+    /** 打开（或复用）教室查询页，并把可选条件回传给「查询教室」页面 */
+    private void classroomOpenOptions() {
+        ensureClassroomWebView();
+        if (classroomLoaded) {
+            classroomWv.evaluateJavascript(CLS_SNAPSHOT_JS, null);
+            return;
+        }
+        if (classroomOptionsPending) return;
+        classroomOptionsPending = true;
+        Map<String, String> h = new HashMap<>();
+        h.put("Accept-Language", "zh-CN,zh;q=0.9");
+        classroomWv.loadUrl(JWGL_BASE + "/jsxsd/kbcx/kbxx_classroom", h);
+        // 会话过期/网络异常时不能一直转圈，到点告诉页面先登录
+        handler.postDelayed(() -> {
+            if (!classroomLoaded) {
+                classroomOptionsPending = false;
+                evalJs("crSetOptions(null)");
+            }
+        }, 15000);
+    }
+
+    private void classroomSendJs(String js) {
+        if (classroomWv != null) classroomWv.evaluateJavascript(js, null);
+    }
+
+    /** 取当前页面上的可选条件（校区/周次/星期/节次） */
+    private static final String CLS_SNAPSHOT_JS = "(function(){try{"
+        + "function opts(id){var e=document.getElementById(id);if(!e)return[];var a=[];"
+        + "for(var i=0;i<e.options.length;i++){var o=e.options[i];"
+        + "if(o.value)a.push({v:o.value,t:(o.text||'').replace(/\\s+/g,' ').trim()});}return a;}"
+        + "AndroidClassroom.onOptions(JSON.stringify("
+        + "{campus:opts('xqid'),term:opts('xnxqh'),week:opts('zc1'),weekday:opts('skxq1'),jc:opts('jc1')}));"
+        + "}catch(e){AndroidClassroom.onOptions('{}');}})()";
+
+    /** 选校区 → 借教务自身 onChangeXq 拉教学楼列表 */
+    private static String clsPickCampusJs(String xqid, String target) {
+        return "(function(){try{"
+            + "var s=document.getElementById('xqid');"
+            + "if(!s){AndroidClassroom.onBuildings('[]'," + jsString(target) + ");return;}"
+            + "s.value=" + jsString(xqid) + ";"
+            + "if(typeof onChangeXq==='function')onChangeXq(s);"
+            + "var b=document.getElementById('jzwid'),a=[];"
+            + "if(b)for(var i=0;i<b.options.length;i++){var o=b.options[i];"
+            + "if(o.value)a.push({v:o.value,t:(o.text||'').replace(/\\s+/g,' ').trim()});}"
+            + "AndroidClassroom.onBuildings(JSON.stringify(a)," + jsString(target) + ");"
+            + "}catch(e){AndroidClassroom.onBuildings('[]'," + jsString(target) + ");}})()";
+    }
+
+    /**
+     * 选教学楼 → 取该楼教室清单。
+     *
+     * 教务的教室选择是 showModalDialog 弹窗（`jx0601_select.htmlx`），这里不去模拟弹窗，
+     * 而是同源 XHR 拉那份页面，读每行 `ondblclick="getData('<教室id>','<教室名>')"`——
+     * 这正是弹窗双击回填到 `jsid`/`skjs` 的两个值，等价于用户手动选教室。
+     */
+    private static String clsRoomsJs(String bld) {
+        return "(function(){try{"
+            + "function done(a){AndroidClassroom.onRooms(JSON.stringify(a||[]));}"
+            + "var xq=document.getElementById('xqid');var xv=xq?xq.value:'';"
+            + "var s=document.getElementById('jzwid');if(s)s.value=" + jsString(bld) + ";"
+            + "if(!xv||!s||!s.value){done([]);return;}"
+            + "var url='/jsxsd/view/kbxx/kbcx/jx0601_select.htmlx?id=jsid&name=skjs&type=1&where=&xqid='"
+            + "+encodeURIComponent(xv)+'&jzwid='+encodeURIComponent(s.value);"
+            + "var x=new XMLHttpRequest();x.open('GET',url,true);"
+            + "x.onreadystatechange=function(){"
+            + "  if(x.readyState!==4)return;"
+            + "  if(x.status!==200){done([]);return;}"
+            + "  var doc=null;"
+            + "  try{doc=new DOMParser().parseFromString(x.responseText,'text/html');}catch(e){doc=null;}"
+            + "  var out=[],seen={};"
+            + "  if(doc){var trs=doc.getElementsByTagName('tr');"
+            + "    for(var i=0;i<trs.length;i++){"
+            + "      var oc=trs[i].getAttribute('ondblclick')||'';"
+            + "      var m=oc.match(/getData\\('([^']*)','([^']*)'\\)/);"
+            + "      if(!m)continue;"
+            + "      var id=m[1],nm=m[2];"
+            + "      if(!id||!nm||seen[id])continue;"
+            + "      seen[id]=1;out.push({v:id,t:nm});}}"
+            + "  done(out);"
+            + "};x.send();"
+            + "}catch(e){try{AndroidClassroom.onRooms('[]');}catch(e2){}}})()";
+    }
+
+    /** 提交查询：填好表单 → submit（结果进 fcenter 框架）→ 轮询取结果表 */
+    private static String clsQueryJs(String campus, String bld, String week,
+                                     String wd, String j1, String j2,
+                                     String roomId, String roomName, int seq) {
+        return "(function(){try{"
+            + "var SQ=" + seq + ";"
+            + "function set(id,v){var e=document.getElementById(id);if(e&&v)e.value=v;}"
+            // 教室可以不选：必须能把 jsid/skjs 清空，否则会一直沿用上一次选的教室
+            + "function setv(id,v){var e=document.getElementById(id);if(e)e.value=(v==null?'':v);}"
+            // ===== 结果表解析：转成 [{room,day,lines}] =====
+            + "function cellText(el){if(!el)return '';"
+            + "  var h=(el.innerHTML||'').replace(/<br\\s*\\/?>/gi,'\\n');"
+            + "  var d=el.ownerDocument.createElement('div');d.innerHTML=h;"
+            + "  return (d.textContent||'').replace(/\\u00a0/g,' ').trim();}"
+            + "function parse(tbl){"
+            + "  var out=[],allRooms=[],free={};"
+            + "  try{"
+            + "    var rows=tbl.rows,matrix=[];"
+            // 展开 rowspan/colspan，得到完整矩阵（否则取不到被合并的格子）
+            + "    for(var r=0;r<rows.length;r++){"
+            + "      if(!matrix[r])matrix[r]=[];"
+            + "      var ci=0;"
+            + "      for(var c=0;c<rows[r].cells.length;c++){"
+            + "        var td=rows[r].cells[c],rs=td.rowSpan||1,cs=td.colSpan||1;"
+            + "        while(matrix[r][ci]!==undefined)ci++;"
+            + "        for(var dr=0;dr<rs;dr++)for(var dc=0;dc<cs;dc++){"
+            + "          var rr=r+dr,cc=ci+dc;if(!matrix[rr])matrix[rr]=[];"
+            + "          matrix[rr][cc]={el:td,origin:(dr===0&&dc===0)};"
+            + "        }"
+            + "        ci+=cs;"
+            + "      }"
+            + "    }"
+            + "    var dayCol={},headRow=-1;"
+            + "    for(var r2=0;r2<matrix.length;r2++){"
+            + "      for(var c2=0;c2<matrix[r2].length;c2++){"
+            + "        var cell=matrix[r2][c2];if(!cell)continue;"
+            + "        var m=(cell.el.textContent||'').replace(/\\s+/g,'').match(/星期([一二三四五六日天])/);"
+            + "        if(m){dayCol[c2]='星期'+m[1];if(headRow<0)headRow=r2;}"
+            + "      }"
+            + "    }"
+            + "    var ks=[];for(var kk in dayCol)ks.push(Number(kk));"
+            + "    if(!ks.length)return out;"
+            + "    var minDay=Math.min.apply(null,ks);"
+            + "    for(var r3=headRow+1;r3<matrix.length;r3++){"
+            + "      var row=matrix[r3]||[],room='';"
+            + "      for(var c3=0;c3<minDay;c3++){"
+            + "        if(row[c3]){room=(row[c3].el.textContent||'').replace(/\\s+/g,'').trim();if(room)break;}}"
+            + "      if(!room)continue;"
+            // 只排表头行（「教室\节次」及其后面的 0102 这类节次码）。
+            // 不能按「名字里含教室」跳过——真实教室名就带这个字，
+            // 例如「博学A-203（智慧教室）」，按旧规则会把这一整行丢掉，表现为「未识别出卡片」。
+            + "      var rk=room.replace(/\\s+/g,'');"
+            + "      if(rk.indexOf('节次')>=0)continue;"
+            + "      if(rk.length<=6&&rk.indexOf('教室')>=0)continue;"
+            + "      allRooms.push(room);"
+            // 该教室在某星期列里「没有任何课」即为空。表格已由教务按周次+节次过滤，
+            // 空格的含义就是「这一整段没课」，不需要自己算时间。
+            + "      for(var dk0 in dayCol){"
+            + "        var c0=matrix[r3][Number(dk0)];if(!c0)continue;"
+            + "        if(cellText(c0.el).replace(/\\s+/g,'')===''){"
+            + "          if(!free[dayCol[dk0]])free[dayCol[dk0]]=[];"
+            + "          free[dayCol[dk0]].push(room);}}"
+            + "      for(var dk in dayCol){"
+            + "        var cc2=Number(dk),cell2=matrix[r3][cc2];"
+            + "        if(!cell2||!cell2.origin)continue;"
+            + "        var txt=cellText(cell2.el);"
+            + "        if(!txt||txt.replace(/\\s+/g,'')===room)continue;"
+            + "        var lines=txt.split('\\n').map(function(s){return s.replace(/\\s+/g,' ').trim();})"
+            + "          .filter(function(s){return s.length>0&&s.replace(/\\s+/g,'')!==room;});"
+            + "        if(!lines.length)continue;"
+            + "        out.push({room:room,day:dayCol[dk],lines:lines,text:lines.join(' ')});"
+            + "      }"
+            + "    }"
+            + "  }catch(e){}"
+            + "  return {list:out,rooms:allRooms,free:free};"
+            + "}"
+            + "set('xqid'," + jsString(campus) + ");"
+            + "var x=document.getElementById('xqid');if(typeof onChangeXq==='function')onChangeXq(x);"
+            // 教学楼可以为空（整校区）：必须能把 jzwid 清空，否则会沿用上一次选的教学楼
+            + "setv('jzwid'," + jsString(bld) + ");"
+            + "if(typeof onChangeJXL==='function')onChangeJXL();"
+            + "set('zc1'," + jsString(week) + ");set('zc2'," + jsString(week) + ");"
+            + "set('skxq1'," + jsString(wd) + ");set('skxq2'," + jsString(wd) + ");"
+            + "set('jc1'," + jsString(j1) + ");set('jc2'," + jsString(j2) + ");"
+            // 教室过滤：实测教务只认 skjs（教室名称文本），jsid 一填反而让名称过滤失效
+            // （同一次请求 jsid+skjs 返回整栋楼，只给 skjs 才只剩那一间）。
+            // 所以 jsid 恒留空，skjs 只在选了具体教室时写名称；
+            // 未选时必须清空——「全部教室（整栋楼）」这种界面文案写进去会查出空结果。
+            + "setv('jsid','');"
+            + "setv('skjs'," + jsString(roomId == null || roomId.isEmpty() ? "" : roomName) + ");"
+            + "var f=document.getElementById('Form1');"
+            + "if(!f){AndroidClassroom.onResult(JSON.stringify({html:'',msg:'教务页面结构异常，未找到查询表单',seq:SQ}));return;}"
+            // 提交前先记下 iframe 里旧结果的指纹并清空：
+            // 不清空的话，poll 第一次（400ms）就可能读到上一次查询留在 fcenter 里的表，
+            // 表现为「查 A 教室却显示 B」「刚查完还是上一个条件的结果」。
+            // 每次查询换一个全新的 iframe：
+            // 复用旧 iframe 时，submit 之后新页面还没到、旧页面还在（旧页脚本还会继续重绘），
+            // 于是会读到上一次的表（表现为「查 A 显示 B」）；整校区大表时还会读到渲染到一半的内容，
+            // 同一条件两次查出行数不一样就是这么来的。换成空的新 iframe，出现内容就一定是这次的。
+            + "try{var old=document.getElementById('fcenter');"
+            + "  if(old&&old.parentNode){"
+            + "    var nf=document.createElement('iframe');"
+            + "    nf.id='fcenter';nf.name='fcenter';nf.width='100%';nf.height='600';nf.style.border='0';"
+            + "    old.parentNode.replaceChild(nf,old);}}catch(e){}"
+            + "function fdoc(){try{var fr=document.getElementById('fcenter');"
+            + "  return fr?fr.contentDocument:null;}catch(e){return null;}}"
+            + "function fsig(d){try{return d&&d.body?(d.body.textContent||'').replace(/\\s+/g,''):'';}catch(e){return '';}}"
+            + "var tries=0,lastRows=-1,stable=0;"
+            + "var timer=setInterval(function(){"
+            + "  tries++;var doc=fdoc();"
+            + "  var txt=fsig(doc);"
+            + "  if(txt.length>0&&doc&&doc.readyState==='complete'){"
+            // 教务的表格是逐行渲染的（脚本一行行插），readyState 完成不等于表格插完。
+            // 所以再看表格行数：连续两次行数不变才算渲染结束，否则会只读到前几行。
+            + "    var tb=null;try{tb=doc.querySelector('table');}catch(e){}"
+            + "    var rc=tb&&tb.rows?tb.rows.length:0;"
+            + "    if(rc>0){"
+            + "      if(rc===lastRows){stable++;}else{stable=0;lastRows=rc;}"
+            + "      if(stable<1&&tries<50)return;"
+            + "    }"
+            + "    clearInterval(timer);"
+            + "    var t=doc.querySelector('table'),rep={html:'',rows:0,list:[],msg:'',seq:SQ};"
+            + "    if(t){rep.html=t.outerHTML;rep.rows=t.rows?t.rows.length:0;"
+            + "      var pr=parse(t)||{};rep.list=pr.list||[];rep.rooms=pr.rooms||[];rep.free=pr.free||{};}"
+            + "    else{rep.html=doc.body.innerHTML;rep.rows=0;}"
+            + "    if(!rep.html)rep.msg='该条件没有查询到占用记录';"
+            + "    AndroidClassroom.onResult(JSON.stringify(rep));return;}"
+            + "  if(tries>60){clearInterval(timer);"
+            + "    AndroidClassroom.onResult(JSON.stringify({html:'',msg:'查询超时，教务系统没有返回结果',list:[],seq:SQ}));}"
+            + "},400);"
+            + "f.submit();"
+            + "}catch(e){AndroidClassroom.onResult(JSON.stringify({html:'',msg:'查询失败：'+e.message,list:[],seq:SQ}));}})()";
+    }
+
+    /** 隐藏 WebView 的桥：只回传教室查询要用的三类数据 */
+    private class ClassroomBridge {
+        /** 临时：把结果表落盘，用于核对解析规则（发布前置 false） */
+        private final boolean dump = false;
+        @JavascriptInterface
+        public void onOptions(final String json) {
+            handler.post(() -> evalJs("crSetOptions(" + (json == null ? "null" : json) + ")"));
+        }
+
+        @JavascriptInterface
+        public void onBuildings(final String json, final String target) {
+            final String t = (target == null || target.isEmpty()) ? "crBuilding" : target;
+            handler.post(() -> evalJs("crSetBuildings(" + (json == null ? "[]" : json)
+                    + ",\"" + t + "\")"));
+        }
+
+        /** 某教学楼的教室清单（来自教务「选择教室」弹窗页，不是自己编的） */
+        @JavascriptInterface
+        public void onRooms(final String json) {
+            handler.post(() -> evalJs("crSetRoom(" + (json == null ? "[]" : json) + ")"));
+        }
+
+        @JavascriptInterface
+        public void onResult(final String json) {
+            handler.post(() -> {
+                try {
+                    JSONObject o = new JSONObject(json == null ? "{}" : json);
+                    // 同一时刻只认最后一次提交的结果：两个页面共用一个 WebView，
+                    // 用户切换功能后迟到的回调必须丢弃，否则会把 A 的结果画到 B 页面上。
+                    int seq = o.optInt("seq", -1);
+                    if (seq >= 0 && seq != classroomSeq) {
+                        Log.d(TAG, "classroom result dropped: seq=" + seq + " current=" + classroomSeq);
+                        return;
+                    }
+                    // 结果表来自另一个文档，去掉脚本再塞进我们的页面
+                    String html = o.optString("html", "").replaceAll("(?is)<script.*?</script>", "");
+                    o.put("html", html);
+                    if (dump && !html.isEmpty()) {
+                        try (java.io.FileOutputStream out = new java.io.FileOutputStream(
+                                new java.io.File(getFilesDir(), "classroom_result.html"))) {
+                            out.write(html.getBytes("UTF-8"));
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    Log.d(TAG, "classroom result: rows=" + o.optInt("rows", 0)
+                            + " list=" + (o.optJSONArray("list") == null ? 0 : o.optJSONArray("list").length()));
+                    evalJs(("empty".equals(classroomMode) ? "eqShowResult(" : "crShowResult(")
+                            + o.toString() + ")");
+                } catch (Exception e) {
+                    Log.w(TAG, "classroom onResult failed", e);
+                }
+            });
         }
     }
 
@@ -1882,6 +3007,49 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
+     * 这一格里的自定义课是否全部是「有意叠加」（加课时该格已有课）。
+     * 只要有一门不是，就按意外撞车处理——宁可多报警，也不要把真实冲突柔化掉。
+     */
+    private static boolean customAllIntentional(JSONArray customs) {
+        if (customs == null || customs.length() == 0) return false;
+        for (int i = 0; i < customs.length(); i++) {
+            JSONObject c = customs.optJSONObject(i);
+            if (c == null) continue;
+            if (!c.optBoolean("overlap", false)) return false;
+        }
+        return true;
+    }
+
+    /**
+     * 指定周、指定格子里已有的课程数（教务 + 自定义，位置按 overrides 修正）。
+     * 用于「重叠加课」时告诉用户这一格已经压了几门课。
+     *
+     * @param excludeId 编辑已有自定义课时传它的 id，避免把它自己算进去
+     */
+    private int countOccupied(int week, int day, int row, String excludeId) {
+        if (store == null) store = new ScheduleStore(this);
+        if (week < 1) week = 1;
+        JSONObject ov = store.getOverrides();
+        int n = 0;
+        JSONArray school = store.coursesForWeek(week);
+        for (int i = 0; i < school.length(); i++) {
+            JSONObject c = school.optJSONObject(i);
+            if (c == null) continue;
+            int[] p = resolvePosition(c, ov);
+            if (p[0] == day && p[1] == row) n++;
+        }
+        JSONArray customs = store.customCoursesForWeek(week);
+        for (int i = 0; i < customs.length(); i++) {
+            JSONObject c = customs.optJSONObject(i);
+            if (c == null) continue;
+            if (excludeId != null && excludeId.equals(c.optString("id", ""))) continue;
+            int[] p = resolvePosition(c, ov);
+            if (p[0] == day && p[1] == row) n++;
+        }
+        return n;
+    }
+
+    /**
      * 课程卡片颜色。
      * 自定义课程允许用户自选颜色，优先级高于按课名分配；其余沿用同一套色板。
      */
@@ -1974,24 +3142,31 @@ public class MainActivity extends AppCompatActivity {
         int maxRow = collectCells(courses, ov, schoolCells, 0);
         maxRow = collectCells(customs, ov, customCells, maxRow);
 
-        // 合并：同一格里同时存在教务课与自定义课时标记冲突，并按用户偏好决定谁排在前面
+        // 合并：同一格里同时存在教务课与自定义课时，按用户偏好决定谁排在前面；
+        // 再区分两种语义——「用户有意叠加」（琥珀色）与「教务刷新后才撞上」（红色报警）。
         boolean schoolFirst = !"custom".equals(store.getConflictPriority());
         Map<String, JSONArray> cellMap = new HashMap<>();
         java.util.Set<String> clashCells = new java.util.HashSet<>();
+        java.util.Set<String> overlapCells = new java.util.HashSet<>();
         java.util.Set<String> allCells = new java.util.LinkedHashSet<>(schoolCells.keySet());
         allCells.addAll(customCells.keySet());
         for (String key : allCells) {
             JSONArray s = schoolCells.get(key);
             JSONArray cu = customCells.get(key);
+            int schoolCount = s == null ? 0 : s.length();
+            int customCount = cu == null ? 0 : cu.length();
             JSONArray arr = new JSONArray();
-            if (s != null && s.length() > 0 && cu != null && cu.length() > 0) {
-                clashCells.add(key);
+            if (schoolCount > 0 && customCount > 0) {
+                if (customAllIntentional(cu)) overlapCells.add(key);
+                else clashCells.add(key);
                 if (schoolFirst) { appendAll(arr, s); appendAll(arr, cu); }
                 else { appendAll(arr, cu); appendAll(arr, s); }
             } else if (s != null) {
                 appendAll(arr, s);
             } else if (cu != null) {
                 appendAll(arr, cu);
+                // 同一格叠了多门自定义课：都属于有意叠加，不需要红色报警
+                if (customCount > 1) overlapCells.add(key);
             }
             if (arr.length() > 0) cellMap.put(key, arr);
         }
@@ -2012,24 +3187,127 @@ public class MainActivity extends AppCompatActivity {
         sb.append("body.dark{--bg:#0F1016;--fg:#E9E9F2;--sub:#A9A9BE;--card:#1E1F2A;--card2:#161722;");
         sb.append("--line:#2A2B38;--empty:#191A24;--modal:#1A1B26;}");
         sb.append("body{font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;");
-        sb.append("background-color:var(--bg);height:100vh;color:var(--fg);padding:12px 8px 0 8px;");
+        // 底部给标签栏留出固定高度，网格用 flex 自动吃掉剩余空间
+        sb.append("background-color:var(--bg);height:100vh;color:var(--fg);");
+        sb.append("padding:12px 8px calc(56px + env(safe-area-inset-bottom,0px)) 8px;");
         sb.append("transition:background-color 0.35s ease,color 0.35s ease;");
         sb.append("display:flex;flex-direction:column;overflow:hidden;}");
         // 有自定义背景图时页面背景透明，露出 Activity 层图片（切周不闪）
         sb.append("body.hasbg{background-color:transparent;}");
-        sb.append(".header{text-align:center;margin-bottom:10px;}");
-        sb.append(".header h1{font-size:20px;font-weight:700;color:var(--fg);}");
-        sb.append(".toolbar{display:flex;justify-content:center;align-items:center;gap:12px;margin-top:8px;}");
-        sb.append(".wbtn{background:var(--card);border:none;color:var(--fg);");
-        sb.append("font-size:16px;border-radius:20px;width:36px;height:36px;}");
-        sb.append(".wbtn:disabled{opacity:0.3;}");
-        sb.append(".wlabel{font-size:16px;font-weight:700;min-width:64px;color:var(--fg);}");
-        sb.append(".wdate{font-size:12px;color:#999;margin-top:4px;}");
-        sb.append(".hint{text-align:center;font-size:12px;color:#888;margin-top:4px;}");
-        sb.append(".btns{display:flex;justify-content:center;gap:10px;margin-top:8px;}");
+        sb.append(".header{text-align:center;margin-bottom:6px;flex:0 0 auto;}");
+        sb.append(".header h1{font-size:20px;font-weight:700;color:var(--fg);margin-bottom:2px;}");
+        // 日期与周次同一行：日期维持次要灰，周次用正文色（浅色主题下即近黑）加粗突出
+        sb.append(".subline{display:flex;justify-content:center;align-items:baseline;gap:8px;}");
+        sb.append(".subline .sdate{font-size:12px;color:#999;}");
+        sb.append(".subline .sweek{font-size:15px;font-weight:700;color:var(--fg);letter-spacing:0.5px;}");
+        sb.append(".hint{text-align:center;font-size:11px;color:#999;margin-top:3px;}");
+        sb.append(".btns{display:flex;justify-content:center;align-items:center;gap:8px;margin-top:8px;}");
         sb.append(".btn{background:var(--card);border:none;color:var(--fg);font-size:12px;");
-        sb.append("border-radius:16px;padding:6px 16px;}");
+        sb.append("border-radius:16px;padding:0 14px;height:32px;line-height:32px;flex:0 0 auto;}");
+        sb.append(".btn:disabled{opacity:0.35;}");
+        // 周切换按钮与其它按钮同高同圆角，只是收窄成方形
+        sb.append(".btn-nav{padding:0;width:32px;font-size:13px;color:var(--sub);}");
         sb.append(".btn-add{background:#667eea;color:#fff;font-weight:600;}");
+        // ===== 底部标签栏 =====
+        // 固定在最下方并高于设置页（z-index 96），任何页面下都可见，像真正的 tab。
+        // 页面容器 .page 的 bottom 也要让出这一段（见 .page 规则）。
+        sb.append(".tabbar{position:fixed;left:0;right:0;bottom:0;height:56px;z-index:96;");
+        sb.append("display:flex;align-items:stretch;background:var(--bg);");
+        sb.append("border-top:1px solid var(--line);");
+        sb.append("padding-bottom:env(safe-area-inset-bottom,0px);}");
+        sb.append(".tabitem{flex:1;border:none;background:transparent;color:var(--sub);");
+        sb.append("font-size:13px;cursor:pointer;position:relative;}");
+        sb.append(".tabitem.on{color:#667eea;font-weight:700;}");
+        sb.append(".tabitem.on::after{content:'';position:absolute;left:50%;bottom:6px;");
+        sb.append("width:18px;height:2px;border-radius:1px;background:#667eea;transform:translateX(-50%);}");
+        sb.append(".tabitem:active{opacity:0.7;}");
+        // 我的页面：资料卡 + 右上角齿轮
+        sb.append(".ph-gear{background:transparent;border:none;color:var(--fg);width:48px;height:48px;");
+        sb.append("display:flex;align-items:center;justify-content:center;cursor:pointer;}");
+        sb.append(".me-card{display:flex;align-items:center;gap:14px;background:var(--card);");
+        sb.append("border-radius:14px;padding:16px;margin-bottom:14px;}");
+        sb.append(".me-avatar{width:52px;height:52px;border-radius:50%;flex:0 0 auto;");
+        sb.append("background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;");
+        sb.append("display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:700;}");
+        sb.append(".me-info{flex:1;min-width:0;}");
+        sb.append(".me-info b{display:block;font-size:17px;color:var(--fg);font-weight:700;}");
+        sb.append(".me-info i{display:block;font-style:normal;font-size:13px;color:var(--sub);margin-top:5px;}");
+        sb.append(".me-empty{font-size:13px;color:var(--sub);line-height:1.7;}");
+        sb.append(".page-hint{font-size:12px;color:var(--sub);line-height:1.7;padding:2px 4px 20px;}");
+        sb.append(".more-empty{text-align:center;color:var(--sub);font-size:13px;line-height:2;padding:56px 0;}");
+        // 查询教室：状态行 + 教务原始结果表的兜底样式
+        sb.append(".cr-status{font-size:13px;color:var(--sub);line-height:1.7;padding:8px 2px;}");
+        sb.append(".cr-raw{margin-top:16px;overflow:auto;-webkit-overflow-scrolling:touch;}");
+        sb.append(".cr-raw table{border-collapse:collapse;width:auto;min-width:100%;font-size:11px;}");
+        // 教务的表列很多：不逐字断行、允许横向滚动，比硬挤在屏宽内可读
+        sb.append(".cr-raw td,.cr-raw th{border:1px solid var(--line);padding:5px 6px;color:var(--fg);");
+        sb.append("white-space:nowrap;word-break:normal;vertical-align:middle;}");
+        sb.append(".cr-raw th{background:var(--card);font-weight:600;}");
+        // 解析后的占用卡片
+        sb.append(".cr-card{background:var(--card);border-radius:12px;padding:12px;margin-top:10px;}");
+        sb.append(".cr-card .ch{display:flex;justify-content:space-between;align-items:baseline;gap:8px;}");
+        sb.append(".cr-card .ch b{font-size:14px;color:var(--fg);font-weight:700;}");
+        sb.append(".cr-card .ch span{font-size:12px;color:#667eea;font-weight:600;flex:0 0 auto;}");
+        sb.append(".cr-card .cb{margin-top:6px;font-size:12px;color:var(--sub);line-height:1.7;word-break:break-all;}");
+        sb.append(".cr-card .cb em{font-style:normal;color:var(--fg);font-weight:600;}");
+        // 卡片详情弹窗（两个教室功能共用）：左侧字段名、右侧值的两列行
+        sb.append(".cd-row{display:flex;gap:12px;font-size:13px;line-height:1.9;color:var(--fg);}");
+        sb.append(".cd-row span{flex:0 0 52px;color:var(--sub);}");
+        sb.append(".cd-row b{flex:1;min-width:0;font-weight:600;word-break:break-word;}");
+        sb.append(".cd-act{display:block;width:100%;margin-top:16px;background:var(--card);");
+        sb.append("border:none;color:#667eea;font-weight:600;border-radius:12px;padding:12px;");
+        sb.append("font-size:14px;font-family:inherit;}");
+        sb.append(".cd-act:active{opacity:0.7;}");
+        // 找空教室：按楼栋分组，房间用小块排布（整校区时可能有上百间）
+        sb.append(".eq-group{margin-top:16px;}");
+        sb.append(".eq-gh{display:flex;align-items:baseline;justify-content:space-between;");
+        sb.append("padding:0 2px 7px;}");
+        sb.append(".eq-gh b{font-size:13px;color:var(--fg);}");
+        sb.append(".eq-gh i{font-style:normal;font-size:11px;color:var(--sub);}");
+        sb.append(".eq-rooms{display:flex;flex-wrap:wrap;gap:8px;}");
+        sb.append(".eq-room{background:var(--card);border-radius:10px;padding:9px 12px;");
+        sb.append("font-size:12.5px;color:var(--fg);line-height:1.3;}");
+        sb.append(".eq-room:active{opacity:0.6;}");
+        // 查询教室：自绘选择行 + 底部选择面板。
+        // 原生 <select> 的弹出列表由系统绘制，各 ROM 差异极大（澎湃/三星/MIUI 各不相同），
+        // 且无法搜索——教学楼动辄几十间教室，必须能过滤，所以自己画。
+        sb.append(".cr-field{display:flex;align-items:center;gap:8px;background:var(--card);");
+        sb.append("border-radius:12px;padding:0 14px;min-height:46px;font-size:14px;color:var(--fg);");
+        sb.append("box-sizing:border-box;}");
+        sb.append(".cr-field:active{opacity:0.7;}");
+        sb.append(".cr-field .crf-v{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;");
+        sb.append("white-space:nowrap;}");
+        sb.append(".cr-field.ph .crf-v{color:var(--sub);}");
+        sb.append(".cr-field .crf-a{flex:0 0 auto;color:var(--sub);font-size:13px;}");
+        sb.append(".cr-field.lock{opacity:0.45;}");
+        // 真正的 <select> 只做「值容器」，不参与显示
+        sb.append(".cr-sel{position:absolute;left:-9999px;top:0;width:1px;height:1px;");
+        sb.append("opacity:0;pointer-events:none;}");
+        sb.append(".pk-mask{position:fixed;left:0;right:0;top:0;bottom:0;background:rgba(0,0,0,0.42);");
+        sb.append("z-index:300;opacity:0;visibility:hidden;transition:opacity 0.2s;}");
+        sb.append(".pk-mask.show{opacity:1;visibility:visible;}");
+        sb.append(".pk-sheet{position:fixed;left:0;right:0;bottom:0;z-index:301;background:var(--bg);");
+        sb.append("border-radius:18px 18px 0 0;max-height:74vh;display:flex;flex-direction:column;");
+        sb.append("transform:translateY(102%);visibility:hidden;");
+        sb.append("transition:transform 0.26s cubic-bezier(.22,.61,.36,1),visibility 0.26s;}");
+        sb.append(".pk-sheet.show{transform:translateY(0);visibility:visible;}");
+        sb.append(".pk-head{display:flex;align-items:center;justify-content:space-between;");
+        sb.append("padding:15px 16px 9px;}");
+        sb.append(".pk-title{font-size:15px;font-weight:600;color:var(--fg);}");
+        sb.append(".pk-cancel{background:none;border:none;padding:2px;font-size:14px;color:#667eea;}");
+        sb.append(".pk-search{padding:0 12px 8px;}");
+        sb.append(".pk-search input{width:100%;box-sizing:border-box;background:var(--card);");
+        sb.append("border:none;border-radius:10px;padding:10px 12px;font-size:14px;color:var(--fg);");
+        sb.append("font-family:inherit;}");
+        sb.append(".pk-list{overflow-y:auto;-webkit-overflow-scrolling:touch;");
+        sb.append("padding:2px 0 calc(12px + env(safe-area-inset-bottom,0px));}");
+        sb.append(".pk-item{display:flex;align-items:center;justify-content:space-between;gap:10px;");
+        sb.append("padding:13px 18px;font-size:14px;color:var(--fg);line-height:1.45;}");
+        sb.append(".pk-item:active{background:rgba(127,127,127,0.13);}");
+        sb.append(".pk-item.on{color:#667eea;font-weight:600;}");
+        sb.append(".pk-ck{display:none;color:#667eea;font-size:14px;flex:0 0 auto;}");
+        sb.append(".pk-item.on .pk-ck{display:block;}");
+        sb.append(".pk-empty{padding:22px;text-align:center;color:var(--sub);font-size:13px;}");
         // WebView 默认会给可点击元素加一层蓝色/灰色高亮，Android 上尤其明显。
         // 一律关掉，按压反馈交给各自的 :active 样式。
         sb.append("*{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;");
@@ -2072,6 +3350,8 @@ public class MainActivity extends AppCompatActivity {
         // 用 box-shadow 而非 border：卡片高度是按 1fr 分配的，
         // border 会把内容区压小导致文字被裁，inset 阴影不占布局尺寸。
         sb.append(".course.conflict{box-shadow:inset 0 0 0 2.5px #FF3B30,0 0 0 1px rgba(255,59,48,0.35);}");
+        // 有意叠加：琥珀色描边，不挂感叹号。用户自己把课压在同一格上，不该像报错。
+        sb.append(".course.overlap{box-shadow:inset 0 0 0 2.5px #F2A24B,0 0 0 1px rgba(242,162,75,0.4);}");
         sb.append(".course.remind-on.conflict{box-shadow:inset 0 0 0 2.5px #FF3B30,");
         sb.append("inset 0 0 0 5px rgba(255,214,71,0.92);}");
         sb.append(".clash-mark{position:absolute;right:4px;bottom:4px;width:15px;height:15px;");
@@ -2082,7 +3362,10 @@ public class MainActivity extends AppCompatActivity {
         sb.append("display:flex;align-items:center;justify-content:center;cursor:pointer;}");
         sb.append("body.adding .empty::after{content:'+';color:#667eea;font-size:20px;font-weight:700;");
         sb.append("line-height:1;opacity:0.75;}");
-        sb.append("body.adding .course{opacity:0.55;}");
+        // 加课模式：已有课的格子同样可点（重叠加课），用虚线描边表示「可叠加」。
+        // 不能沿用 opacity 压暗——那样像禁用状态，而且文字会一起变淡。
+        sb.append("body.adding .course{outline:2.5px dashed #667eea;outline-offset:-2.5px;");
+        sb.append("filter:saturate(0.9);cursor:pointer;}");
         // 顶部提示条
         sb.append(".addbar{display:none;align-items:center;justify-content:space-between;gap:8px;");
         sb.append("margin-top:8px;padding:8px 12px;border-radius:12px;background:rgba(102,126,234,0.12);");
@@ -2222,6 +3505,11 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".cf-del{flex:0 0 auto;background:#FFF0F0;color:#e55;border:none;border-radius:12px;");
         sb.append("padding:13px 18px;font-size:15px;font-weight:600;}");
         sb.append(".cf-tip{font-size:11px;color:var(--sub);margin-top:6px;line-height:1.5;}");
+        // 叠加加课提示（目标格已有课）：琥珀色，与卡片上的叠加描边同一语义
+        sb.append(".cf-overlap{font-size:12px;color:#8A5A12;background:rgba(242,162,75,0.14);");
+        sb.append("border-left:3px solid #F2A24B;border-radius:8px;padding:9px 11px;");
+        sb.append("margin-top:12px;line-height:1.55;}");
+        sb.append("body.dark .cf-overlap{color:#F2C078;background:rgba(242,162,75,0.18);}");
         sb.append(".cc-item{display:flex;align-items:center;gap:10px;padding:12px 0;");
         sb.append("border-bottom:1px solid var(--line);}");
         sb.append(".cc-item:last-child{border-bottom:none;}");
@@ -2244,6 +3532,20 @@ public class MainActivity extends AppCompatActivity {
         sb.append("font-size:13px;opacity:0;pointer-events:none;transition:opacity 0.2s ease;");
         sb.append("z-index:200;max-width:80%;text-align:center;line-height:1.4;}");
         sb.append(".toast.show{opacity:1;}");
+        // ===== 检查更新页 =====
+        sb.append(".up-block{margin-top:16px;background:var(--card);border-radius:12px;padding:14px;}");
+        sb.append(".up-block-title{font-size:13px;font-weight:700;color:var(--fg);margin-bottom:8px;}");
+        sb.append(".up-log{font-size:13px;color:var(--fg);line-height:1.7;");
+        sb.append("white-space:pre-wrap;word-break:break-word;}");
+        sb.append(".up-empty{font-size:13px;color:var(--sub);line-height:1.7;}");
+        // 公告/日志里的【前缀】着色（任务书第五章）
+        sb.append(".up-tag{color:#667eea;font-weight:700;margin-right:2px;}");
+        sb.append("body.dark .up-tag{color:#9AA6FF;}");
+        sb.append(".up-progress{margin-top:16px;}");
+        sb.append(".up-bar{height:8px;border-radius:4px;background:var(--line);overflow:hidden;}");
+        sb.append(".up-bar i{display:block;height:100%;width:0;background:#667eea;");
+        sb.append("transition:width 0.2s ease;}");
+        sb.append(".up-prog-txt{font-size:12px;color:var(--sub);margin-top:6px;text-align:center;}");
         // 空课周提示
         sb.append(".emptyweek{grid-column:1/-1;text-align:center;color:var(--sub);font-size:13px;padding:40px 0;}");
         // 自定义图片背景：卡片/控件半透明，文字保持原色
@@ -2252,7 +3554,7 @@ public class MainActivity extends AppCompatActivity {
         sb.append("body.hasbg .ts{background:rgba(240,240,245,0.62);}");
         sb.append("body.hasbg .empty{background:transparent;}");
         sb.append("body.hasbg .btn{background:rgba(240,240,245,0.62);}");
-        sb.append("body.hasbg .wbtn{background:rgba(240,240,245,0.62);}");
+        sb.append("body.hasbg .btn-nav{background:rgba(240,240,245,0.62);}");
         sb.append("body.hasbg .course{background:transparent;}");
         sb.append("body.hasbg .course::before{content:'';position:absolute;inset:0;");
         sb.append("background:var(--cc);opacity:0.84;z-index:0;}");
@@ -2263,7 +3565,7 @@ public class MainActivity extends AppCompatActivity {
         sb.append("body.hasbg.dark .ts{background:rgba(30,31,42,0.62);}");
         sb.append("body.hasbg.dark .empty{background:transparent;}");
         sb.append("body.hasbg.dark .btn{background:rgba(30,31,42,0.62);}");
-        sb.append("body.hasbg.dark .wbtn{background:rgba(30,31,42,0.62);}");
+        sb.append("body.hasbg.dark .btn-nav{background:rgba(30,31,42,0.62);}");
         sb.append("body.hasbg.dark .course::before{opacity:0.88;}");
         sb.append("body.hasbg.dark .course::after{opacity:0.88;}");
         // 有自定义背景图时弹窗半透明（毛玻璃观感）
@@ -2280,7 +3582,9 @@ public class MainActivity extends AppCompatActivity {
         String theme = store != null ? store.getTheme() : "light";
         String bgName = store != null ? store.getBgImage() : "";
         // ===== 独立设置页样式 =====
-        sb.append(".page{position:fixed;top:0;left:0;right:0;bottom:0;background:var(--bg);z-index:95;");
+        // 页面让出底部标签栏：bottom 不写 0，标签栏才能在任何页面下都露出来
+        sb.append(".page{position:fixed;top:0;left:0;right:0;");
+        sb.append("bottom:calc(56px + env(safe-area-inset-bottom,0px));background:var(--bg);z-index:95;");
         sb.append("display:flex;flex-direction:column;visibility:hidden;transform:translateX(100%);");
         sb.append("transition:transform 0.26s cubic-bezier(.22,.68,.36,1),visibility 0.26s ease;}");
         sb.append(".page.show{visibility:visible;transform:translateX(0);}");
@@ -2316,37 +3620,39 @@ public class MainActivity extends AppCompatActivity {
           .append(hasBg ? " hasbg" : "")
           .append("'>");
 
-        // 头部
+        // 头部：只保留标题 → 日期+周次 → 按钮行（设置已移到「我的」页右上角齿轮）
         sb.append("<div class='header'>");
         sb.append("<h1>石大课表</h1>");
-        sb.append("<div class='toolbar'>");
-        if (week > 1) {
-            sb.append("<button class='wbtn' onclick='Android.onWeekChanged(").append(week - 1).append(")'>◀</button>");
-        } else {
-            sb.append("<button class='wbtn' disabled>◀</button>");
-        }
-        sb.append("<span class='wlabel'>第").append(week).append("周</span>");
-        if (week < totalWeeks) {
-            sb.append("<button class='wbtn' onclick='Android.onWeekChanged(").append(week + 1).append(")'>▶</button>");
-        } else {
-            sb.append("<button class='wbtn' disabled>▶</button>");
-        }
-        sb.append("</div>");
+        // 日期与周次同一行，周次用正文色加粗突出（不再是灰色小字）
+        sb.append("<div class='subline'>");
         if (monday > 0) {
-            sb.append("<div class='wdate'>").append(ScheduleStore.fmtDate(monday)).append(" 起</div>");
+            sb.append("<span class='sdate'>").append(ScheduleStore.fmtDate(monday)).append(" 起</span>");
         }
+        sb.append("<span class='sweek'>第").append(week).append("周</span>");
+        sb.append("</div>");
         if (week == todayWeek) {
             sb.append("<div class='hint'>本周 · 今天 ")
               .append(ScheduleStore.fmtDate(System.currentTimeMillis())).append(" ")
               .append(ScheduleStore.fmtWeekday(System.currentTimeMillis())).append("</div>");
         }
+        // 按钮行：◀ / 刷新课表 / ＋加课 / ▶ —— 四个按钮同一套 .btn 尺寸与圆角
         sb.append("<div class='btns'>");
+        if (week > 1) {
+            sb.append("<button class='btn btn-nav' onclick='Android.onWeekChanged(")
+              .append(week - 1).append(")'>◀</button>");
+        } else {
+            sb.append("<button class='btn btn-nav' disabled>◀</button>");
+        }
         sb.append("<button class='btn' onclick='Android.onRefreshRequested()'>刷新课表</button>");
-        sb.append("<button class='btn' onclick='showSettings()'>设置</button>");
-        // 自定义加课入口：紧挨设置，点一下进入「选位模式」，再点空格子即可填写课程
         sb.append("<button class='btn btn-add' onclick='toggleAddMode()'>＋ 加课</button>");
+        if (week < totalWeeks) {
+            sb.append("<button class='btn btn-nav' onclick='Android.onWeekChanged(")
+              .append(week + 1).append(")'>▶</button>");
+        } else {
+            sb.append("<button class='btn btn-nav' disabled>▶</button>");
+        }
         sb.append("</div>");
-        sb.append("<div class='addbar'><span>点击空白格子添加自定义课程</span>");
+        sb.append("<div class='addbar'><span>点击任意格子添加自定义课程（已有课也可叠加）</span>");
         sb.append("<button onclick='toggleAddMode()'>取消</button></div>");
         sb.append("</div>");
 
@@ -2399,6 +3705,7 @@ public class MainActivity extends AppCompatActivity {
                     JSONObject first = arr.optJSONObject(0);
                     String color = courseColor(first, colorMap);
                     boolean clash = clashCells.contains(cellKey);
+                    boolean overlap = overlapCells.contains(cellKey);
                     // 详情包含该格所有课程（同一时段可能有多门重叠课）
                     String detail = buildCourseDetailArray(arr, week, label, time, color, clash);
                     // 格内所有课程的标识（拖动按整格处理）
@@ -2410,7 +3717,7 @@ public class MainActivity extends AppCompatActivity {
                     }
                     // 与教务课程位置冲突的自定义课：整格描红边，并在右下角挂一个感叹号
                     sb.append("<div class='course")
-                      .append(clash ? " conflict" : "")
+                      .append(clash ? " conflict" : (overlap ? " overlap" : ""))
                       .append("' style='--cc:").append(color)
                       .append(";background:var(--cc);animation-delay:").append((row + d) * 0.05).append("s' data-detail='")
                       .append(detail).append("' data-keys='").append(keysB).append("' data-day='").append(d).append("' data-row='").append(row).append("'>");
@@ -2440,6 +3747,24 @@ public class MainActivity extends AppCompatActivity {
         }
         sb.append("</div>");
 
+        // ===== 底部标签栏（position:fixed，任何页面下都露在底部）=====
+        sb.append("<div class='tabbar'>");
+        sb.append("<button class='tabitem on' id='tabSchedule' onclick='switchTab(\"schedule\")'>课表</button>");
+        sb.append("<button class='tabitem' id='tabMine' onclick='switchTab(\"mine\")'>我的</button>");
+        sb.append("<button class='tabitem' id='tabMore' onclick='switchTab(\"more\")'>更多功能</button>");
+        sb.append("</div>");
+
+        // ===== 通用底部选择面板（校区/教学楼/教室/周次/星期/节次共用）=====
+        // 放在 body 级：.page 是 z-index:95 的滑动层，面板放进去会被它和标签栏压住。
+        sb.append("<div class='pk-mask' id='pkMask' onclick='pkClose()'></div>");
+        sb.append("<div class='pk-sheet' id='pkSheet'>");
+        sb.append("<div class='pk-head'><div class='pk-title' id='pkTitle'>请选择</div>");
+        sb.append("<button class='pk-cancel' onclick='pkClose()'>取消</button></div>");
+        sb.append("<div class='pk-search' id='pkSearchWrap' style='display:none'>");
+        sb.append("<input id='pkSearch' type='search' placeholder='搜索' oninput='pkRender()'></div>");
+        sb.append("<div class='pk-list' id='pkList'></div>");
+        sb.append("</div>");
+
         // 课程详情弹窗：外层 .modal 是「生长的窗口」，内层 .m-inner 是内容（不缩放）
         sb.append("<div class='modal-bg' id='courseModal' onclick='closeModal()'>");
         sb.append("<div class='modal' onclick='event.stopPropagation()'>");
@@ -2448,6 +3773,152 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<div id='cmBody'></div>");
         sb.append("<button class='modal-close' onclick='closeModal()'>关闭</button>");
         sb.append("</div></div></div>");
+
+        // 通用详情弹窗（查询教室/找空教室的卡片共用）
+        sb.append("<div class='modal-bg' id='cdModal' onclick='cdClose()'>");
+        sb.append("<div class='modal' onclick='event.stopPropagation()'>");
+        sb.append("<div class='m-inner'>");
+        sb.append("<h2 id='cdTitle'></h2>");
+        sb.append("<div id='cdBody'></div>");
+        sb.append("<div id='cdActions'></div>");
+        sb.append("<button class='modal-close' onclick='cdClose()'>关闭</button>");
+        sb.append("</div></div></div>");
+
+        // ===== 我的（底部标签之一；右上角齿轮进入设置）=====
+        String stuName = store != null ? store.getStudentName() : "";
+        String stuId = store != null ? store.getStudentId() : "";
+        String stuOwner = store != null ? store.getStudentOwner() : "";
+        // 资料必须与当前登录账号对得上：换了账号、或本地是调试时塞进去的测试数据（owner 为空），
+        // 一律不展示，避免出现「登录后还挂着别人的姓名与学号」。
+        if (savedUser.isEmpty() || !savedUser.equals(stuOwner)) {
+            stuName = "";
+            stuId = "";
+        }
+        // 学号兜底用登录账号：资料还没抓到时不至于空着
+        if (stuId.isEmpty()) stuId = savedUser;
+        String avatarTxt = stuName.isEmpty() ? "我" : stuName.substring(0, 1);
+        sb.append("<div class='page' id='pageMine'>");
+        sb.append("<div class='page-head'><div class='ph-pad'></div>");
+        sb.append("<div class='ph-title'>我的</div>");
+        sb.append("<button class='ph-gear' aria-label='设置' onclick='showSettings()'>")
+          .append(GEAR_SVG).append("</button></div>");
+        sb.append("<div class='page-body'>");
+        sb.append("<div class='me-card'><div class='me-avatar' id='meAvatar'>")
+          .append(esc(avatarTxt)).append("</div>");
+        sb.append("<div class='me-info'><b id='meName'>")
+          .append(esc(stuName.isEmpty() ? "未获取到姓名" : stuName)).append("</b>");
+        sb.append("<i id='meId'>")
+          .append(esc(stuId.isEmpty() ? "学号未获取" : "学号 " + stuId)).append("</i></div></div>");
+        sb.append("<div class='page-hint'>姓名与学号在你登录教务系统时读取，只保存在本机，不上传云端。"
+                + "显示「未获取」时点下面的按钮，或回课表点一次「刷新课表」。</div>");
+        sb.append("<button class='adv-btn' style='width:100%;' onclick='reFetchMe()'>重新获取资料</button>");
+        sb.append("</div></div>");
+
+        // ===== 更多功能 =====
+        sb.append("<div class='page' id='pageMore'>");
+        sb.append("<div class='page-head'><div class='ph-pad'></div>");
+        sb.append("<div class='ph-title'>更多功能</div><div class='ph-pad'></div></div>");
+        sb.append("<div class='page-body'>");
+        sb.append("<div class='nav-card'>");
+        sb.append("<div class='nav-item' onclick='openClassroomQuery()'>");
+        sb.append("<div class='ni-txt'><b>查询教室</b><i>查看某间教室在指定周次的占用情况</i></div>");
+        sb.append("<div class='ni-arrow'>›</div></div>");
+        sb.append("<div class='nav-item' onclick='openEmptyRoom()'>");
+        sb.append("<div class='ni-txt'><b>找空教室</b><i>按校区/教学楼找某时段没课的教室</i></div>");
+        sb.append("<div class='ni-arrow'>›</div></div>");
+        sb.append("</div>");
+        sb.append("<div class='more-empty' id='moreProbe'>其余功能开发中<br>后续会在这里加入实用工具</div>");
+        sb.append("</div></div>");
+
+        // ===== 查询教室（原生表单 + 隐藏 WebView 驱动教务自身的联调逻辑）=====
+        sb.append("<div class='page' id='pageClassroom'>");
+        sb.append("<div class='page-head'><button class='ph-back' onclick='closePage()'>‹</button>");
+        sb.append("<div class='ph-title'>查询教室</div><div class='ph-pad'></div></div>");
+        sb.append("<div class='page-body'>");
+        sb.append("<div class='cr-status' id='crStatus'>正在读取教务端的可选条件…</div>");
+        sb.append("<div id='crForm' style='display:none'>");
+        sb.append("<label class='cf-label'>校区</label>");
+        sb.append("<div class='cr-field ph' id='crCampusF' onclick='crPick(\"crCampus\")'>");
+        sb.append("<span class='crf-v' id='crCampusTxt'>请选择校区</span><span class='crf-a'>›</span></div>");
+        sb.append("<label class='cf-label'>教学楼</label>");
+        sb.append("<div class='cr-field ph' id='crBuildingF' onclick='crPick(\"crBuilding\")'>");
+        sb.append("<span class='crf-v' id='crBuildingTxt'>请选择教学楼</span><span class='crf-a'>›</span></div>");
+        sb.append("<label class='cf-label'>教室</label>");
+        sb.append("<div class='cr-field ph lock' id='crRoomF' onclick='crPick(\"crRoom\")'>");
+        sb.append("<span class='crf-v' id='crRoomTxt'>全部教室</span><span class='crf-a'>›</span></div>");
+        sb.append("<div class='cf-row'>");
+        sb.append("<div><label class='cf-label'>周次</label>");
+        sb.append("<div class='cr-field' id='crWeekF' onclick='crPick(\"crWeek\")'>");
+        sb.append("<span class='crf-v' id='crWeekTxt'>请选择周次</span><span class='crf-a'>›</span></div></div>");
+        sb.append("<div><label class='cf-label'>星期</label>");
+        sb.append("<div class='cr-field' id='crWeekdayF' onclick='crPick(\"crWeekday\")'>");
+        sb.append("<span class='crf-v' id='crWeekdayTxt'>请选择星期</span><span class='crf-a'>›</span></div></div>");
+        sb.append("</div>");
+        sb.append("<div class='cf-row'>");
+        sb.append("<div><label class='cf-label'>起始节次</label>");
+        sb.append("<div class='cr-field' id='crJc1F' onclick='crPick(\"crJc1\")'>");
+        sb.append("<span class='crf-v' id='crJc1Txt'>起始节次</span><span class='crf-a'>›</span></div></div>");
+        sb.append("<div><label class='cf-label'>结束节次</label>");
+        sb.append("<div class='cr-field' id='crJc2F' onclick='crPick(\"crJc2\")'>");
+        sb.append("<span class='crf-v' id='crJc2Txt'>结束节次</span><span class='crf-a'>›</span></div></div>");
+        sb.append("</div>");
+        sb.append("<div class='cf-tip'>教学楼可留空查整校区；不选教室＝看范围内所有教室该时段的占用，选具体教室则只看这一间。</div>");
+        sb.append("<button class='cf-save' style='width:100%;margin-top:14px;' id='crSubmitBtn' onclick='crSubmit()'>查询</button>");
+        sb.append("<div id='crResult'></div>");
+        // 值容器：保留原生 select，让取值/回显逻辑只有一处
+        sb.append("<div class='cr-sel'>");
+        sb.append("<select id='crCampus' onchange='crPickCampus()'></select>");
+        sb.append("<select id='crBuilding' onchange='crPickBuilding()'></select>");
+        sb.append("<select id='crRoom'></select>");
+        sb.append("<select id='crWeek'></select>");
+        sb.append("<select id='crWeekday'></select>");
+        sb.append("<select id='crJc1'></select><select id='crJc2'></select>");
+        sb.append("</div>");
+        sb.append("</div>");
+        sb.append("</div></div>");
+
+        // ===== 找空教室（复用同一个隐藏 WebView 与查询通道，只是解析结果取反）=====
+        sb.append("<div class='page' id='pageEmpty'>");
+        sb.append("<div class='page-head'><button class='ph-back' onclick='closePage()'>‹</button>");
+        sb.append("<div class='ph-title'>找空教室</div><div class='ph-pad'></div></div>");
+        sb.append("<div class='page-body'>");
+        sb.append("<div class='cr-status' id='eqStatus'>正在读取教务端的可选条件…</div>");
+        sb.append("<div id='eqForm' style='display:none'>");
+        sb.append("<label class='cf-label'>校区</label>");
+        sb.append("<div class='cr-field ph' id='eqCampusF' onclick='crPick(\"eqCampus\")'>");
+        sb.append("<span class='crf-v' id='eqCampusTxt'>请选择校区</span><span class='crf-a'>›</span></div>");
+        sb.append("<label class='cf-label'>教学楼</label>");
+        sb.append("<div class='cr-field ph' id='eqBuildingF' onclick='crPick(\"eqBuilding\")'>");
+        sb.append("<span class='crf-v' id='eqBuildingTxt'>全部教学楼（整校区）</span><span class='crf-a'>›</span></div>");
+        sb.append("<div class='cf-row'>");
+        sb.append("<div><label class='cf-label'>周次</label>");
+        sb.append("<div class='cr-field' id='eqWeekF' onclick='crPick(\"eqWeek\")'>");
+        sb.append("<span class='crf-v' id='eqWeekTxt'>请选择周次</span><span class='crf-a'>›</span></div></div>");
+        sb.append("<div><label class='cf-label'>星期</label>");
+        sb.append("<div class='cr-field' id='eqWeekdayF' onclick='crPick(\"eqWeekday\")'>");
+        sb.append("<span class='crf-v' id='eqWeekdayTxt'>请选择星期</span><span class='crf-a'>›</span></div></div>");
+        sb.append("</div>");
+        sb.append("<div class='cf-row'>");
+        sb.append("<div><label class='cf-label'>起始节次</label>");
+        sb.append("<div class='cr-field' id='eqJc1F' onclick='crPick(\"eqJc1\")'>");
+        sb.append("<span class='crf-v' id='eqJc1Txt'>起始节次</span><span class='crf-a'>›</span></div></div>");
+        sb.append("<div><label class='cf-label'>结束节次</label>");
+        sb.append("<div class='cr-field' id='eqJc2F' onclick='crPick(\"eqJc2\")'>");
+        sb.append("<span class='crf-v' id='eqJc2Txt'>结束节次</span><span class='crf-a'>›</span></div></div>");
+        sb.append("</div>");
+        sb.append("<div class='cf-tip'>按所选校区/教学楼统计该时段没课的教室；教学楼留空即查整校区"
+                + "（范围大，教务返回会慢一些）。</div>");
+        sb.append("<button class='cf-save' style='width:100%;margin-top:14px;' id='eqSubmitBtn' onclick='eqSubmit()'>查找空教室</button>");
+        sb.append("<div id='eqResult'></div>");
+        sb.append("<div class='cr-sel'>");
+        sb.append("<select id='eqCampus' onchange='crPickCampusFor(\"eqBuilding\")'></select>");
+        sb.append("<select id='eqBuilding' onchange='eqPickBuilding()'></select>");
+        sb.append("<select id='eqWeek'></select>");
+        sb.append("<select id='eqWeekday'></select>");
+        sb.append("<select id='eqJc1'></select><select id='eqJc2'></select>");
+        sb.append("</div>");
+        sb.append("</div>");
+        sb.append("</div></div>");
 
         // ===== 设置页（独立页面，从右侧滑入）=====
         // 一级：设置列表
@@ -2462,6 +3933,8 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<i>课表背景、开屏动画、桌面小组件、课程布局</i></div><div class='ni-arrow'>›</div></div>");
         sb.append("<div class='nav-item' onclick='openSub(\"custom\")'><div class='ni-txt'><b>自定义课程</b>");
         sb.append("<i>管理自己添加的课程，与教务课表互不影响</i></div><div class='ni-arrow'>›</div></div>");
+        sb.append("<div class='nav-item' onclick='openSub(\"update\")'><div class='ni-txt'><b>检查更新</b>");
+        sb.append("<i>检查新版本、查看更新内容与公告</i></div><div class='ni-arrow'>›</div></div>");
         sb.append("<div class='nav-item' onclick='openSub(\"about\")'><div class='ni-txt'><b>关于</b>");
         sb.append("<i>开发信息、开源地址与作者联系方式</i></div><div class='ni-arrow'>›</div></div>");
         sb.append("</div>");
@@ -2518,8 +3991,8 @@ public class MainActivity extends AppCompatActivity {
         String cp = store != null ? store.getConflictPriority() : "school";
         sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
         sb.append("<div><div class='si-label'>位置冲突时优先显示</div>");
-        sb.append("<div class='si-desc'>自定义课程与教务课程落在同一格时，卡片主色与地点按这里的顺序取值；");
-        sb.append("冲突格始终描红边框</div></div>");
+        sb.append("<div class='si-desc'>自定义课程与教务课程落在同一格时，卡片主色与地点按这里的顺序取值。");
+        sb.append("自己叠加的课用<b style='color:#C1801F'>琥珀色</b>描边，教务同步后撞上的用<b style='color:#E5533D'>红色</b>描边</div></div>");
         sb.append("<div style='display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;'>");
         sb.append("<button class='adv-btn' id='cpSchool' onclick='setConflictPriority(\"school\")'>教务课程优先</button>");
         sb.append("<button class='adv-btn' id='cpCustom' onclick='setConflictPriority(\"custom\")'>自定义课程优先</button>");
@@ -2536,6 +4009,41 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<div class='si-desc'>保存最近一次教务系统课表页面及解析结果，便于排查漏课。文件可能包含课程和个人信息，请勿公开传播。</div></div>");
         sb.append("<button class='adv-btn' style='margin-top:10px;width:100%;' onclick='Android.onExportScheduleCapture()'>保存抓取数据</button>");
         sb.append("</div>");
+        sb.append("</div></div>");
+
+        // 二级：检查更新
+        // 骨架固定、数据由 JS 填：无论首次打开还是切周后重渲染，元素集合都一致，
+        // 不会出现「检查到新版本却不显示更新日志/没有立即更新按钮」的情况（v1.4.1 的 bug）。
+        String updCurVer = currentVersionName();
+        sb.append("<div class='page' id='pageUpdate'>");
+        sb.append("<div class='page-head'><button class='ph-back' onclick='closePage()'>‹</button>");
+        sb.append("<div class='ph-title'>检查更新</div><div class='ph-pad'></div></div>");
+        sb.append("<div class='page-body'>");
+        sb.append("<div class='settings-item'><div><div class='si-label'>当前版本</div>");
+        sb.append("<div class='si-desc'>v").append(esc(updCurVer)).append("</div></div>");
+        sb.append("<button class='adv-btn' id='upBtn' onclick='Android.onCheckUpdate()'>检查更新</button></div>");
+        // 最新版本行：按钮默认隐藏，检查到新版本后由 renderUpdateInfo 显示
+        sb.append("<div class='settings-item'><div><div class='si-label'>最新版本</div>");
+        sb.append("<div class='si-desc' id='upLatest'>—</div>");
+        sb.append("<div class='si-desc' id='upMeta' style='display:none'></div></div>");
+        sb.append("<button class='adv-btn' id='upDlBtn' style='display:none;");
+        sb.append("background:#667eea;color:#fff;border-color:#667eea;font-weight:600;' ");
+        sb.append("onclick='Android.onDownloadUpdate()'>立即更新</button></div>");
+        // 更新内容：默认空态提示，检查到结果后由 JS 填 changelog（换行由 pre-wrap 保留）
+        sb.append("<div class='up-block'><div class='up-block-title'>更新内容</div>");
+        sb.append("<div class='up-empty' id='upLog'>点击右上角「检查更新」从服务器获取最新版本的更新内容。</div></div>");
+        // 公告区：内容为空时整体隐藏
+        sb.append("<div class='up-block' id='upContentBox' style='display:none'>");
+        sb.append("<div class='up-block-title'>公告</div>");
+        sb.append("<div class='up-log' id='upContent'></div></div>");
+        // 下载进度条 + 取消按钮
+        sb.append("<div class='up-progress' id='upProgBox' style='display:none'>");
+        sb.append("<div class='up-bar'><i id='upBar'></i></div>");
+        sb.append("<div class='up-prog-txt' id='upProgTxt'>0%</div></div>");
+        sb.append("<button class='adv-btn' id='upCancelBtn' style='display:none;margin-top:10px;width:100%;");
+        sb.append("background:#FFF0F0;color:#e55;' onclick='Android.onCancelDownload()'>取消下载</button>");
+        // 缓存数据不在这里内联渲染：本段 HTML 位于主 <script> 之前，函数还没定义。
+        // 回填统一走 openSub('update') → Android.onUpdatePageOpened() 推送。
         sb.append("</div></div>");
 
         // 二级：自定义课程管理
@@ -2575,6 +4083,8 @@ public class MainActivity extends AppCompatActivity {
             sb.append("<option value='").append(r).append("'>第").append(pl).append("</option>");
         }
         sb.append("</select></div></div>");
+        // 目标格已有课时提示「这是叠加加课」，由 openCustomForm 按 occupied 决定是否显示
+        sb.append("<div class='cf-overlap' id='cfOverlapTip' style='display:none'></div>");
         // 重复方式：仅本周（单次卡片） / 按周次（可填 1-16、3,5,7 等）
         sb.append("<label class='cf-label'>重复方式</label>");
         sb.append("<div class='cf-seg'><button class='cf-seg-item' id='cfRepWeek' onclick='pickRepeat(\"week\")'>仅本周一次</button>");
@@ -2624,6 +4134,7 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<div class='kv'><span>核心逻辑</span><b>CAS 单点登录 → 教务 DOM 解析课表 → 本地离线存储 → 周课表渲染 + 桌面小组件</b></div>");
         sb.append("<div class='kv'><span>数据存储</span><b>课表与配置存本机，密码经 Android Keystore 加密</b></div>");
         sb.append("<div class='kv'><span>兼容版本</span><b>Android 7.0 及以上（API 24+）</b></div>");
+        sb.append("<div class='kv'><span>自动更新</span><b>启动后每天检查一次；安装包下载后校验 SHA-256，再交系统安装器</b></div>");
         sb.append("</div>");
         // 作者与开源
         sb.append("<div class='about-card'>");
@@ -2633,9 +4144,10 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<div class='kv'><span>微信</span><b class='tap' onclick='copyTxt(\"m1SuCode\")'>m1SuCode</b></div>");
         sb.append("<div class='kv'><span>邮箱</span><b class='tap' onclick='copyTxt(\"19633187@qq.com\")'>19633187@qq.com</b></div>");
         sb.append("<div class='kv'><span>GitHub</span><b class='tap' onclick='copyTxt(\"https://github.com/DoGeMisu/shzu-schedule\")'>DoGeMisu / shzu-schedule</b></div>");
+        sb.append("<div class='kv'><span>个人站点</span><b class='tap' onclick='copyTxt(\"https://misuhub.cc.cd\")'>misuhub.cc.cd</b></div>");
         sb.append("<div class='kv'><span>开源协议</span><b>MIT License</b></div>");
         sb.append("</div>");
-        sb.append("<div class='about-note'>点击 QQ / 微信 / 邮箱 / GitHub 可复制。本项目为在校学生利用课余时间出于学习目的独立开发维护，不收取任何费用，请勿用于商业用途。</div>");
+        sb.append("<div class='about-note'>点击 QQ / 微信 / 邮箱 / GitHub / 个人站点可复制。本项目为在校学生利用课余时间出于学习目的独立开发维护，不收取任何费用，请勿用于商业用途。</div>");
         sb.append("</div></div>");
 
         // 拖动模式底部操作栏
@@ -2648,6 +4160,8 @@ public class MainActivity extends AppCompatActivity {
         // JS
         sb.append("<script>");
         sb.append("var CUR_WEEK=").append(week).append(";");
+        // 查询教室的默认条件：当前周 / 今天 / 第1大节起（注入 todayDow，免去用户逐项选）
+        sb.append("var TODAY_DOW=").append(todayDow).append(";");
         // ===== 轻量 toast（不依赖原生 Toast，错误提示不会打断操作）=====
         sb.append("function toast(msg){");
         sb.append("  var t=document.getElementById('toastBox');");
@@ -2660,10 +4174,18 @@ public class MainActivity extends AppCompatActivity {
         sb.append("function toggleAddMode(){");
         sb.append("  addMode=!addMode;");
         sb.append("  document.body.classList.toggle('adding',addMode);");
-        sb.append("  if(addMode)toast('点一下空白格子，选择位置');}");
+        sb.append("  if(addMode)toast('点任意格子选位置，已有课也能叠加');}");
         sb.append("function onEmptyClick(ev,d,r){");
         sb.append("  if(!addMode)return;");
         sb.append("  ev.stopPropagation();");
+        sb.append("  addMode=false;");
+        sb.append("  document.body.classList.remove('adding');");
+        sb.append("  Android.onPickCell(d,r);}");
+        // 已有课的格子：加课模式下点卡片 = 在这一格叠加一门课（不再打开详情）
+        sb.append("function onCardPick(el){");
+        sb.append("  var d=parseInt(el.getAttribute('data-day')||'0',10);");
+        sb.append("  var r=parseInt(el.getAttribute('data-row')||'0',10);");
+        sb.append("  if(d<1||r<1)return;");
         sb.append("  addMode=false;");
         sb.append("  document.body.classList.remove('adding');");
         sb.append("  Android.onPickCell(d,r);}");
@@ -2699,6 +4221,12 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  g('cfName').value=d.name||'';");
         sb.append("  g('cfDay').value=String(d.day||1);");
         sb.append("  g('cfRow').value=String(d.row||1);");
+        // 目标格已有课 → 说明这是叠加加课（occupied 由 Java 侧按当前周统计后传入）
+        sb.append("  var ot=g('cfOverlapTip');");
+        sb.append("  if(ot){var oc=parseInt(d.occupied||'0',10)||0;");
+        sb.append("    if(oc>0){ot.style.display='block';");
+        sb.append("      ot.textContent='该时段已有 '+oc+' 门课，保存后会叠加显示在同一格，并用琥珀色描边标记。';}");
+        sb.append("    else{ot.style.display='none';ot.textContent='';}}");
         sb.append("  var wk=(d.weeks||'').trim();");
         sb.append("  g('cfWeeks').value=wk;");
         // 周次恰好是「当前显示周」的单值 → 视为单次卡片，其余走按周次
@@ -2836,6 +4364,8 @@ public class MainActivity extends AppCompatActivity {
         sb.append("document.querySelectorAll('.course').forEach(function(el){");
         sb.append("  el.addEventListener('touchstart',function(e){");
         sb.append("    if(dragEl)return;");
+        // 加课模式下禁掉长按浮起：否则停手 700ms 会误进入拖动，与「点格子加课」冲突
+        sb.append("    if(addMode)return;");
         sb.append("    var card=this;");
         sb.append("    pressX=e.touches[0].clientX;pressY=e.touches[0].clientY;");
         sb.append("    if(dragMode){startLift(card);}");
@@ -2860,7 +4390,9 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  },false);");
         sb.append("  el.addEventListener('click',function(){");
         sb.append("    if(didDrag){didDrag=false;return;}");
-        sb.append("    if(dragMode||addMode)return;");
+        sb.append("    if(dragMode)return;");
+        // 加课模式下点卡片：走「在这一格叠加」分支
+        sb.append("    if(addMode){onCardPick(this);return;}");
         sb.append("    var d=this.getAttribute('data-detail');");
         // 取 rect 时若入场动画(popIn)还在播，scale 会让 getBoundingClientRect
         // 返回缩放后的矩形，窗口起点就算错了。
@@ -3040,19 +4572,417 @@ public class MainActivity extends AppCompatActivity {
         sb.append("var pageStack=[];");
         sb.append("function openPage(id){var p=document.getElementById(id);if(!p)return;");
         sb.append("  p.classList.add('show');pageStack.push(id);}");
+        // 跨功能跳转用：openPage 不会隐藏上一个页面，若目标页在 DOM 里更靠前
+        // （查询教室就排在找空教室之前），旧页会盖在上面，看起来像没跳转。
+        sb.append("function gotoPage(id){");
+        sb.append("  var ps=document.querySelectorAll('.page');");
+        sb.append("  for(var i=0;i<ps.length;i++)ps[i].classList.remove('show');");
+        sb.append("  pageStack.length=0;openPage(id);}");
         sb.append("function closePage(){var id=pageStack.pop();if(!id)return;");
-        sb.append("  var p=document.getElementById(id);if(p)p.classList.remove('show');}");
+        sb.append("  var p=document.getElementById(id);if(p)p.classList.remove('show');");
+        // 关页后同步底部标签：栈空了就回到「课表」，栈顶是我的/更多则保持对应标签
+        sb.append("  syncTabWithStack();}");
+        // ===== 底部标签栏 =====
+        sb.append("function updateTabs(t){");
+        sb.append("  var ids={schedule:'tabSchedule',mine:'tabMine',more:'tabMore'};");
+        sb.append("  for(var k in ids){var el=document.getElementById(ids[k]);");
+        sb.append("    if(el)el.classList.toggle('on',k===t);}}");
+        sb.append("function syncTabWithStack(){");
+        sb.append("  var top=pageStack.length?pageStack[pageStack.length-1]:'';");
+        sb.append("  if(top==='pageMine')updateTabs('mine');");
+        sb.append("  else if(top==='pageMore')updateTabs('more');");
+        sb.append("  else if(!pageStack.length)updateTabs('schedule');}");
+        sb.append("function switchTab(t){");
+        sb.append("  while(pageStack.length){closePage();}");
+        sb.append("  if(t==='mine')openPage('pageMine');");
+        sb.append("  else if(t==='more')openPage('pageMore');");
+        // 打开「我的」时用本地最新资料刷新卡片：
+        // 启动时可能还没抓到姓名（要等教务首页），之后课表页不再重渲染，卡片会停在空态。
+        sb.append("  if(t==='mine'&&window.Android&&Android.onMineTabOpened)Android.onMineTabOpened();");
+        sb.append("  updateTabs(t);}");
+        // 我的页「重新获取资料」：先回课表再触发刷新，避免用户停在覆盖页看不到进度
+        sb.append("function refreshAndBack(){switchTab('schedule');Android.onRefreshRequested();}");
+        // 「重新获取资料」：直接去教务首页抓姓名/学号（不必刷新整个课表，也不必退出重登）
+        sb.append("function reFetchMe(){Android.onRefreshStudentInfo();}");
+        // 更多功能 → 查询教室
+        sb.append("function openClassroomQuery(){openPage('pageClassroom');");
+        sb.append("  if(window.Android&&Android.onClassroomQueryOpened)Android.onClassroomQueryOpened();}");
+        // ===== 查询教室：表单渲染（数据由 Java 侧的隐藏 WebView 从教务取回）=====
+        sb.append("function crEsc(s){return String(s==null?'':s).replace(/&/g,'&amp;')");
+        sb.append("  .replace(/</g,'&lt;').replace(/>/g,'&gt;');}");
+        sb.append("function crFill(id,arr,ph){var s=document.getElementById(id);if(!s)return;");
+        sb.append("  var h=ph?\"<option value=''>\"+crEsc(ph)+\"</option>\":'';");
+        sb.append("  for(var i=0;i<(arr||[]).length;i++){h+=\"<option value='\"+crEsc(arr[i].v)+\"'>\"+crEsc(arr[i].t)+\"</option>\";}");
+        sb.append("  s.innerHTML=h;crSync(id);}");
+        // 选择行只是「显示器」，值仍存在原生 select 里：显示与取值永远同步，避免两边各存一份状态
+        sb.append("function crSync(id){var s=document.getElementById(id),t=document.getElementById(id+'Txt');");
+        sb.append("  if(!s||!t)return;var i=s.selectedIndex,txt='',ph=true;");
+        sb.append("  if(i>=0&&s.options[i]){txt=(s.options[i].text||'').replace(/\\s+/g,' ').trim();ph=!s.value;}");
+        sb.append("  if(!txt)txt=(id==='crRoom'?'全部教室':'请选择');");
+        sb.append("  t.textContent=txt;var f=document.getElementById(id+'F');");
+        sb.append("  if(f){if(ph)f.classList.add('ph');else f.classList.remove('ph');}}");
+        // ===== 底部选择面板（替代系统下拉）=====
+        sb.append("var PK={id:'',items:[],sel:''};");
+        sb.append("var PK_TITLE={crCampus:'选择校区',crBuilding:'选择教学楼',crRoom:'选择教室',");
+        sb.append("crWeek:'选择周次',crWeekday:'选择星期',crJc1:'起始节次',crJc2:'结束节次',");
+        sb.append("eqCampus:'选择校区',eqBuilding:'选择教学楼',eqWeek:'选择周次',");
+        sb.append("eqWeekday:'选择星期',eqJc1:'起始节次',eqJc2:'结束节次'};");
+        // 占位项（请选择/读取中/请先选择）不进可选列表；
+        // 「全部教室」「全部教学楼（整校区）」这类空值选项是真实选择，必须保留。
+        sb.append("function pkPlaceholder(t){return /请选择|读取中|请先选择/.test(t||'');}");
+        sb.append("function crPick(id){");
+        sb.append("  var s=document.getElementById(id);if(!s)return;");
+        sb.append("  var f=document.getElementById(id+'F');");
+        sb.append("  if(f&&f.classList.contains('lock')){toast('正在读取教室清单，请稍候');return;}");
+        sb.append("  var items=[];for(var i=0;i<s.options.length;i++){var o=s.options[i];");
+        // 空值项是占位符（「请选择校区」「读取中…」），不该出现在可选列表里；
+        // 只有教室的「全部教室（整栋楼）」是真正的空值选项，要保留。
+        sb.append("    if(!o.value&&pkPlaceholder(o.text))continue;items.push({v:o.value,t:o.text});}");
+        sb.append("  if(!items.length){toast('暂无可选项');return;}");
+        sb.append("  PK.id=id;PK.items=items;PK.sel=s.value;");
+        sb.append("  var tt=document.getElementById('pkTitle');if(tt)tt.textContent=PK_TITLE[id]||'请选择';");
+        sb.append("  var sw=document.getElementById('pkSearchWrap');if(sw)sw.style.display=items.length>8?'block':'none';");
+        sb.append("  var q=document.getElementById('pkSearch');if(q)q.value='';");
+        sb.append("  pkRender();");
+        sb.append("  document.getElementById('pkMask').classList.add('show');");
+        sb.append("  document.getElementById('pkSheet').classList.add('show');");
+        sb.append("  var l=document.getElementById('pkList');if(l)l.scrollTop=0;}");
+        sb.append("function pkRender(){");
+        sb.append("  var box=document.getElementById('pkList');if(!box)return;");
+        sb.append("  var q=(document.getElementById('pkSearch').value||'').trim().toLowerCase();");
+        sb.append("  var h='',n=0;");
+        sb.append("  for(var i=0;i<PK.items.length;i++){var it=PK.items[i];");
+        sb.append("    if(q&&(String(it.t)+' '+it.v).toLowerCase().indexOf(q)<0)continue;n++;");
+        sb.append("    h+=\"<div class='pk-item\"+(it.v===PK.sel?' on':'')+\"' onclick='pkChoose(\"+i+\")'>\"");
+        sb.append("      +\"<span>\"+crEsc(it.t)+\"</span><span class='pk-ck'>✓</span></div>\";}");
+        sb.append("  box.innerHTML=n?h:\"<div class='pk-empty'>没有匹配的选项</div>\";}");
+        sb.append("function pkChoose(i){var it=PK.items[i];if(!it)return;");
+        sb.append("  var id=PK.id,s=document.getElementById(id);");
+        sb.append("  pkClose();");
+        sb.append("  if(!s)return;s.value=it.v;crSync(id);");
+        // 选完要按字段类型做后续动作：校区→拉教学楼；教学楼→拉教室（仅查询教室页需要）
+        sb.append("  if(id==='crCampus')crPickCampus();");
+        sb.append("  else if(id==='crBuilding')crPickBuilding();");
+        sb.append("  else if(id==='eqCampus')crPickCampusFor('eqBuilding');}");
+        sb.append("function pkClose(){var m=document.getElementById('pkMask'),sh=document.getElementById('pkSheet');");
+        sb.append("  if(m)m.classList.remove('show');if(sh)sh.classList.remove('show');");
+        // 搜索框保持焦点会把软键盘留到面板关闭之后，必须主动失焦
+        sb.append("  var q=document.getElementById('pkSearch');if(q&&q.blur)q.blur();");
+        sb.append("  var a=document.activeElement;if(a&&a.blur&&a!==document.body)a.blur();}");
+        sb.append("function pkOpen(){var sh=document.getElementById('pkSheet');");
+        sb.append("  return !!(sh&&sh.classList.contains('show'));}");
+        // ===== 选项填充：两个页面共用教务返回的同一份选项 =====
+        sb.append("function crSetOptions(o){");
+        sb.append("  var g=function(id){return document.getElementById(id);};");
+        sb.append("  var st=g('crStatus'),f=g('crForm'),es=g('eqStatus'),ef=g('eqForm');");
+        sb.append("  if(!o||!o.campus||!o.campus.length){");
+        sb.append("    var m='读取失败：请先在课表页点一次「刷新课表」完成登录，再回来查询。';");
+        sb.append("    if(st)st.textContent=m;if(es)es.textContent=m;return;}");
+        // 选项只填一次：两个页面共用同一份教务选项，重复填充会把用户已选的
+        // 校区/教学楼/周次全部清回占位符（切页面就丢条件）。
+        sb.append("  if(window.__clsOpts){");
+        sb.append("    if(st)st.style.display='none';if(f)f.style.display='block';");
+        sb.append("    if(es)es.style.display='none';if(ef)ef.style.display='block';return;}");
+        sb.append("  window.__clsOpts=1;");
+        sb.append("  crFill('crCampus',o.campus,'请选择校区');");
+        sb.append("  crFill('crWeek',o.week,'请选择周次');");
+        sb.append("  crFill('crWeekday',o.weekday,'请选择星期');");
+        sb.append("  crFill('crJc1',o.jc,'起始节次');crFill('crJc2',o.jc,'结束节次');");
+        sb.append("  crSetRoom([]);");
+        sb.append("  crFill('eqCampus',o.campus,'请选择校区');");
+        sb.append("  crFill('eqWeek',o.week,'请选择周次');");
+        sb.append("  crFill('eqWeekday',o.weekday,'请选择星期');");
+        sb.append("  crFill('eqJc1',o.jc,'起始节次');crFill('eqJc2',o.jc,'结束节次');");
+        sb.append("  eqSetBuildings([]);");
+        // 默认：当前显示周 / 今天 / 第 1 大节（用户通常只需选校区）
+        sb.append("  var pref=[['crWeek','crWeekday','crJc1','crJc2'],['eqWeek','eqWeekday','eqJc1','eqJc2']];");
+        sb.append("  for(var pi=0;pi<pref.length;pi++){var ids=pref[pi];");
+        sb.append("    var w=g(ids[0]);if(w&&window.CUR_WEEK)w.value=String(CUR_WEEK);");
+        sb.append("    var wd=g(ids[1]);if(wd&&window.TODAY_DOW)wd.value=String(TODAY_DOW);");
+        sb.append("    var j1=g(ids[2]);if(j1&&j1.options.length>1)j1.value=j1.options[1].value;");
+        sb.append("    var j2=g(ids[3]);if(j2&&j2.options.length>1)j2.value=j2.options[1].value;");
+        sb.append("    crSync(ids[0]);crSync(ids[1]);crSync(ids[2]);crSync(ids[3]);}");
+        sb.append("  if(st)st.style.display='none';if(f)f.style.display='block';");
+        sb.append("  if(es)es.style.display='none';if(ef)ef.style.display='block';}");
+        sb.append("function crPickCampus(){crPickCampusFor('crBuilding');}");
+        // 选校区 → 拉教学楼。targetId 决定填到哪个页面的下拉：
+        // 两个功能共用一个隐藏 WebView，不能让结果一律写回查询教室页。
+        sb.append("function crPickCampusFor(targetId){");
+        sb.append("  var cid=(targetId==='eqBuilding')?'eqCampus':'crCampus';");
+        sb.append("  var cv=document.getElementById(cid).value;");
+        sb.append("  if(targetId==='crBuilding')crSetRoom([]);");
+        sb.append("  var b=document.getElementById(targetId);");
+        sb.append("  if(cv){if(b)b.innerHTML=\"<option value=''>读取中…</option>\";crSync(targetId);");
+        sb.append("    Android.onClassroomCampus(cv,targetId);}");
+        sb.append("  else if(b){b.innerHTML=\"<option value=''>请先选择校区</option>\";crSync(targetId);}}");
+        // 教学楼列表：首项是「整校区」（value 为空），与整栋楼查询共用同一套表单
+        sb.append("function crSetBuildings(a,targetId){");
+        sb.append("  var id=targetId||'crBuilding',s=document.getElementById(id);if(!s)return;");
+        sb.append("  var h=\"<option value=''>全部教学楼（整校区）</option>\";");
+        sb.append("  for(var i=0;i<(a||[]).length;i++){");
+        sb.append("    h+=\"<option value='\"+crEsc(a[i].v)+\"'>\"+crEsc(a[i].t)+\"</option>\";}");
+        sb.append("  s.innerHTML=h;crSync(id);}");
+        sb.append("function eqSetBuildings(a){crSetBuildings(a,'eqBuilding');}");
+        sb.append("function crPickBuilding(){");
+        sb.append("  var v=document.getElementById('crBuilding').value;");
+        sb.append("  crSetRoom([]);");
+        sb.append("  if(v){crRoomLoading();Android.onClassroomRooms(v);}}");
+        sb.append("function crRoomLoading(){var s=document.getElementById('crRoom');if(!s)return;");
+        sb.append("  s.innerHTML=\"<option value=''>读取中…</option>\";crSync('crRoom');");
+        sb.append("  var f=document.getElementById('crRoomF');if(f)f.classList.add('lock');}");
+        sb.append("function crSetRoom(a){var s=document.getElementById('crRoom');if(!s)return;");
+        sb.append("  var bs=document.getElementById('crBuilding');");
+        sb.append("  var scope=(bs&&bs.value)?'全部教室（本教学楼）':'全部教室（整校区）';");
+        sb.append("  var h=\"<option value=''>\"+scope+\"</option>\";");
+        sb.append("  for(var i=0;i<(a||[]).length;i++){");
+        sb.append("    h+=\"<option value='\"+crEsc(a[i].v)+\"'>\"+crEsc(a[i].t)+\"</option>\";}");
+        sb.append("  s.innerHTML=h;crSync('crRoom');");
+        // 即使这栋楼没列出教室，也要允许打开（面板里还有「全部教室」一项）
+        sb.append("  var f=document.getElementById('crRoomF');if(f)f.classList.remove('lock');}");
+        sb.append("function crSubmit(){");
+        sb.append("  var g=function(id){return document.getElementById(id);};");
+        sb.append("  var campus=g('crCampus').value,bld=g('crBuilding').value;");
+        sb.append("  var wk=g('crWeek').value,wd=g('crWeekday').value,j1=g('crJc1').value,j2=g('crJc2').value;");
+        sb.append("  if(!campus){toast('请选择校区');return;}");
+        sb.append("  if(!wk){toast('请选择周次');return;}");
+        sb.append("  var ot=function(id){var e=g(id);return e&&e.selectedIndex>=0?e.options[e.selectedIndex].text:'';};");
+        sb.append("  var room=g('crRoom')?g('crRoom').value:'',roomName=g('crRoom')?ot('crRoom'):'';");
+        sb.append("  window.__crPeriod=ot('crJc1')+'-'+ot('crJc2');");
+        sb.append("  window.__crQuery=(ot('crWeek')+' '+ot('crWeekday')+' 节次'+window.__crPeriod)");
+        sb.append("    .replace(/\\s+/g,' ').trim();");
+        sb.append("  window.__crQuery+=(bld?(' · '+ot('crBuilding')):' · 整校区');");
+        sb.append("  if(room)window.__crQuery+=' · '+roomName;");
+        sb.append("  var btn=g('crSubmitBtn');if(btn){btn.disabled=true;btn.textContent='查询中…';}");
+        sb.append("  var r=g('crResult');if(r)r.innerHTML=\"<div class='cr-status'>正在向教务系统查询…</div>\";");
+        sb.append("  Android.onClassroomQuery(campus,bld,wk,wd,j1,j2,room,roomName);}");
+        sb.append("function crShowResult(o){");
+        sb.append("  var btn=document.getElementById('crSubmitBtn');");
+        sb.append("  if(btn){btn.disabled=false;btn.textContent='查询';}");
+        sb.append("  var r=document.getElementById('crResult');if(!r)return;");
+        sb.append("  if(!o){r.innerHTML=\"<div class='cr-status'>没有查询到结果</div>\";return;}");
+        sb.append("  var list=o.list||[];window.__crList=list;");
+        sb.append("  if(list.length){");
+        sb.append("    var cond=window.__crQuery?crEsc(window.__crQuery)+' · ':'';");
+        sb.append("    var h=\"<div class='cr-status'>\"+cond+\"共 \"+list.length+\" 条占用记录（点卡片看详情）</div>\";");
+        sb.append("    for(var i=0;i<list.length;i++){var it=list[i];");
+        sb.append("      h+=\"<div class='cr-card' onclick='crCardInfo(\"+i+\")'><div class='ch'><b>\"");
+        sb.append("        +crEsc(it.room)+\"</b>\";");
+        sb.append("      h+=\"<span>\"+crEsc(it.day)+\"</span></div><div class='cb'>\";");
+        sb.append("      for(var j=0;j<it.lines.length;j++){");
+        sb.append("        h+=(j===0?\"<em>\"+crEsc(it.lines[j])+\"</em>\":crEsc(it.lines[j]));");
+        sb.append("        if(j<it.lines.length-1)h+='<br>';}");
+        sb.append("      h+=\"</div></div>\";}");
+        sb.append("    r.innerHTML=h;return;}");
+        sb.append("  if(o.html){");
+        sb.append("    r.innerHTML=\"<div class='cr-status'>未识别出卡片，以下为教务原始结果</div>\"");
+        sb.append("      +\"<div class='cr-raw'>\"+o.html+\"</div>\";return;}");
+        sb.append("  r.innerHTML=\"<div class='cr-status'>\"+crEsc(o.msg||'没有查询到结果')+\"</div>\";}");
+        // ===== 卡片详情（两个教室功能共用同一个弹窗）=====
+        sb.append("function cdShow(title,rows,actionHtml){");
+        sb.append("  var m=document.getElementById('cdModal');if(!m)return;");
+        sb.append("  var tt=document.getElementById('cdTitle');if(tt)tt.textContent=title||'详情';");
+        sb.append("  var h='';");
+        sb.append("  for(var i=0;i<rows.length;i++){var row=rows[i];");
+        sb.append("    if(!row||row[1]===undefined||row[1]===null||row[1]==='')continue;");
+        sb.append("    h+=\"<div class='cd-row'><span>\"+crEsc(row[0])+\"</span><b>\"+crEsc(row[1])+\"</b></div>\";}");
+        sb.append("  var b=document.getElementById('cdBody');if(b)b.innerHTML=h;");
+        sb.append("  var a=document.getElementById('cdActions');if(a)a.innerHTML=actionHtml||'';");
+        sb.append("  m.classList.add('show');}");
+        sb.append("function cdClose(){var m=document.getElementById('cdModal');if(m)m.classList.remove('show');}");
+        // 教务的格子文本是「课程 / 教师 / (周次) / 班级」四段，按特征拆开比整段堆着清楚
+        sb.append("function crSplit(lines){");
+        sb.append("  var name=lines[0]||'',weeks='',rest=[];");
+        sb.append("  for(var i=1;i<lines.length;i++){var s=lines[i];");
+        sb.append("    if(!weeks&&/\\(\\s*\\d+\\s*(-\\s*\\d+)?\\s*周/.test(s)){weeks=s;continue;}");
+        sb.append("    rest.push(s);}");
+        sb.append("  var teacher=rest.length>1?rest[0]:'';");
+        sb.append("  var classes=rest.length>1?rest.slice(1).join(' '):(rest[0]||'');");
+        sb.append("  return {name:name,teacher:teacher,weeks:weeks,classes:classes};}");
+        sb.append("function crCardInfo(i){");
+        sb.append("  var it=(window.__crList||[])[i];if(!it)return;");
+        sb.append("  var p=crSplit(it.lines||[]);");
+        sb.append("  cdShow(it.room,[['教室',it.room],['星期',it.day],['节次',window.__crPeriod||''],");
+        sb.append("    ['课程',p.name],['教师',p.teacher],['周次',p.weeks],['班级',p.classes]],'');}");
+        // ===== 找空教室 =====
+        sb.append("function openEmptyRoom(){openPage('pageEmpty');");
+        sb.append("  if(window.Android&&Android.onEmptyPageOpened)Android.onEmptyPageOpened();}");
+        sb.append("function eqSubmit(){");
+        sb.append("  var g=function(id){return document.getElementById(id);};");
+        sb.append("  var campus=g('eqCampus').value,bld=g('eqBuilding').value;");
+        sb.append("  var wk=g('eqWeek').value,wd=g('eqWeekday').value,j1=g('eqJc1').value,j2=g('eqJc2').value;");
+        sb.append("  if(!campus){toast('请选择校区');return;}");
+        sb.append("  if(!wk){toast('请选择周次');return;}");
+        sb.append("  var ot=function(id){var e=g(id);return e&&e.selectedIndex>=0?e.options[e.selectedIndex].text:'';};");
+        sb.append("  window.__eqDay=ot('eqWeekday');");
+        sb.append("  window.__eqParams=[campus,bld,wk,wd,j1,j2];");
+        sb.append("  window.__eqQuery=(ot('eqWeek')+' '+ot('eqWeekday')+' 节次'+ot('eqJc1')+'-'+ot('eqJc2')");
+        sb.append("    +(bld?(' · '+ot('eqBuilding')):' · 整校区')).replace(/\\s+/g,' ').trim();");
+        sb.append("  var btn=g('eqSubmitBtn');if(btn){btn.disabled=true;btn.textContent='查询中…';}");
+        sb.append("  var r=g('eqResult');if(r)r.innerHTML=\"<div class='cr-status'>正在向教务系统查询…</div>\";");
+        sb.append("  Android.onEmptyQuery(campus,bld,wk,wd,j1,j2);}");
+        // 房号前缀当楼栋名：会4-213→会4，博学A-203→博学A，绿9-204XX→绿9
+        sb.append("function eqPrefix(n){var i=n.indexOf('-');");
+        sb.append("  if(i>0&&i<=8)return n.slice(0,i);");
+        sb.append("  var m=n.match(/^[\\u4e00-\\u9fa5A-Za-z]{1,4}/);return m?m[0]:n;}");
+        sb.append("function eqShowResult(o){");
+        sb.append("  var btn=document.getElementById('eqSubmitBtn');");
+        sb.append("  if(btn){btn.disabled=false;btn.textContent='查找空教室';}");
+        sb.append("  var r=document.getElementById('eqResult');if(!r)return;");
+        sb.append("  if(!o){r.innerHTML=\"<div class='cr-status'>没有查询到结果</div>\";return;}");
+        sb.append("  var day=window.__eqDay||'',free=(o.free&&o.free[day])||[],rooms=o.rooms||[];");
+        sb.append("  if(!rooms.length){");
+        sb.append("    if(o.html){r.innerHTML=\"<div class='cr-status'>未识别出教室，以下为教务原始结果</div>\"");
+        sb.append("      +\"<div class='cr-raw'>\"+o.html+\"</div>\";return;}");
+        sb.append("    r.innerHTML=\"<div class='cr-status'>\"+crEsc(o.msg||'没有取到教室清单')+\"</div>\";return;}");
+        sb.append("  window.__eqFree=free;");
+        sb.append("  var cond=window.__eqQuery?crEsc(window.__eqQuery)+' · ':'';");
+        sb.append("  var h=\"<div class='cr-status'>\"+cond+\"空闲 \"+free.length+\" / 共 \"+rooms.length");
+        sb.append("    +\" 间教室（点教室看详情）</div>\";");
+        sb.append("  if(!free.length){");
+        sb.append("    h+=\"<div class='cr-status'>该时段没有空教室，换个节次或周次试试。</div>\";");
+        sb.append("    r.innerHTML=h;return;}");
+        sb.append("  var order=[],grp={};");
+        sb.append("  for(var i=0;i<free.length;i++){var pf=eqPrefix(free[i]);");
+        sb.append("    if(!grp[pf]){grp[pf]=[];order.push(pf);}grp[pf].push({n:free[i],i:i});}");
+        sb.append("  order.sort();");
+        sb.append("  for(var k=0;k<order.length;k++){");
+        sb.append("    var p=order[k],arr=grp[p];");
+        sb.append("    h+=\"<div class='eq-group'><div class='eq-gh'><b>\"+crEsc(p)+\"</b><i>\"+arr.length+\" 间</i></div>\";");
+        sb.append("    h+=\"<div class='eq-rooms'>\";");
+        sb.append("    for(var m=0;m<arr.length;m++){");
+        sb.append("      h+=\"<div class='eq-room' onclick='eqRoomInfo(\"+arr[m].i+\")'>\"+crEsc(arr[m].n)+\"</div>\";}");
+        sb.append("    h+=\"</div></div>\";}");
+        sb.append("  r.innerHTML=h;}");
+        sb.append("function eqRoomInfo(i){");
+        sb.append("  var free=window.__eqFree||[],name=free[i];if(!name)return;");
+        sb.append("  cdShow(name,[['教室',name],['状态','该时段空闲'],['时段',window.__eqQuery||'']],");
+        sb.append("    \"<button class='cd-act' onclick='eqToRoom(\"+i+\")'>看这间教室的课表</button>\");}");
+        // 跳到查询教室并预填同一条件：从空教室点进去就该直接看到这间的课表
+        sb.append("function eqToRoom(i){");
+        sb.append("  var free=window.__eqFree||[],name=free[i];cdClose();if(!name)return;");
+        sb.append("  var p=window.__eqParams||[];");
+        sb.append("  window.__crWantRoom=name;");
+        sb.append("  gotoPage('pageClassroom');");
+        sb.append("  if(window.Android&&Android.onClassroomQueryOpened)Android.onClassroomQueryOpened();");
+        sb.append("  crPreselect(name,p);}");
+        // 轮询等待：教务处要先把校区→教学楼→教室三级联动跑完，才能选中具体教室
+        sb.append("function crPreselect(room,p){");
+        sb.append("  if(!p||p.length<6){return;}");
+        sb.append("  var tries=0;");
+        sb.append("  var t=setInterval(function(){");
+        sb.append("    tries++;if(tries>50){clearInterval(t);window.__crWantRoom='';return;}");
+        sb.append("    var cs=document.getElementById('crCampus');if(!cs||cs.options.length<2)return;");
+        sb.append("    if(cs.value!==p[0]){cs.value=p[0];crSync('crCampus');crPickCampus();return;}");
+        sb.append("    if(!p[1]){clearInterval(t);window.__crWantRoom='';");
+        sb.append("      toast('已定位到校区，选择教学楼后即可选到该教室');return;}");
+        sb.append("    var bs=document.getElementById('crBuilding');if(!bs||bs.options.length<2)return;");
+        sb.append("    if(bs.value!==p[1]){bs.value=p[1];crSync('crBuilding');crPickBuilding();return;}");
+        sb.append("    var w=document.getElementById('crWeek');if(w&&p[2])w.value=p[2];");
+        sb.append("    var wd=document.getElementById('crWeekday');if(wd&&p[3])wd.value=p[3];");
+        sb.append("    var j1=document.getElementById('crJc1');if(j1&&p[4])j1.value=p[4];");
+        sb.append("    var j2=document.getElementById('crJc2');if(j2&&p[5])j2.value=p[5];");
+        sb.append("    crSync('crWeek');crSync('crWeekday');crSync('crJc1');crSync('crJc2');");
+        sb.append("    var rs=document.getElementById('crRoom');if(!rs)return;");
+        sb.append("    var val=null;");
+        sb.append("    for(var k=0;k<rs.options.length;k++){");
+        sb.append("      if((rs.options[k].text||'').trim()===room){val=rs.options[k].value;break;}}");
+        sb.append("    if(val===null)return;");
+        sb.append("    clearInterval(t);window.__crWantRoom='';");
+        sb.append("    rs.value=val;crSync('crRoom');},300);}");
+        // 我的页资料卡实时回填（Java 侧读到学生信息后调用）
+        sb.append("function setMeInfo(n,sid){");
+        sb.append("  var a=document.getElementById('meAvatar');");
+        sb.append("  var b=document.getElementById('meName');");
+        sb.append("  var c=document.getElementById('meId');");
+        sb.append("  if(n){if(b)b.textContent=n;if(a)a.textContent=n.substring(0,1);}");
+        sb.append("  if(sid){if(c)c.textContent='学号 '+sid;}}");
         // 系统返回键统一入口：优先关设置页，再关课程详情弹窗，返回'1'表示已消费
         sb.append("function handleBack(){");
+        sb.append("  if(typeof pkOpen==='function'&&pkOpen()){pkClose();return '1';}");
+        // 详情弹窗要优先于页面关闭，否则按返回会直接退出当前页
+        sb.append("  var cd=document.getElementById('cdModal');");
+        sb.append("  if(cd&&cd.classList.contains('show')){cdClose();return '1';}");
         sb.append("  if(typeof pageStack!=='undefined'&&pageStack.length){closePage();return '1';}");
         sb.append("  var cm=document.getElementById('courseModal');");
         sb.append("  if(cm&&cm.classList.contains('show')){closeModal();return '1';}");
         sb.append("  return '0';}");
         sb.append("function openSub(name){");
-        sb.append("  var map={account:'pageAccount',general:'pageGeneral',custom:'pageCustom',about:'pageAbout'};");
-        sb.append("  if(map[name])openPage(map[name]);}");
+        sb.append("  var map={account:'pageAccount',general:'pageGeneral',custom:'pageCustom',");
+        sb.append("update:'pageUpdate',about:'pageAbout'};");
+        sb.append("  if(map[name])openPage(map[name]);");
+        // 检查更新页：回填内存里已有的更新信息（切周后 JS 状态会丢）
+        sb.append("  if(name==='update'&&window.Android&&Android.onUpdatePageOpened)Android.onUpdatePageOpened();}");
         sb.append("function showSettings(){openPage('pageSettings');}");
         sb.append("function copyTxt(t){if(window.Android&&Android.onCopy)Android.onCopy(t);}");
+        // ===== 检查更新页 =====
+        // 公告/更新日志里的【前缀】着色（任务书第五章：前缀可加粗或着色）
+        sb.append("function upEsc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}");
+        sb.append("function upSize(n){");
+        sb.append("  if(n>=1048576)return (n/1048576).toFixed(1)+' MB';");
+        sb.append("  if(n>=1024)return (n/1024).toFixed(0)+' KB';");
+        sb.append("  return n+' B';}");
+        sb.append("function upTagged(txt){");
+        sb.append("  var lines=String(txt||'').split('\\n');");
+        sb.append("  var out='';");
+        sb.append("  for(var i=0;i<lines.length;i++){");
+        sb.append("    var m=lines[i].match(/^(\\[[^\\]\\n]{1,12}\\])([\\s\\S]*)$/);");
+        sb.append("    if(m){out+='<b class=\"up-tag\">'+m[1]+'</b>'+upEsc(m[2]);}");
+        sb.append("    else{out+=upEsc(lines[i]);}");
+        sb.append("    if(i<lines.length-1)out+='<br>';}");
+        sb.append("  return out;}");
+        sb.append("function renderUpdateInfo(o){");
+        sb.append("  var latest=document.getElementById('upLatest');");
+        sb.append("  var meta=document.getElementById('upMeta');");
+        sb.append("  var log=document.getElementById('upLog');");
+        sb.append("  var box=document.getElementById('upContentBox');");
+        sb.append("  var cbox=document.getElementById('upContent');");
+        sb.append("  var dl=document.getElementById('upDlBtn');");
+        sb.append("  if(!o)return;");
+        // 兼容两种注入形式：对象字面量（现用）与 JSON 字符串（旧实现用 quote 包了一层）
+        sb.append("  if(typeof o==='string'){try{o=JSON.parse(o);}catch(e){return;}}");
+        sb.append("  window.__upVer=o.latest_version||'';");
+        sb.append("  if(latest)latest.textContent='v'+(o.latest_version||'—');");
+        // 版本元信息：发布时间 + 包大小
+        sb.append("  if(meta){");
+        sb.append("    var bits=[];");
+        sb.append("    if(o.released_at)bits.push('发布于 '+o.released_at);");
+        sb.append("    if(o.size&&o.size>0)bits.push('安装包 '+upSize(o.size));");
+        sb.append("    if(bits.length){meta.textContent=bits.join(' · ');meta.style.display='block';}");
+        sb.append("    else{meta.style.display='none';}}");
+        // 更新日志：检查到新版本后必须展示
+        sb.append("  if(log){");
+        sb.append("    log.className=(o.changelog&&o.changelog.length)?'up-log':'up-empty';");
+        sb.append("    log.innerHTML=(o.changelog&&o.changelog.length)?upTagged(o.changelog)");
+        sb.append("      :'（服务端未提供更新内容）';}");
+        sb.append("  if(cbox)cbox.innerHTML=upTagged(o.content||'');");
+        sb.append("  if(box)box.style.display=(o.content&&o.content.length)?'block':'none';");
+        sb.append("  if(dl){");
+        sb.append("    dl.style.display=o.update_available?'inline-block':'none';");
+        sb.append("    dl.textContent=o.update_available?('立即更新到 v'+(o.latest_version||'')):'立即更新';}}");
+        // 只更新公告区（内容接口刷新用，不影响更新信息）
+        sb.append("function renderUpdateContent(c){");
+        sb.append("  var box=document.getElementById('upContentBox');");
+        sb.append("  var cbox=document.getElementById('upContent');");
+        sb.append("  if(!box||!cbox)return;");
+        sb.append("  cbox.innerHTML=upTagged(c||'');");
+        sb.append("  box.style.display=(c&&c.length)?'block':'none';}");
+        sb.append("function setUpdateLoading(on){");
+        sb.append("  var b=document.getElementById('upBtn');");
+        sb.append("  if(!b)return;b.disabled=on;b.textContent=on?'检查中…':'检查更新';}");
+        sb.append("function setUpdateDownloading(on){");
+        sb.append("  var b=document.getElementById('upDlBtn');");
+        sb.append("  if(b){b.disabled=on;");
+        sb.append("    b.textContent=on?'下载中…':(window.__upVer?('立即更新到 v'+window.__upVer):'立即更新');}");
+        sb.append("  var p=document.getElementById('upProgBox');");
+        sb.append("  var cb=document.getElementById('upCancelBtn');");
+        sb.append("  if(p)p.style.display=on?'block':'none';");
+        sb.append("  if(cb)cb.style.display=on?'block':'none';");
+        sb.append("  if(!on)setUpdateProgress(0);}");
+        sb.append("function setUpdateProgress(p){");
+        sb.append("  var bar=document.getElementById('upBar');");
+        sb.append("  if(bar)bar.style.width=p+'%';");
+        sb.append("  var t=document.getElementById('upProgTxt');");
+        sb.append("  if(t)t.textContent=p+'%';}");
         // 主题切换（带背景过渡动画）
         sb.append("function setTheme(m){");
         sb.append("  document.body.classList.toggle('dark',m==='dark');");
@@ -3197,6 +5127,64 @@ public class MainActivity extends AppCompatActivity {
             handler.post(() -> displaySchedule(json));
         }
 
+        /** 打开「我的」页：用本地最新资料刷新姓名/学号卡片 */
+        @JavascriptInterface
+        public void onMineTabOpened() {
+            handler.post(() -> {
+                if (store == null) return;
+                String n = store.getStudentName();
+                String sid = store.getStudentId();
+                // 归属不对的一律不显示（换号 / 调试数据）
+                if (!savedUser.isEmpty() && !sid.isEmpty() && !sid.equals(savedUser)) {
+                    n = "";
+                    sid = "";
+                }
+                evalJs("setMeInfo(" + jsStr(n) + "," + jsStr(sid) + ")");
+            });
+        }
+
+        /** 「重新获取资料」：强制去教务首页再抓一次姓名/学号 */
+        @JavascriptInterface
+        public void onRefreshStudentInfo() {
+            handler.post(() -> {
+                studentInfoManual = true;
+                ensureStudentInfo(true);
+            });
+        }
+
+        /** 教务页里读到的姓名/学号：只写本机，不上传任何服务器 */
+        @JavascriptInterface
+        public void onStudentInfo(String json) {
+            handler.post(() -> {
+                try {
+                    JSONObject o = new JSONObject(json == null ? "{}" : json);
+                    String name = o.optString("name", "").trim();
+                    String sid = o.optString("sid", "").trim();
+                    if (name.isEmpty() && sid.isEmpty()) {
+                        Log.d(TAG, "student info: not found on this page");
+                        return;
+                    }
+                    if (store == null) store = new ScheduleStore(MainActivity.this);
+                    // owner 记成当前登录账号：换号后旧资料会自动失效，不再被展示
+                    store.setStudentInfo(name, sid, savedUser);
+                    // 我的页面可能正开着，实时刷新卡片
+                    evalJs("setMeInfo(" + jsStr(name) + "," + jsStr(sid) + ")");
+                    Log.d(TAG, "student info: name=" + (name.isEmpty() ? "-" : "ok")
+                            + " sid=" + (sid.isEmpty() ? "-" : "ok"));
+                    releaseStudentWv();
+                    if (studentInfoManual) {
+                        studentInfoManual = false;
+                        Toast.makeText(MainActivity.this,
+                                name.isEmpty() ? "没抓到姓名，退出账号重新登录一次试试"
+                                        : "资料已更新",
+                                Toast.LENGTH_SHORT).show();
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "onStudentInfo failed", e);
+                }
+            });
+        }
+
         @JavascriptInterface
         public void onScheduleLinkFound(String url) {
             final String link = url == null ? "" : url;
@@ -3293,6 +5281,53 @@ public class MainActivity extends AppCompatActivity {
             handler.post(() -> requestAddWidget());
         }
 
+        // ====== 查询教室（页面 → 隐藏 WebView 驱动）======
+
+        @JavascriptInterface
+        public void onClassroomQueryOpened() {
+            handler.post(MainActivity.this::classroomOpenOptions);
+        }
+
+        @JavascriptInterface
+        public void onClassroomCampus(String campusId, String target) {
+            final String t = (target == null || target.isEmpty()) ? "crBuilding" : target;
+            handler.post(() -> classroomSendJs(clsPickCampusJs(campusId, t)));
+        }
+
+        @JavascriptInterface
+        public void onClassroomRooms(String building) {
+            handler.post(() -> classroomSendJs(clsRoomsJs(building)));
+        }
+
+        @JavascriptInterface
+        public void onClassroomQuery(String campus, String building, String week,
+                                     String weekday, String jc1, String jc2,
+                                     String roomId, String roomName) {
+            handler.post(() -> {
+                classroomMode = "room";
+                classroomSeq++;
+                classroomSendJs(clsQueryJs(campus, building, week, weekday, jc1, jc2,
+                        roomId, roomName, classroomSeq));
+            });
+        }
+
+        /** 找空教室：同一次查询通道，只是不限定教室，由页面取 free 列表 */
+        @JavascriptInterface
+        public void onEmptyQuery(String campus, String building, String week,
+                                 String weekday, String jc1, String jc2) {
+            handler.post(() -> {
+                classroomMode = "empty";
+                classroomSeq++;
+                classroomSendJs(clsQueryJs(campus, building, week, weekday, jc1, jc2,
+                        "", "", classroomSeq));
+            });
+        }
+
+        @JavascriptInterface
+        public void onEmptyPageOpened() {
+            handler.post(MainActivity.this::classroomOpenOptions);
+        }
+
         @JavascriptInterface
         public void onResetLayout() {
             handler.post(new Runnable() {
@@ -3345,14 +5380,18 @@ public class MainActivity extends AppCompatActivity {
             });
         }
 
-        /** 加课模式选中了空格子：打开表单并预填位置 */
+        /** 加课模式选中了格子（空格或已有课的格子）：打开表单并预填位置 */
         @JavascriptInterface
         public void onPickCell(int day, int row) {
             handler.post(() -> {
                 try {
+                    int d = Math.max(1, Math.min(7, day));
+                    int r = Math.max(1, Math.min(MAX_RENDER_ROWS, row));
                     JSONObject blank = new JSONObject();
-                    blank.put("day", Math.max(1, Math.min(7, day)));
-                    blank.put("row", Math.max(1, Math.min(MAX_RENDER_ROWS, row)));
+                    blank.put("day", d);
+                    blank.put("row", r);
+                    // 该格已有几门课：>0 时表单里提示「这是叠加加课」
+                    blank.put("occupied", countOccupied(currentDisplayWeek, d, r, null));
                     showCustomForm(blank);
                 } catch (Exception e) {
                     Log.e(TAG, "pick cell error", e);
@@ -3368,10 +5407,80 @@ public class MainActivity extends AppCompatActivity {
                     JSONObject blank = new JSONObject();
                     blank.put("day", 1);
                     blank.put("row", 1);
+                    blank.put("occupied", countOccupied(currentDisplayWeek, 1, 1, null));
                     showCustomForm(blank);
                 } catch (Exception e) {
                     Log.e(TAG, "add custom error", e);
                 }
+            });
+        }
+
+        // ====== 自动更新 ======
+
+        /** 检查更新页：手动向服务端查询最新版本与更新内容 */
+        @JavascriptInterface
+        public void onCheckUpdate() {
+            handler.post(() -> {
+                if (store == null) store = new ScheduleStore(MainActivity.this);
+                checkUpdate(UPD_MANUAL);
+            });
+        }
+
+        /** 立即更新：下载 + SHA-256 校验 + 唤起系统安装器 */
+        @JavascriptInterface
+        public void onDownloadUpdate() {
+            handler.post(() -> {
+                if (store == null) store = new ScheduleStore(MainActivity.this);
+                UpdateManager.Info info = lastUpdateInfo;
+                if (info == null) {
+                    // 页面刚打开还没检查过：先查一次，查到就直接续上下载
+                    pendingAutoDownload = true;
+                    Toast.makeText(MainActivity.this, "正在获取更新信息…", Toast.LENGTH_SHORT).show();
+                    checkUpdate(UPD_MANUAL);
+                    return;
+                }
+                if (!info.updateAvailable) {
+                    Toast.makeText(MainActivity.this, "当前已是最新版本", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                startDownloadUpdate(info);
+            });
+        }
+
+        /** 取消正在进行的下载 */
+        @JavascriptInterface
+        public void onCancelDownload() {
+            handler.post(MainActivity.this::cancelDownloadUpdate);
+        }
+
+        /**
+         * 「检查更新」页被打开：先把内存里已有的信息回填（切周重渲染会丢 JS 状态），
+         * 再自动向服务端检查一次——每次进入这个页面都查，保证看到的是最新状态。
+         */
+        @JavascriptInterface
+        public void onUpdatePageOpened() {
+            handler.post(() -> {
+                if (lastUpdateInfo != null) {
+                    evalJs("renderUpdateInfo(" + updateInfoJson(lastUpdateInfo) + ")");
+                }
+                checkUpdate(UPD_PAGE);
+            });
+        }
+
+        /** 只刷新服务端公共内容（公告/维护通知），不查版本 */
+        @JavascriptInterface
+        public void onRefreshContent() {
+            handler.post(() -> {
+                if (updateManager == null) return;
+                Toast.makeText(MainActivity.this, "正在获取公告…", Toast.LENGTH_SHORT).show();
+                new Thread(() -> {
+                    final String content = updateManager.fetchContent();
+                    handler.post(() -> {
+                        if (isFinishing() || isDestroyed()) return;
+                        if (store != null) store.setUpdateLastContent(content);
+                        evalJs("renderUpdateContent(" + jsString(content) + ")");
+                    });
+                }, "update-content").start();
             });
         }
 
@@ -3382,6 +5491,12 @@ public class MainActivity extends AppCompatActivity {
                 if (store == null) store = new ScheduleStore(MainActivity.this);
                 JSONObject c = store.getCustomCourse(id);
                 if (c == null) { Toast.makeText(MainActivity.this, "课程不存在", Toast.LENGTH_SHORT).show(); return; }
+                // 编辑时同样提示叠加情况，但要把自己排除在外
+                try {
+                    c.put("occupied", countOccupied(currentDisplayWeek,
+                            c.optInt("day", 0), c.optInt("row", 0), id));
+                } catch (Exception ignored) {
+                }
                 showCustomForm(c);
             });
         }
@@ -3394,6 +5509,15 @@ public class MainActivity extends AppCompatActivity {
                     if (store == null) store = new ScheduleStore(MainActivity.this);
                     JSONObject input = new JSONObject(json == null ? "{}" : json);
                     boolean isNew = input.optString("id", "").isEmpty();
+                    // 按「保存时该格是否已有其它课」重算叠加标记：
+                    // 用户可能在表单里改了星期/节次，不能沿用点格子那一刻的判断。
+                    // 这一标记只决定描边颜色（琥珀=主动叠加 / 红=同步撞车），不拦截保存。
+                    int sd = input.optInt("day", 0), sr = input.optInt("row", 0);
+                    String sid = input.optString("id", "");
+                    if (sd >= 1 && sd <= 7 && sr >= 1 && sr <= MAX_RENDER_ROWS) {
+                        input.put("overlap", countOccupied(currentDisplayWeek, sd, sr,
+                                sid.isEmpty() ? null : sid) > 0);
+                    }
                     JSONObject saved = store.saveCustomCourse(input);
                     if (saved == null) {
                         Toast.makeText(MainActivity.this, "保存失败：请检查课程名称与位置",
@@ -3406,8 +5530,9 @@ public class MainActivity extends AppCompatActivity {
                         + saved.optString("name", ""));
                     NextCourseWidgetProvider.refreshAll(MainActivity.this);
                     renderWeekSchedule(currentDisplayWeek);
-                    Toast.makeText(MainActivity.this,
-                        isNew ? "已添加自定义课程" : "已保存修改", Toast.LENGTH_SHORT).show();
+                    String base = isNew ? "已添加自定义课程" : "已保存修改";
+                    if (saved.optBoolean("overlap", false)) base += "（与已有课程叠加）";
+                    Toast.makeText(MainActivity.this, base, Toast.LENGTH_SHORT).show();
                 } catch (Exception e) {
                     Log.e(TAG, "save custom error", e);
                 }
@@ -3557,15 +5682,17 @@ public class MainActivity extends AppCompatActivity {
         public void onLogout() {
             handler.post(() -> {
                 Log.d(TAG, "logout requested");
-                // 清除凭据
+                // 清除凭据（password_enc 也要删：否则重启后会从 Keystore 解回来，等于没退出）
                 savedUser = "";
                 savedPass = "";
-                prefs.edit().remove("username").remove("password").apply();
+                prefs.edit().remove("username").remove("password").remove("password_enc").apply();
                 // 清除Cookie
                 CookieManager.getInstance().removeAllCookies(null);
                 CookieManager.getInstance().flush();
                 // 清除课表数据
                 if (store != null) store.clear();
+                // 学生资料属于账号隐私，与凭据一起清掉
+                if (store != null) store.clearStudentInfo();
                 // 重置状态
                 onSchedulePage = false;
                 cameFromLink = false;
@@ -3711,6 +5838,19 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /** 拼进 JS 单引号字符串：先 HTML 转义，再转义反斜杠/单引号/换行 */
+    /**
+     * 拼成 **JS 字符串字面量**（带双引号并转义），用于 evaluateJavascript 的参数。
+     *
+     * 注意别用 jss()：它是给「嵌在单引号里」用的（只转义、不加引号），
+     * 直接拼进函数参数会变成 setMeInfo(张三,"") 这种非法 JS，页面直接报语法错误、什么都不更新。
+     */
+    private String jsStr(String s) {
+        if (s == null) return "\"\"";
+        String t = s.replace("\\", "\\\\").replace("\"", "\\\"")
+            .replace("\n", " ").replace("\r", "");
+        return "\"" + t + "\"";
+    }
+
     private String jss(String s) {
         if (s == null) return "";
         return esc(s).replace("\\", "\\\\").replace("'", "\\'")

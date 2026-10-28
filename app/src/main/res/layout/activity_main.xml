@@ -74,13 +74,18 @@
             android:paddingEnd="32dp" />
     </LinearLayout>
 
-    <!-- Splash 开屏（置顶） -->
+    <!-- Splash 开屏（置顶）。
+         clickable/focusable 必须为 true：FrameLayout 里不可点击的子 View 不消费触摸，
+         事件会继续派发给下层 WebView —— 开屏期间点一下会命中课程卡片、左右滑会切周。
+         这也是「开屏动画看起来被打断 / 课表自己动了」的来源。 -->
     <LinearLayout
         android:id="@+id/splashOverlay"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:orientation="vertical"
         android:gravity="center"
+        android:clickable="true"
+        android:focusable="true"
         android:background="#FFFFFF">
 
         <ImageView

@@ -20,8 +20,33 @@ android {
         applicationId "com.shzu.schedule"
         minSdk 24
         targetSdk 34
-        versionCode 11
-        versionName "1.4.0"
+        versionCode 16
+        versionName "1.4.6"
+
+        // 更新服务 API Key：优先读本地凭据文件 keystore.properties（不入库），
+        // 其次读 gradle.properties 的 shzuUpdateApiKey（供他人构建时自带）。
+        // 业务代码只引用 BuildConfig.UPDATE_API_KEY；缺省空串时退化为匿名受限通道。
+        def updateKey = keystoreProps['updateApiKey'] ?: (project.findProperty('shzuUpdateApiKey') ?: '')
+        buildConfigField "String", "UPDATE_API_KEY", "\"${updateKey}\""
+        if (!updateKey) {
+            logger.warn('[更新服务] 未配置 updateApiKey，将使用匿名受限下载通道（每 IP 每天 5 次）')
+        }
+    }
+
+    buildFeatures {
+        // AGP 8 起 BuildConfig 默认关闭，这里显式打开以承载注入的 API Key
+        buildConfig true
+    }
+
+    // APK 统一命名规则（以后每次构建都按这个产出，不用再手动改名）：
+    //   release → shzu-schedule-v<版本名>.apk
+    //   debug   → shzu-schedule-v<版本名>-debug.apk
+    // 上传到更新服务器时用 release 那个名字，与 m1SuHub 下载管理里的文件名保持一致。
+    applicationVariants.all { variant ->
+        variant.outputs.all { output ->
+            def suffix = variant.buildType.name == "release" ? "" : "-" + variant.buildType.name
+            outputFileName = "shzu-schedule-v" + variant.versionName + suffix + ".apk"
+        }
     }
 
     signingConfigs {

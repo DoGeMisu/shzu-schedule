@@ -4,8 +4,10 @@
         <item name="colorPrimary">@color/primary</item>
         <item name="colorPrimaryVariant">@color/primary_dark</item>
         <item name="colorOnPrimary">@color/white</item>
-        <item name="android:statusBarColor">@color/bg_gradient_start</item>
-        <item name="android:windowLightStatusBar">false</item>
+        <!-- 状态栏不再用品牌紫：跟随页面底色，运行时还会按 in-app 深浅主题再同步一次
+             （见 MainActivity.applyStatusBar）。这里给的是首帧默认值。 -->
+        <item name="android:statusBarColor">@color/window_bg</item>
+        <item name="android:windowLightStatusBar">true</item>
         <item name="android:windowBackground">@color/window_bg</item>
     </style>
 </resources>

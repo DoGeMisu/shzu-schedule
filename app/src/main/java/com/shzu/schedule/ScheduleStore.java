@@ -41,6 +41,26 @@ public class ScheduleStore {
     private static final String KEY_CUSTOM = "custom_courses";
     /** 位置冲突时哪一路课程显示在前面：school / custom */
     private static final String KEY_CONFLICT_PRIORITY = "conflict_priority";
+    /** 上次自动检查更新的时间（epoch ms），用于「每天最多一次」节流 */
+    private static final String KEY_LAST_CHECK = "update_last_check";
+    /** 自动检查期间流过的服务端公共内容（公告/维护通知），可能为空串 */
+    private static final String KEY_LAST_CONTENT = "update_last_content";
+    /**
+     * 检测到新版本时先存下来的更新内容，等安装完成、下次启动时弹出。
+     * 这样「自动更新完成后弹更新内容」不依赖跨版本保留任何安装产物。
+     */
+    private static final String KEY_PENDING_LOG = "update_pending_log";
+    private static final String KEY_PENDING_VER = "update_pending_ver";
+    /** 已经展示过更新内容弹窗的版本号，避免每次启动重复弹 */
+    private static final String KEY_LOG_SHOWN_VER = "update_log_shown_ver";
+    /**
+     * 学生资料（姓名 / 学号）：进入教务系统时顺带读取。
+     * **只存本机**，不上传任何服务器；退出登录时一并清除。
+     */
+    private static final String KEY_STU_NAME = "student_name";
+    private static final String KEY_STU_ID = "student_id";
+    /** 资料归属账号（学号） */
+    private static final String KEY_STU_OWNER = "student_owner";
     /** 自定义课程条数上限，防止误操作写入海量数据拖慢渲染 */
     public static final int MAX_CUSTOM_COURSES = 200;
     private static final long DAY = 86400000L;
@@ -61,6 +81,16 @@ public class ScheduleStore {
     private JSONArray customCourses = new JSONArray();
     /** 冲突时优先显示的来源：school(默认) / custom */
     private String conflictPriority = "school";
+    /** 自动更新相关轻量配置（与课表数据解耦，clear() 清课表时不动这里） */
+    private long updateLastCheck = 0;
+    private String updateLastContent = "";
+    private String pendingLogVer = "";
+    private String pendingLog = "";
+    private String logShownVer = "";
+    /** 学生资料（仅本机） */
+    private String studentName = "";
+    private String studentId = "";
+    private String studentOwner = "";
 
     public ScheduleStore(Context ctx) {
         prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
@@ -100,6 +130,15 @@ public class ScheduleStore {
         bgImage = prefs.getString(KEY_BG, "");
         splashAnimEnabled = prefs.getBoolean(KEY_SPLASH_ANIM, true);
         conflictPriority = prefs.getString(KEY_CONFLICT_PRIORITY, "school");
+        // 自动更新：节流时间戳、上次公共内容、待弹出的更新内容
+        updateLastCheck = prefs.getLong(KEY_LAST_CHECK, 0);
+        updateLastContent = prefs.getString(KEY_LAST_CONTENT, "");
+        pendingLogVer = prefs.getString(KEY_PENDING_VER, "");
+        pendingLog = prefs.getString(KEY_PENDING_LOG, "");
+        logShownVer = prefs.getString(KEY_LOG_SHOWN_VER, "");
+        studentName = prefs.getString(KEY_STU_NAME, "");
+        studentId = prefs.getString(KEY_STU_ID, "");
+        studentOwner = prefs.getString(KEY_STU_OWNER, "");
         // 自定义课程走独立键，与 KEY_DATA 互不影响
         try {
             String cj = prefs.getString(KEY_CUSTOM, null);
@@ -161,6 +200,9 @@ public class ScheduleStore {
                 .remove(KEY_BG)
                 .remove(KEY_CUSTOM)
                 .remove(KEY_CONFLICT_PRIORITY)
+                .remove(KEY_STU_NAME)
+                .remove(KEY_STU_ID)
+                .remove(KEY_STU_OWNER)
                 .apply();
         periodTimes = null;
         theme = "light";
@@ -383,6 +425,9 @@ public class ScheduleStore {
             String color = in.optString("color", "").trim();
             if (!color.matches("^#[0-9a-fA-F]{6}$")) color = "";
             c.put("color", color);
+            // 是否「有意叠加」在已有课的格子上（加课时该格已有课 → true）。
+            // 渲染时据此区分：有意叠加用琥珀色描边，教务同步后撞上的才用红色报警。
+            c.put("overlap", in.optBoolean("overlap", false));
             return c;
         } catch (Exception e) {
             return null;
@@ -404,6 +449,113 @@ public class ScheduleStore {
         prefs.edit().putString(KEY_CONFLICT_PRIORITY, conflictPriority).apply();
     }
 
+    // ====== 自动更新 ======
+
+    /**
+     * 上次自动检查时间（epoch ms）。
+     * v1.4.5 起不再用它做 24 小时节流——改成「每次进入软件都检查一次」，
+     * 这个时间戳只作诊断用途（记录最近一次成功检查的时刻）。
+     */
+    public long getUpdateLastCheck() {
+        return updateLastCheck;
+    }
+
+    public void setUpdateLastCheck(long ts) {
+        updateLastCheck = ts;
+        prefs.edit().putLong(KEY_LAST_CHECK, ts).apply();
+    }
+
+    /** 上次自动检查时服务端返回的公共内容 */
+    public String getUpdateLastContent() {
+        return updateLastContent == null ? "" : updateLastContent;
+    }
+
+    public void setUpdateLastContent(String content) {
+        updateLastContent = content == null ? "" : content;
+        prefs.edit().putString(KEY_LAST_CONTENT, updateLastContent).apply();
+    }
+
+    /** 暂存待弹出的更新内容（版本号 + 日志），安装完成后由启动流程消费 */
+    public void setPendingUpdateLog(String version, String log) {
+        pendingLogVer = version == null ? "" : version;
+        pendingLog = log == null ? "" : log;
+        prefs.edit()
+                .putString(KEY_PENDING_VER, pendingLogVer)
+                .putString(KEY_PENDING_LOG, pendingLog)
+                .apply();
+    }
+
+    public String getPendingUpdateLog() {
+        return pendingLog == null ? "" : pendingLog;
+    }
+
+    public String getPendingUpdateVersion() {
+        return pendingLogVer == null ? "" : pendingLogVer;
+    }
+
+    /** 消费掉暂存的更新内容：已弹过就清掉，避免重复弹 */
+    public void clearPendingUpdateLog() {
+        setPendingUpdateLog("", "");
+    }
+
+    /** 已展示过更新内容弹窗的版本号 */
+    public String getLogShownVersion() {
+        return logShownVer == null ? "" : logShownVer;
+    }
+
+    // ====== 学生资料（仅本机保存，不上传）======
+
+    public String getStudentName() {
+        return studentName == null ? "" : studentName;
+    }
+
+    public String getStudentId() {
+        return studentId == null ? "" : studentId;
+    }
+
+    /** 这份资料属于哪个登录账号（学号）：用于识别「换了账号/遗留数据」 */
+    public String getStudentOwner() {
+        return studentOwner == null ? "" : studentOwner;
+    }
+
+    /**
+     * 写入学生资料，并记下它属于哪个账号。
+     *
+     * @param owner 当前登录账号（学号）；为空时不覆盖已有 owner，避免把归属洗掉
+     */
+    public void setStudentInfo(String name, String sid, String owner) {
+        String n = name == null ? "" : name.replaceAll("\\s+", " ").trim();
+        String i = sid == null ? "" : sid.replaceAll("\\s+", "").trim();
+        String own = owner == null ? "" : owner.replaceAll("\\s+", "").trim();
+        // 归属账号变了（换号/上次是别的账号或调试数据）→ 整份替换，不做增量合并，
+        // 否则「只抓到学号」时会把上一个账号的姓名留在页面上。
+        if (!own.isEmpty() && !own.equals(studentOwner)) {
+            studentName = "";
+            studentId = "";
+        }
+        if (!n.isEmpty()) studentName = n;
+        if (!i.isEmpty()) studentId = i;
+        if (!own.isEmpty()) studentOwner = own;
+        prefs.edit()
+                .putString(KEY_STU_NAME, studentName)
+                .putString(KEY_STU_ID, studentId)
+                .putString(KEY_STU_OWNER, studentOwner)
+                .apply();
+    }
+
+    /** 退出登录时清除（与账号密码一起走） */
+    public void clearStudentInfo() {
+        studentName = "";
+        studentId = "";
+        studentOwner = "";
+        prefs.edit().remove(KEY_STU_NAME).remove(KEY_STU_ID).remove(KEY_STU_OWNER).apply();
+    }
+
+    public void setLogShownVersion(String v) {
+        logShownVer = v == null ? "" : v;
+        prefs.edit().putString(KEY_LOG_SHOWN_VER, logShownVer).apply();
+    }
+
     /**
      * 自定义课程指纹（进渲染缓存签名）。
      * 增删改任何一条都会改变它，从而让后台预热的周页面缓存失效。
@@ -413,9 +565,11 @@ public class ScheduleStore {
         for (int i = 0; i < customCourses.length(); i++) {
             JSONObject c = customCourses.optJSONObject(i);
             if (c == null) continue;
+            // overlap 必须进指纹：否则「有意叠加」标记变化时，预热的周页面仍是旧样式
             h = 31 * h + (c.optString("id", "") + "|" + c.optString("name", "") + "|"
                     + c.optString("location", "") + "|" + c.optString("weeks", "") + "|"
-                    + c.optString("color", "") + "|" + c.optInt("day", 0) + "|" + c.optInt("row", 0)).hashCode();
+                    + c.optString("color", "") + "|" + c.optInt("day", 0) + "|" + c.optInt("row", 0)
+                    + "|" + (c.optBoolean("overlap", false) ? "o" : "-")).hashCode();
         }
         return h;
     }

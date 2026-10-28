@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider 路径声明：只暴露自动更新用的安装包目录。
+  下载位置是 getExternalFilesDir(null)/update/，对应 external-files-path。
+-->
+<paths>
+    <external-files-path name="update" path="update/" />
+    <files-path name="update_internal" path="update/" />
+</paths>

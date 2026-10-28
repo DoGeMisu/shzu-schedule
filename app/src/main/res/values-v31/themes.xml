@@ -5,8 +5,9 @@
         <item name="colorPrimary">@color/primary</item>
         <item name="colorPrimaryVariant">@color/primary_dark</item>
         <item name="colorOnPrimary">@color/white</item>
-        <item name="android:statusBarColor">@color/bg_gradient_start</item>
-        <item name="android:windowLightStatusBar">false</item>
+        <!-- 状态栏跟随页面底色（去掉品牌紫色条），运行时按 in-app 主题再同步 -->
+        <item name="android:statusBarColor">@color/window_bg</item>
+        <item name="android:windowLightStatusBar">true</item>
         <item name="android:windowBackground">@color/window_bg</item>
         <!-- 系统开屏：纯白背景，不显示程序图标 -->
         <item name="android:windowSplashScreenBackground">@color/white</item>
