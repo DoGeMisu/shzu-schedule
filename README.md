@@ -13,9 +13,21 @@
 
 > 两处源码与版本完全同步，功能一致。若 Gitee 打不开，请改用 GitHub，反之亦然。
 
-![Platform](https://img.shields.io/badge/Platform-Android-3DDC84) ![Language](https://img.shields.io/badge/Language-Java-orange) ![UI](https://img.shields.io/badge/UI-WebView%20HTML%2FCSS%2FJS-blue) ![Version](https://img.shields.io/badge/Version-1.4.6-667eea)
+![Platform](https://img.shields.io/badge/Platform-Android-3DDC84) ![Language](https://img.shields.io/badge/Language-Java-orange) ![UI](https://img.shields.io/badge/UI-WebView%20HTML%2FCSS%2FJS-blue) ![Version](https://img.shields.io/badge/Version-1.4.7-667eea)
 
-## ✨ v1.4.6 更新日志（自 v1.4.4 起的全部改动）
+## ✨ v1.4.7 更新日志
+
+**新增与改进**
+
+- 🔠 **新增字体大小调节**：设置 → 通用设置里加了滑块与「小 / 标准 / 大 / 特大」四档，80%~150% 连续可调，拖动时页面文字实时变化，不用重启也不用重载页面。
+- 🧱 **课表格子内温和缩放**：格子高度是均分的，跟着整体字号同步放大会把地点挤没，所以网格内只按 45% 的增量跟随，放大后课名与地点都还看得见。
+
+**修复**
+
+- 🩹 **修复拖动课表卡片的操作栏被底部导航栏挡住**：「应用 / 取消更改 / 撤销」三个按钮原本贴在屏幕最底部，被新加的标签栏整块盖住，现已抬到标签栏上方显示。
+- 🩹 页面内的轻提示（toast）同样避开底部标签栏，不再贴着导航栏边缘显示。
+
+## v1.4.6 更新日志（自 v1.4.4 起的全部改动）
 
 **新增与改进**
 

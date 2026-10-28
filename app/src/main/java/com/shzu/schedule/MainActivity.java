@@ -2923,7 +2923,36 @@ public class MainActivity extends AppCompatActivity {
                 + "|" + (ov == null ? "" : ov.toString().hashCode())
                 + "|" + store.getCoursesHash()
                 + "|" + store.getCustomCoursesHash()
-                + "|" + store.getConflictPriority();
+                + "|" + store.getConflictPriority()
+                // 字号是烘焙进 CSS 的（:root 的 --fs），改了必须让缓存整体作废
+                + "|" + store.getFontScale();
+    }
+
+    /**
+     * 界面字体缩放系数，写进 CSS 变量 --fs。
+     *
+     * 保留两位小数即可：用户能选的是 5% 一档，没必要打印更长的小数，
+     * 而且这个值会进 HTML 与缓存指纹，越短越好。
+     */
+    private String fontScaleFactor() {
+        int pct = store == null ? 100 : store.getFontScale();
+        return String.format(Locale.US, "%.2f", pct / 100.0);
+    }
+
+    /**
+     * 课表网格内的字号缩放系数（比 --fs 温和）。
+     *
+     * 网格的格子高度是 1fr 均分的，卡片尺寸不随字号变化。若按用户选的比例
+     * 原样放大（140%），一格的「课名 + 教师 + 地点 + 周次」必然塞不下，
+     * 地点会被直接裁掉 —— 实测就是这样。所以网格内只跟 45% 的增量：
+     * 140% → 1.18，既看得出变大，又能保住信息。
+     *
+     * 网格外的页面（设置、我的、查询教室）没有固定高度约束，照常用 --fs。
+     */
+    private String gridFontScaleFactor() {
+        int pct = store == null ? 100 : store.getFontScale();
+        double f = 1.0 + (pct / 100.0 - 1.0) * 0.45;
+        return String.format(Locale.US, "%.2f", f);
     }
 
     /** 由近及远排入待预热的周次（本周±1、±2…），等首帧画完再开始 */
@@ -3182,7 +3211,12 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<style>");
         sb.append("*{margin:0;padding:0;box-sizing:border-box;}");
         // 主题变量：浅色（默认）/ 深色，背景与文字带过渡动画
-        sb.append(":root{--bg:#FFFFFF;--fg:#333;--sub:#999;--card:#F0F0F5;--card2:#F8F8FA;");
+        // --fs 是界面字体缩放系数（由「设置 → 通用设置 → 字体大小」写入内存配置）。
+        // 所有字号都写成 calc(<原字号> * var(--fs,1))，所以调这个变量能实时缩放整页文字，
+        // 而卡片/网格的尺寸仍由布局决定，不会因为放大字而把课表挤变形。
+        sb.append(":root{--fs:").append(fontScaleFactor())
+          .append(";--fsg:").append(gridFontScaleFactor()).append(";");
+        sb.append("--bg:#FFFFFF;--fg:#333;--sub:#999;--card:#F0F0F5;--card2:#F8F8FA;");
         sb.append("--line:#F0F0F5;--empty:#FAFAFC;--modal:#FFFFFF;}");
         sb.append("body.dark{--bg:#0F1016;--fg:#E9E9F2;--sub:#A9A9BE;--card:#1E1F2A;--card2:#161722;");
         sb.append("--line:#2A2B38;--empty:#191A24;--modal:#1A1B26;}");
@@ -3195,18 +3229,18 @@ public class MainActivity extends AppCompatActivity {
         // 有自定义背景图时页面背景透明，露出 Activity 层图片（切周不闪）
         sb.append("body.hasbg{background-color:transparent;}");
         sb.append(".header{text-align:center;margin-bottom:6px;flex:0 0 auto;}");
-        sb.append(".header h1{font-size:20px;font-weight:700;color:var(--fg);margin-bottom:2px;}");
+        sb.append(".header h1{font-size:calc(20px * var(--fs,1));font-weight:700;color:var(--fg);margin-bottom:2px;}");
         // 日期与周次同一行：日期维持次要灰，周次用正文色（浅色主题下即近黑）加粗突出
         sb.append(".subline{display:flex;justify-content:center;align-items:baseline;gap:8px;}");
-        sb.append(".subline .sdate{font-size:12px;color:#999;}");
-        sb.append(".subline .sweek{font-size:15px;font-weight:700;color:var(--fg);letter-spacing:0.5px;}");
-        sb.append(".hint{text-align:center;font-size:11px;color:#999;margin-top:3px;}");
+        sb.append(".subline .sdate{font-size:calc(12px * var(--fs,1));color:#999;}");
+        sb.append(".subline .sweek{font-size:calc(15px * var(--fs,1));font-weight:700;color:var(--fg);letter-spacing:0.5px;}");
+        sb.append(".hint{text-align:center;font-size:calc(11px * var(--fs,1));color:#999;margin-top:3px;}");
         sb.append(".btns{display:flex;justify-content:center;align-items:center;gap:8px;margin-top:8px;}");
-        sb.append(".btn{background:var(--card);border:none;color:var(--fg);font-size:12px;");
+        sb.append(".btn{background:var(--card);border:none;color:var(--fg);font-size:calc(12px * var(--fs,1));");
         sb.append("border-radius:16px;padding:0 14px;height:32px;line-height:32px;flex:0 0 auto;}");
         sb.append(".btn:disabled{opacity:0.35;}");
         // 周切换按钮与其它按钮同高同圆角，只是收窄成方形
-        sb.append(".btn-nav{padding:0;width:32px;font-size:13px;color:var(--sub);}");
+        sb.append(".btn-nav{padding:0;width:32px;font-size:calc(13px * var(--fs,1));color:var(--sub);}");
         sb.append(".btn-add{background:#667eea;color:#fff;font-weight:600;}");
         // ===== 底部标签栏 =====
         // 固定在最下方并高于设置页（z-index 96），任何页面下都可见，像真正的 tab。
@@ -3216,7 +3250,7 @@ public class MainActivity extends AppCompatActivity {
         sb.append("border-top:1px solid var(--line);");
         sb.append("padding-bottom:env(safe-area-inset-bottom,0px);}");
         sb.append(".tabitem{flex:1;border:none;background:transparent;color:var(--sub);");
-        sb.append("font-size:13px;cursor:pointer;position:relative;}");
+        sb.append("font-size:calc(13px * var(--fs,1));cursor:pointer;position:relative;}");
         sb.append(".tabitem.on{color:#667eea;font-weight:700;}");
         sb.append(".tabitem.on::after{content:'';position:absolute;left:50%;bottom:6px;");
         sb.append("width:18px;height:2px;border-radius:1px;background:#667eea;transform:translateX(-50%);}");
@@ -3228,17 +3262,17 @@ public class MainActivity extends AppCompatActivity {
         sb.append("border-radius:14px;padding:16px;margin-bottom:14px;}");
         sb.append(".me-avatar{width:52px;height:52px;border-radius:50%;flex:0 0 auto;");
         sb.append("background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;");
-        sb.append("display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:700;}");
+        sb.append("display:flex;align-items:center;justify-content:center;font-size:calc(22px * var(--fs,1));font-weight:700;}");
         sb.append(".me-info{flex:1;min-width:0;}");
-        sb.append(".me-info b{display:block;font-size:17px;color:var(--fg);font-weight:700;}");
-        sb.append(".me-info i{display:block;font-style:normal;font-size:13px;color:var(--sub);margin-top:5px;}");
-        sb.append(".me-empty{font-size:13px;color:var(--sub);line-height:1.7;}");
-        sb.append(".page-hint{font-size:12px;color:var(--sub);line-height:1.7;padding:2px 4px 20px;}");
-        sb.append(".more-empty{text-align:center;color:var(--sub);font-size:13px;line-height:2;padding:56px 0;}");
+        sb.append(".me-info b{display:block;font-size:calc(17px * var(--fs,1));color:var(--fg);font-weight:700;}");
+        sb.append(".me-info i{display:block;font-style:normal;font-size:calc(13px * var(--fs,1));color:var(--sub);margin-top:5px;}");
+        sb.append(".me-empty{font-size:calc(13px * var(--fs,1));color:var(--sub);line-height:1.7;}");
+        sb.append(".page-hint{font-size:calc(12px * var(--fs,1));color:var(--sub);line-height:1.7;padding:2px 4px 20px;}");
+        sb.append(".more-empty{text-align:center;color:var(--sub);font-size:calc(13px * var(--fs,1));line-height:2;padding:56px 0;}");
         // 查询教室：状态行 + 教务原始结果表的兜底样式
-        sb.append(".cr-status{font-size:13px;color:var(--sub);line-height:1.7;padding:8px 2px;}");
+        sb.append(".cr-status{font-size:calc(13px * var(--fs,1));color:var(--sub);line-height:1.7;padding:8px 2px;}");
         sb.append(".cr-raw{margin-top:16px;overflow:auto;-webkit-overflow-scrolling:touch;}");
-        sb.append(".cr-raw table{border-collapse:collapse;width:auto;min-width:100%;font-size:11px;}");
+        sb.append(".cr-raw table{border-collapse:collapse;width:auto;min-width:100%;font-size:calc(11px * var(--fs,1));}");
         // 教务的表列很多：不逐字断行、允许横向滚动，比硬挤在屏宽内可读
         sb.append(".cr-raw td,.cr-raw th{border:1px solid var(--line);padding:5px 6px;color:var(--fg);");
         sb.append("white-space:nowrap;word-break:normal;vertical-align:middle;}");
@@ -3246,39 +3280,39 @@ public class MainActivity extends AppCompatActivity {
         // 解析后的占用卡片
         sb.append(".cr-card{background:var(--card);border-radius:12px;padding:12px;margin-top:10px;}");
         sb.append(".cr-card .ch{display:flex;justify-content:space-between;align-items:baseline;gap:8px;}");
-        sb.append(".cr-card .ch b{font-size:14px;color:var(--fg);font-weight:700;}");
-        sb.append(".cr-card .ch span{font-size:12px;color:#667eea;font-weight:600;flex:0 0 auto;}");
-        sb.append(".cr-card .cb{margin-top:6px;font-size:12px;color:var(--sub);line-height:1.7;word-break:break-all;}");
+        sb.append(".cr-card .ch b{font-size:calc(14px * var(--fs,1));color:var(--fg);font-weight:700;}");
+        sb.append(".cr-card .ch span{font-size:calc(12px * var(--fs,1));color:#667eea;font-weight:600;flex:0 0 auto;}");
+        sb.append(".cr-card .cb{margin-top:6px;font-size:calc(12px * var(--fs,1));color:var(--sub);line-height:1.7;word-break:break-all;}");
         sb.append(".cr-card .cb em{font-style:normal;color:var(--fg);font-weight:600;}");
         // 卡片详情弹窗（两个教室功能共用）：左侧字段名、右侧值的两列行
-        sb.append(".cd-row{display:flex;gap:12px;font-size:13px;line-height:1.9;color:var(--fg);}");
+        sb.append(".cd-row{display:flex;gap:12px;font-size:calc(13px * var(--fs,1));line-height:1.9;color:var(--fg);}");
         sb.append(".cd-row span{flex:0 0 52px;color:var(--sub);}");
         sb.append(".cd-row b{flex:1;min-width:0;font-weight:600;word-break:break-word;}");
         sb.append(".cd-act{display:block;width:100%;margin-top:16px;background:var(--card);");
         sb.append("border:none;color:#667eea;font-weight:600;border-radius:12px;padding:12px;");
-        sb.append("font-size:14px;font-family:inherit;}");
+        sb.append("font-size:calc(14px * var(--fs,1));font-family:inherit;}");
         sb.append(".cd-act:active{opacity:0.7;}");
         // 找空教室：按楼栋分组，房间用小块排布（整校区时可能有上百间）
         sb.append(".eq-group{margin-top:16px;}");
         sb.append(".eq-gh{display:flex;align-items:baseline;justify-content:space-between;");
         sb.append("padding:0 2px 7px;}");
-        sb.append(".eq-gh b{font-size:13px;color:var(--fg);}");
-        sb.append(".eq-gh i{font-style:normal;font-size:11px;color:var(--sub);}");
+        sb.append(".eq-gh b{font-size:calc(13px * var(--fs,1));color:var(--fg);}");
+        sb.append(".eq-gh i{font-style:normal;font-size:calc(11px * var(--fs,1));color:var(--sub);}");
         sb.append(".eq-rooms{display:flex;flex-wrap:wrap;gap:8px;}");
         sb.append(".eq-room{background:var(--card);border-radius:10px;padding:9px 12px;");
-        sb.append("font-size:12.5px;color:var(--fg);line-height:1.3;}");
+        sb.append("font-size:calc(12.5px * var(--fs,1));color:var(--fg);line-height:1.3;}");
         sb.append(".eq-room:active{opacity:0.6;}");
         // 查询教室：自绘选择行 + 底部选择面板。
         // 原生 <select> 的弹出列表由系统绘制，各 ROM 差异极大（澎湃/三星/MIUI 各不相同），
         // 且无法搜索——教学楼动辄几十间教室，必须能过滤，所以自己画。
         sb.append(".cr-field{display:flex;align-items:center;gap:8px;background:var(--card);");
-        sb.append("border-radius:12px;padding:0 14px;min-height:46px;font-size:14px;color:var(--fg);");
+        sb.append("border-radius:12px;padding:0 14px;min-height:46px;font-size:calc(14px * var(--fs,1));color:var(--fg);");
         sb.append("box-sizing:border-box;}");
         sb.append(".cr-field:active{opacity:0.7;}");
         sb.append(".cr-field .crf-v{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;");
         sb.append("white-space:nowrap;}");
         sb.append(".cr-field.ph .crf-v{color:var(--sub);}");
-        sb.append(".cr-field .crf-a{flex:0 0 auto;color:var(--sub);font-size:13px;}");
+        sb.append(".cr-field .crf-a{flex:0 0 auto;color:var(--sub);font-size:calc(13px * var(--fs,1));}");
         sb.append(".cr-field.lock{opacity:0.45;}");
         // 真正的 <select> 只做「值容器」，不参与显示
         sb.append(".cr-sel{position:absolute;left:-9999px;top:0;width:1px;height:1px;");
@@ -3293,21 +3327,21 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".pk-sheet.show{transform:translateY(0);visibility:visible;}");
         sb.append(".pk-head{display:flex;align-items:center;justify-content:space-between;");
         sb.append("padding:15px 16px 9px;}");
-        sb.append(".pk-title{font-size:15px;font-weight:600;color:var(--fg);}");
-        sb.append(".pk-cancel{background:none;border:none;padding:2px;font-size:14px;color:#667eea;}");
+        sb.append(".pk-title{font-size:calc(15px * var(--fs,1));font-weight:600;color:var(--fg);}");
+        sb.append(".pk-cancel{background:none;border:none;padding:2px;font-size:calc(14px * var(--fs,1));color:#667eea;}");
         sb.append(".pk-search{padding:0 12px 8px;}");
         sb.append(".pk-search input{width:100%;box-sizing:border-box;background:var(--card);");
-        sb.append("border:none;border-radius:10px;padding:10px 12px;font-size:14px;color:var(--fg);");
+        sb.append("border:none;border-radius:10px;padding:10px 12px;font-size:calc(14px * var(--fs,1));color:var(--fg);");
         sb.append("font-family:inherit;}");
         sb.append(".pk-list{overflow-y:auto;-webkit-overflow-scrolling:touch;");
         sb.append("padding:2px 0 calc(12px + env(safe-area-inset-bottom,0px));}");
         sb.append(".pk-item{display:flex;align-items:center;justify-content:space-between;gap:10px;");
-        sb.append("padding:13px 18px;font-size:14px;color:var(--fg);line-height:1.45;}");
+        sb.append("padding:13px 18px;font-size:calc(14px * var(--fs,1));color:var(--fg);line-height:1.45;}");
         sb.append(".pk-item:active{background:rgba(127,127,127,0.13);}");
         sb.append(".pk-item.on{color:#667eea;font-weight:600;}");
-        sb.append(".pk-ck{display:none;color:#667eea;font-size:14px;flex:0 0 auto;}");
+        sb.append(".pk-ck{display:none;color:#667eea;font-size:calc(14px * var(--fs,1));flex:0 0 auto;}");
         sb.append(".pk-item.on .pk-ck{display:block;}");
-        sb.append(".pk-empty{padding:22px;text-align:center;color:var(--sub);font-size:13px;}");
+        sb.append(".pk-empty{padding:22px;text-align:center;color:var(--sub);font-size:calc(13px * var(--fs,1));}");
         // WebView 默认会给可点击元素加一层蓝色/灰色高亮，Android 上尤其明显。
         // 一律关掉，按压反馈交给各自的 :active 样式。
         sb.append("*{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;");
@@ -3319,16 +3353,16 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".grid{display:grid;grid-template-columns:34px repeat(7,1fr);gap:3px;");
         sb.append("flex:1;min-height:0;grid-auto-rows:1fr;background:var(--card2);border-radius:14px;padding:8px;");
         sb.append("transition:background-color 0.35s ease;}");
-        sb.append(".gh{text-align:center;font-weight:700;font-size:12px;padding:8px 2px;");
+        sb.append(".gh{text-align:center;font-weight:700;font-size:calc(12px * var(--fsg,1));padding:8px 2px;");
         sb.append("background:var(--card);border-radius:8px;color:var(--fg);}");
-        sb.append(".gh-date{font-size:10px;font-weight:400;color:#999;margin-top:2px;}");
+        sb.append(".gh-date{font-size:calc(10px * var(--fsg,1));font-weight:400;color:#999;margin-top:2px;}");
         sb.append(".gh.today{background:#667eea;color:#fff;}");
         sb.append(".gh.today .gh-date{color:#ddd;}");
-        sb.append(".ts{font-size:10px;text-align:center;color:#777;");
+        sb.append(".ts{font-size:calc(10px * var(--fsg,1));text-align:center;color:#777;");
         sb.append("display:flex;flex-direction:column;align-items:center;justify-content:center;");
         sb.append("background:var(--card);border-radius:8px;padding:4px 2px;line-height:1.15;}");
-        sb.append(".ts .ts-time{font-size:8px;color:#aaa;margin-top:2px;}");
-        sb.append(".course{border-radius:10px;padding:9px 7px;font-size:11px;");
+        sb.append(".ts .ts-time{font-size:calc(8px * var(--fsg,1));color:#aaa;margin-top:2px;}");
+        sb.append(".course{border-radius:10px;padding:9px 7px;font-size:calc(11px * var(--fsg,1));");
         sb.append("display:flex;flex-direction:column;justify-content:flex-start;cursor:pointer;position:relative;overflow:hidden;");
         sb.append("transition:transform 0.18s,opacity 0.18s,box-shadow 0.18s;}");
         // 长名称底部淡出遮罩（渐变到卡片底色，文字不超出卡片）
@@ -3342,8 +3376,8 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".drop-hint{outline:2.5px dashed #667eea;outline-offset:-2px;}");
         sb.append(".empty.drop-hint{background:#EEF0FF;}");
         sb.append(".course .name{font-weight:700;margin-bottom:3px;line-height:1.25;");
-        sb.append("font-size:12px;color:#fff;}");
-        sb.append(".course .info{font-size:10px;opacity:0.95;line-height:1.35;color:#fff;");
+        sb.append("font-size:calc(12px * var(--fsg,1));color:#fff;}");
+        sb.append(".course .info{font-size:calc(10px * var(--fsg,1));opacity:0.95;line-height:1.35;color:#fff;");
         sb.append("font-weight:600;letter-spacing:0.2px;}");
         sb.append(".empty{background:var(--empty);border-radius:8px;}");
         // ===== 与教务课程位置冲突：整格描红，并在右下角挂感叹号 =====
@@ -3355,12 +3389,12 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".course.remind-on.conflict{box-shadow:inset 0 0 0 2.5px #FF3B30,");
         sb.append("inset 0 0 0 5px rgba(255,214,71,0.92);}");
         sb.append(".clash-mark{position:absolute;right:4px;bottom:4px;width:15px;height:15px;");
-        sb.append("border-radius:50%;background:#FF3B30;color:#fff;font-size:11px;font-weight:800;");
+        sb.append("border-radius:50%;background:#FF3B30;color:#fff;font-size:calc(11px * var(--fsg,1));font-weight:800;");
         sb.append("line-height:15px;text-align:center;z-index:14;box-shadow:0 1px 4px rgba(0,0,0,0.3);}");
         // ===== 加课模式：空格子变成可点选的占位 =====
         sb.append("body.adding .empty{border:2px dashed #667eea;background:rgba(102,126,234,0.10);");
         sb.append("display:flex;align-items:center;justify-content:center;cursor:pointer;}");
-        sb.append("body.adding .empty::after{content:'+';color:#667eea;font-size:20px;font-weight:700;");
+        sb.append("body.adding .empty::after{content:'+';color:#667eea;font-size:calc(20px * var(--fs,1));font-weight:700;");
         sb.append("line-height:1;opacity:0.75;}");
         // 加课模式：已有课的格子同样可点（重叠加课），用虚线描边表示「可叠加」。
         // 不能沿用 opacity 压暗——那样像禁用状态，而且文字会一起变淡。
@@ -3369,22 +3403,26 @@ public class MainActivity extends AppCompatActivity {
         // 顶部提示条
         sb.append(".addbar{display:none;align-items:center;justify-content:space-between;gap:8px;");
         sb.append("margin-top:8px;padding:8px 12px;border-radius:12px;background:rgba(102,126,234,0.12);");
-        sb.append("font-size:12px;color:#5A6FD6;font-weight:600;}");
+        sb.append("font-size:calc(12px * var(--fs,1));color:#5A6FD6;font-weight:600;}");
         sb.append("body.adding .addbar{display:flex;}");
         sb.append(".addbar button{background:#667eea;color:#fff;border:none;border-radius:8px;");
-        sb.append("padding:5px 10px;font-size:12px;}");
+        sb.append("padding:5px 10px;font-size:calc(12px * var(--fs,1));}");
         sb.append(".grid-head{display:grid;grid-template-columns:34px repeat(7,1fr);gap:3px;margin-bottom:4px;padding:0 8px;}");
         // 拖动模式底部操作栏（横向拉长、低高度；拖动中下滑隐藏）
-        sb.append(".dockbar{position:fixed;left:50%;bottom:10px;transform:translate(-50%,150%);");
+        // **必须抬到底部标签栏上方**：标签栏是 bottom:0 的固定层（高 56px + 安全区），
+        // 操作栏若还停在 bottom:10px，就会被标签栏整块盖住 —— 「应用/取消/撤销」全点不到。
+        sb.append(".dockbar{position:fixed;left:50%;");
+        sb.append("bottom:calc(56px + env(safe-area-inset-bottom,0px) + 10px);");
+        sb.append("transform:translate(-50%,150%);");
         sb.append("background:#fff;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.2);");
         sb.append("display:flex;gap:6px;padding:6px 8px;z-index:80;opacity:0;");
         sb.append("width:calc(100% - 24px);max-width:420px;");
         sb.append("transition:transform 0.3s cubic-bezier(.22,.68,.36,1),opacity 0.3s ease;}");
         sb.append(".dockbar.show{transform:translate(-50%,0);opacity:1;}");
         sb.append(".dockbar.hide-drag{transform:translate(-50%,150%);opacity:0;}");
-        sb.append(".db-btn{border:none;border-radius:12px;padding:9px 10px;font-size:12px;font-weight:600;}");
+        sb.append(".db-btn{border:none;border-radius:12px;padding:9px 10px;font-size:calc(12px * var(--fs,1));font-weight:600;}");
         sb.append(".db-btn:disabled{opacity:0.4;}");
-        sb.append(".db-apply{background:#667eea;color:#fff;flex:2.2;order:2;font-size:14px;}");
+        sb.append(".db-apply{background:#667eea;color:#fff;flex:2.2;order:2;font-size:calc(14px * var(--fs,1));}");
         sb.append(".db-cancel{background:#F0F0F5;color:#555;flex:1;order:1;}");
         sb.append(".db-undo{background:#F0F0F5;color:#555;flex:1;order:3;}");
         // 课程卡片入场动画：由小变大（缩放淡入）
@@ -3433,27 +3471,27 @@ public class MainActivity extends AppCompatActivity {
         // 内容层：始终按最终尺寸渲染，只做透明度
         sb.append(".modal .m-inner{opacity:1;}");
 
-        sb.append(".modal h2{font-size:16px;font-weight:700;margin-bottom:12px;color:var(--fg);}");
+        sb.append(".modal h2{font-size:calc(16px * var(--fs,1));font-weight:700;margin-bottom:12px;color:var(--fg);}");
         sb.append(".modal .row{display:flex;padding:8px 0;border-bottom:1px solid var(--line);}");
-        sb.append(".modal .row .label{color:var(--sub);font-size:13px;min-width:70px;}");
-        sb.append(".modal .row .val{color:var(--fg);font-size:13px;flex:1;}");
+        sb.append(".modal .row .label{color:var(--sub);font-size:calc(13px * var(--fs,1));min-width:70px;}");
+        sb.append(".modal .row .val{color:var(--fg);font-size:calc(13px * var(--fs,1));flex:1;}");
         sb.append(".modal #cmBody{max-height:58vh;overflow-y:auto;-webkit-overflow-scrolling:touch;}");
         sb.append(".modal .cblock{margin-top:2px;}");
         sb.append(".modal .cblock+.cblock{border-top:1px solid var(--line);margin-top:14px;padding-top:14px;}");
-        sb.append(".modal .cb-name{font-size:15px;font-weight:700;color:var(--fg);margin-bottom:4px;}");
-        sb.append(".modal .cb-tag{font-size:11px;color:var(--sub);font-weight:400;margin-left:6px;}");
+        sb.append(".modal .cb-name{font-size:calc(15px * var(--fs,1));font-weight:700;color:var(--fg);margin-bottom:4px;}");
+        sb.append(".modal .cb-tag{font-size:calc(11px * var(--fs,1));color:var(--sub);font-weight:400;margin-left:6px;}");
         sb.append(".modal-close{display:block;margin:16px auto 0;background:#667eea;color:#fff;");
-        sb.append("border:none;border-radius:12px;padding:8px 32px;font-size:14px;}");
+        sb.append("border:none;border-radius:12px;padding:8px 32px;font-size:calc(14px * var(--fs,1));}");
         // 设置弹窗
         sb.append(".settings-modal{background:var(--modal);border-radius:16px;width:88%;max-width:360px;");
         sb.append("overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,0.3);");
         sb.append("animation:slideUp 0.25s ease-out;max-height:82vh;");
         sb.append("display:flex;flex-direction:column;transition:background-color 0.3s ease;}");
         // 标题与标签栏固定，仅内容区滚动
-        sb.append(".settings-modal h2{font-size:18px;font-weight:700;padding:20px 20px 12px;color:var(--fg);");
+        sb.append(".settings-modal h2{font-size:calc(18px * var(--fs,1));font-weight:700;padding:20px 20px 12px;color:var(--fg);");
         sb.append("flex:0 0 auto;}");
         sb.append(".tab-bar{display:flex;border-bottom:1px solid var(--line);flex:0 0 auto;}");
-        sb.append(".tab{flex:1;text-align:center;padding:10px;font-size:14px;color:var(--sub);");
+        sb.append(".tab{flex:1;text-align:center;padding:10px;font-size:calc(14px * var(--fs,1));color:var(--sub);");
         sb.append("border-bottom:2px solid transparent;}");
         sb.append(".tab.active{color:#667eea;border-bottom-color:#667eea;font-weight:600;}");
         sb.append(".tab-content{padding:16px 20px;overflow-y:auto;-webkit-overflow-scrolling:touch;flex:1 1 auto;}");
@@ -3461,16 +3499,16 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".tab-in{animation:tabIn 0.22s ease-out;}");
         sb.append(".settings-item{display:flex;justify-content:space-between;align-items:center;");
         sb.append("padding:14px 0;border-bottom:1px solid var(--line);}");
-        sb.append(".settings-item .si-label{font-size:15px;color:var(--fg);}");
-        sb.append(".settings-item .si-desc{font-size:12px;color:var(--sub);margin-top:2px;}");
+        sb.append(".settings-item .si-label{font-size:calc(15px * var(--fs,1));color:var(--fg);}");
+        sb.append(".settings-item .si-desc{font-size:calc(12px * var(--fs,1));color:var(--sub);margin-top:2px;}");
         sb.append(".logout-btn{display:block;width:100%;margin-top:20px;background:#FF4444;color:#fff;");
-        sb.append("border:none;border-radius:12px;padding:12px;font-size:15px;font-weight:600;}");
+        sb.append("border:none;border-radius:12px;padding:12px;font-size:calc(15px * var(--fs,1));font-weight:600;}");
         // 设置页按钮统一样式（跟随主题，带按压反馈）
         sb.append(".adv-btn{background:var(--card);border:1px solid var(--line);");
-        sb.append("border-radius:10px;padding:9px 14px;font-size:13px;color:var(--fg);");
+        sb.append("border-radius:10px;padding:9px 14px;font-size:calc(13px * var(--fs,1));color:var(--fg);");
         sb.append("cursor:pointer;transition:background-color 0.2s ease,border-color 0.2s ease;}");
         sb.append(".adv-btn:active{opacity:0.75;}");
-        sb.append(".si-hint{font-size:12px;color:#999;margin-top:8px;line-height:1.5;}");
+        sb.append(".si-hint{font-size:calc(12px * var(--fs,1));color:#999;margin-top:8px;line-height:1.5;}");
         // ===== 单开关按钮（设置项右侧，与文字同一行）=====
         sb.append(".switch{width:48px;height:28px;border-radius:14px;background:#D8D8E0;border:none;");
         sb.append("padding:0;position:relative;flex:0 0 auto;cursor:pointer;");
@@ -3481,10 +3519,23 @@ public class MainActivity extends AppCompatActivity {
         sb.append("transition:left 0.2s cubic-bezier(.3,.8,.4,1);}");
         sb.append(".switch.on i{left:23px;}");
         sb.append("body.dark .switch{background:#3A3B4A;}");
+        // ===== 字体大小：滑块 + 档位按钮 =====
+        // 滑块负责连续调节（实时预览），下面四个档位负责一键回到常用值。
+        // 两者共用 applyFontScale()，每次调节都会同步滑块位置、数值文字与档位高亮。
+        sb.append(".fs-wrap{display:flex;align-items:center;gap:10px;margin-top:12px;}");
+        sb.append(".fs-wrap .fs-a{font-size:calc(13px * var(--fs,1));color:var(--sub);flex:0 0 auto;}");
+        sb.append(".fs-wrap .fs-b{font-size:calc(19px * var(--fs,1));color:var(--sub);flex:0 0 auto;}");
+        sb.append(".fs-range{flex:1;min-width:0;-webkit-appearance:none;appearance:none;height:4px;");
+        sb.append("border-radius:2px;background:var(--line);outline:none;margin:0;}");
+        sb.append(".fs-range::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;");
+        sb.append("border-radius:50%;background:#667eea;box-shadow:0 1px 4px rgba(0,0,0,0.28);}");
+        sb.append(".fs-val{flex:0 0 auto;min-width:44px;text-align:right;");
+        sb.append("font-size:calc(13px * var(--fs,1));color:#667eea;font-weight:700;}");
+        sb.append(".fs-presets{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;}");
         // ===== 自定义课程：表单与列表 =====
-        sb.append(".cf-label{display:block;font-size:13px;color:var(--sub);margin:14px 0 6px;}");
+        sb.append(".cf-label{display:block;font-size:calc(13px * var(--fs,1));color:var(--sub);margin:14px 0 6px;}");
         sb.append(".cf-input{width:100%;background:var(--card);border:1px solid var(--line);");
-        sb.append("border-radius:10px;padding:11px 12px;font-size:15px;color:var(--fg);");
+        sb.append("border-radius:10px;padding:11px 12px;font-size:calc(15px * var(--fs,1));color:var(--fg);");
         sb.append("box-sizing:border-box;font-family:inherit;-webkit-appearance:none;}");
         sb.append(".cf-input:focus{outline:none;border-color:#667eea;}");
         sb.append(".cf-row{display:flex;gap:10px;}");
@@ -3492,7 +3543,7 @@ public class MainActivity extends AppCompatActivity {
         // 重复方式分段选择：仅本周 / 按周次
         sb.append(".cf-seg{display:flex;gap:8px;}");
         sb.append(".cf-seg-item{flex:1;background:var(--card);border:1px solid var(--line);");
-        sb.append("color:var(--sub);border-radius:10px;padding:10px 8px;font-size:13px;");
+        sb.append("color:var(--sub);border-radius:10px;padding:10px 8px;font-size:calc(13px * var(--fs,1));");
         sb.append("font-family:inherit;transition:all 0.16s ease;}");
         sb.append(".cf-seg-item.sel{background:#667eea;border-color:#667eea;color:#fff;font-weight:600;}");
         sb.append(".cf-colors{display:flex;flex-wrap:wrap;gap:10px;margin-top:4px;}");
@@ -3501,12 +3552,12 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".cf-color.sel{box-shadow:0 0 0 2px var(--bg),0 0 0 4px #667eea;}");
         sb.append(".cf-actions{display:flex;gap:10px;margin-top:24px;}");
         sb.append(".cf-save{flex:1;background:#667eea;color:#fff;border:none;border-radius:12px;");
-        sb.append("padding:13px;font-size:15px;font-weight:600;}");
+        sb.append("padding:13px;font-size:calc(15px * var(--fs,1));font-weight:600;}");
         sb.append(".cf-del{flex:0 0 auto;background:#FFF0F0;color:#e55;border:none;border-radius:12px;");
-        sb.append("padding:13px 18px;font-size:15px;font-weight:600;}");
-        sb.append(".cf-tip{font-size:11px;color:var(--sub);margin-top:6px;line-height:1.5;}");
+        sb.append("padding:13px 18px;font-size:calc(15px * var(--fs,1));font-weight:600;}");
+        sb.append(".cf-tip{font-size:calc(11px * var(--fs,1));color:var(--sub);margin-top:6px;line-height:1.5;}");
         // 叠加加课提示（目标格已有课）：琥珀色，与卡片上的叠加描边同一语义
-        sb.append(".cf-overlap{font-size:12px;color:#8A5A12;background:rgba(242,162,75,0.14);");
+        sb.append(".cf-overlap{font-size:calc(12px * var(--fs,1));color:#8A5A12;background:rgba(242,162,75,0.14);");
         sb.append("border-left:3px solid #F2A24B;border-radius:8px;padding:9px 11px;");
         sb.append("margin-top:12px;line-height:1.55;}");
         sb.append("body.dark .cf-overlap{color:#F2C078;background:rgba(242,162,75,0.18);}");
@@ -3515,29 +3566,32 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".cc-item:last-child{border-bottom:none;}");
         sb.append(".cc-dot{width:10px;height:10px;border-radius:50%;flex:0 0 auto;}");
         sb.append(".cc-txt{flex:1;min-width:0;}");
-        sb.append(".cc-txt b{display:block;font-size:14px;font-weight:600;color:var(--fg);");
+        sb.append(".cc-txt b{display:block;font-size:calc(14px * var(--fs,1));font-weight:600;color:var(--fg);");
         sb.append("white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}");
-        sb.append(".cc-txt i{display:block;font-style:normal;font-size:11px;color:var(--sub);margin-top:3px;}");
-        sb.append(".cc-del{background:transparent;border:none;color:#E5533D;font-size:12px;");
+        sb.append(".cc-txt i{display:block;font-style:normal;font-size:calc(11px * var(--fs,1));color:var(--sub);margin-top:3px;}");
+        sb.append(".cc-del{background:transparent;border:none;color:#E5533D;font-size:calc(12px * var(--fs,1));");
         sb.append("padding:8px;flex:0 0 auto;}");
-        sb.append(".cc-empty{text-align:center;color:var(--sub);font-size:13px;padding:34px 0;line-height:1.7;}");
+        sb.append(".cc-empty{text-align:center;color:var(--sub);font-size:calc(13px * var(--fs,1));padding:34px 0;line-height:1.7;}");
         // 自定义课程详情标签、页面内 toast
-        sb.append(".cb-src{display:inline-block;font-size:10px;font-weight:600;color:#667eea;");
+        sb.append(".cb-src{display:inline-block;font-size:calc(10px * var(--fs,1));font-weight:600;color:#667eea;");
         sb.append("background:rgba(102,126,234,0.12);border-radius:6px;padding:1px 6px;margin-left:6px;");
         sb.append("vertical-align:middle;}");
-        sb.append(".cb-clash{font-size:12px;color:#E5533D;background:rgba(255,59,48,0.08);");
+        sb.append(".cb-clash{font-size:calc(12px * var(--fs,1));color:#E5533D;background:rgba(255,59,48,0.08);");
         sb.append("border-radius:8px;padding:8px 10px;margin-top:8px;line-height:1.5;}");
-        sb.append(".toast{position:fixed;left:50%;bottom:84px;transform:translateX(-50%);");
+        // toast 同样要避开底部标签栏，否则会贴着导航栏边缘
+        sb.append(".toast{position:fixed;left:50%;");
+        sb.append("bottom:calc(56px + env(safe-area-inset-bottom,0px) + 16px);");
+        sb.append("transform:translateX(-50%);");
         sb.append("background:rgba(0,0,0,0.82);color:#fff;padding:9px 16px;border-radius:20px;");
-        sb.append("font-size:13px;opacity:0;pointer-events:none;transition:opacity 0.2s ease;");
+        sb.append("font-size:calc(13px * var(--fs,1));opacity:0;pointer-events:none;transition:opacity 0.2s ease;");
         sb.append("z-index:200;max-width:80%;text-align:center;line-height:1.4;}");
         sb.append(".toast.show{opacity:1;}");
         // ===== 检查更新页 =====
         sb.append(".up-block{margin-top:16px;background:var(--card);border-radius:12px;padding:14px;}");
-        sb.append(".up-block-title{font-size:13px;font-weight:700;color:var(--fg);margin-bottom:8px;}");
-        sb.append(".up-log{font-size:13px;color:var(--fg);line-height:1.7;");
+        sb.append(".up-block-title{font-size:calc(13px * var(--fs,1));font-weight:700;color:var(--fg);margin-bottom:8px;}");
+        sb.append(".up-log{font-size:calc(13px * var(--fs,1));color:var(--fg);line-height:1.7;");
         sb.append("white-space:pre-wrap;word-break:break-word;}");
-        sb.append(".up-empty{font-size:13px;color:var(--sub);line-height:1.7;}");
+        sb.append(".up-empty{font-size:calc(13px * var(--fs,1));color:var(--sub);line-height:1.7;}");
         // 公告/日志里的【前缀】着色（任务书第五章）
         sb.append(".up-tag{color:#667eea;font-weight:700;margin-right:2px;}");
         sb.append("body.dark .up-tag{color:#9AA6FF;}");
@@ -3545,9 +3599,9 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".up-bar{height:8px;border-radius:4px;background:var(--line);overflow:hidden;}");
         sb.append(".up-bar i{display:block;height:100%;width:0;background:#667eea;");
         sb.append("transition:width 0.2s ease;}");
-        sb.append(".up-prog-txt{font-size:12px;color:var(--sub);margin-top:6px;text-align:center;}");
+        sb.append(".up-prog-txt{font-size:calc(12px * var(--fs,1));color:var(--sub);margin-top:6px;text-align:center;}");
         // 空课周提示
-        sb.append(".emptyweek{grid-column:1/-1;text-align:center;color:var(--sub);font-size:13px;padding:40px 0;}");
+        sb.append(".emptyweek{grid-column:1/-1;text-align:center;color:var(--sub);font-size:calc(13px * var(--fs,1));padding:40px 0;}");
         // 自定义图片背景：卡片/控件半透明，文字保持原色
         sb.append("body.hasbg .grid{background:transparent;}");
         sb.append("body.hasbg .gh{background:rgba(240,240,245,0.62);}");
@@ -3589,8 +3643,8 @@ public class MainActivity extends AppCompatActivity {
         sb.append("transition:transform 0.26s cubic-bezier(.22,.68,.36,1),visibility 0.26s ease;}");
         sb.append(".page.show{visibility:visible;transform:translateX(0);}");
         sb.append(".page-head{display:flex;align-items:center;padding:8px;border-bottom:1px solid var(--line);flex:0 0 auto;}");
-        sb.append(".ph-back{background:transparent;border:none;font-size:26px;color:var(--fg);width:48px;height:48px;cursor:pointer;}");
-        sb.append(".ph-title{flex:1;text-align:center;font-size:17px;font-weight:700;color:var(--fg);}");
+        sb.append(".ph-back{background:transparent;border:none;font-size:calc(26px * var(--fs,1));color:var(--fg);width:48px;height:48px;cursor:pointer;}");
+        sb.append(".ph-title{flex:1;text-align:center;font-size:calc(17px * var(--fs,1));font-weight:700;color:var(--fg);}");
         sb.append(".ph-pad{width:48px;flex:0 0 auto;}");
         sb.append(".page-body{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:16px;}");
         sb.append(".nav-card{background:var(--card);border-radius:14px;overflow:hidden;}");
@@ -3598,22 +3652,22 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".nav-item:last-child{border-bottom:none;}");
         sb.append(".nav-item:active{background:rgba(102,126,234,0.12);}");
         sb.append(".ni-txt{flex:1;}");
-        sb.append(".ni-txt b{display:block;font-size:15px;font-weight:600;color:var(--fg);}");
-        sb.append(".ni-txt i{display:block;font-style:normal;font-size:12px;color:var(--sub);margin-top:4px;}");
-        sb.append(".ni-arrow{color:var(--sub);font-size:20px;margin-left:8px;}");
+        sb.append(".ni-txt b{display:block;font-size:calc(15px * var(--fs,1));font-weight:600;color:var(--fg);}");
+        sb.append(".ni-txt i{display:block;font-style:normal;font-size:calc(12px * var(--fs,1));color:var(--sub);margin-top:4px;}");
+        sb.append(".ni-arrow{color:var(--sub);font-size:calc(20px * var(--fs,1));margin-left:8px;}");
         sb.append(".about-hero{text-align:center;padding:26px 0 22px;}");
-        sb.append(".about-hero .ah-name{font-size:26px;font-weight:800;color:var(--fg);letter-spacing:2px;}");
-        sb.append(".about-hero .ah-ver{margin-top:8px;font-size:13px;color:#667eea;font-weight:600;}");
-        sb.append(".about-hero .ah-slogan{margin-top:10px;font-size:12px;color:var(--sub);line-height:1.6;}");
+        sb.append(".about-hero .ah-name{font-size:calc(26px * var(--fs,1));font-weight:800;color:var(--fg);letter-spacing:2px;}");
+        sb.append(".about-hero .ah-ver{margin-top:8px;font-size:calc(13px * var(--fs,1));color:#667eea;font-weight:600;}");
+        sb.append(".about-hero .ah-slogan{margin-top:10px;font-size:calc(12px * var(--fs,1));color:var(--sub);line-height:1.6;}");
         sb.append(".about-card{background:var(--card);border-radius:14px;padding:2px 16px;margin-bottom:14px;}");
-        sb.append(".about-card .ac-title{font-size:12px;color:#667eea;font-weight:700;padding:14px 0 6px;letter-spacing:1px;}");
-        sb.append(".about-card .kv{display:flex;padding:11px 0;border-top:1px solid var(--line);font-size:13px;}");
+        sb.append(".about-card .ac-title{font-size:calc(12px * var(--fs,1));color:#667eea;font-weight:700;padding:14px 0 6px;letter-spacing:1px;}");
+        sb.append(".about-card .kv{display:flex;padding:11px 0;border-top:1px solid var(--line);font-size:calc(13px * var(--fs,1));}");
         sb.append(".about-card .kv:first-of-type{border-top:none;}");
         sb.append(".about-card .kv span{color:var(--sub);min-width:74px;flex:0 0 auto;}");
         sb.append(".about-card .kv b{color:var(--fg);font-weight:500;flex:1;word-break:break-all;line-height:1.5;}");
         sb.append(".about-card .kv b.tap{color:#667eea;cursor:pointer;}");
         sb.append(".about-card .kv b.tap:active{opacity:0.6;}");
-        sb.append(".about-note{font-size:12px;color:var(--sub);line-height:1.7;padding:0 4px 24px;}");
+        sb.append(".about-note{font-size:calc(12px * var(--fs,1));color:var(--sub);line-height:1.7;padding:0 4px 24px;}");
 
         boolean hasBg = !bgName.isEmpty() && new java.io.File(getFilesDir(), bgName).exists();
         sb.append("</style></head><body class='").append("dark".equals(theme) ? "dark" : "light")
@@ -3976,6 +4030,28 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<div class='si-desc'>关闭后启动直接显示课表，下次启动生效</div></div>");
         sb.append("<button class='switch").append(splashAnimOn ? " on" : "")
           .append("' id='splashSwitch' onclick='toggleSplash()'><i></i></button>");
+        sb.append("</div>");
+        // 字体大小：滑块连续调节（实时预览），档位按钮一键回到常用值。
+        // 页面字号全部写成 calc(<原字号> * var(--fs))，所以改 --fs 就能整页缩放。
+        int fsPct = store == null ? 100 : store.getFontScale();
+        sb.append("<div class='settings-item' style='flex-direction:column;align-items:stretch;'>");
+        sb.append("<div class='fs-head' style='display:flex;align-items:baseline;justify-content:space-between;gap:8px;'>");
+        sb.append("<div class='si-label'>字体大小</div>");
+        sb.append("<div class='fs-val' id='fsVal'>").append(fsPct).append("%</div></div>");
+        sb.append("<div class='si-desc'>调整课表与各页面文字的大小，拖动即刻生效</div>");
+        sb.append("<div class='fs-wrap'>");
+        sb.append("<span class='fs-a'>A</span>");
+        sb.append("<input class='fs-range' id='fsRange' type='range' min='80' max='150' step='5' value='")
+          .append(fsPct).append("' oninput='onFontSlide(this.value)'>");
+        sb.append("<span class='fs-b'>A</span>");
+        sb.append("</div>");
+        sb.append("<div class='fs-presets'>");
+        sb.append("<button class='adv-btn' id='fsP80' onclick='setFontScale(80)'>小</button>");
+        sb.append("<button class='adv-btn' id='fsP100' onclick='setFontScale(100)'>标准</button>");
+        sb.append("<button class='adv-btn' id='fsP120' onclick='setFontScale(120)'>大</button>");
+        sb.append("<button class='adv-btn' id='fsP140' onclick='setFontScale(140)'>特大</button>");
+        sb.append("</div>");
+        sb.append("<div class='si-hint'>字放大后课表格子高度不变，长课名可能显示不下；觉得挤可以配合「小」档使用。</div>");
         sb.append("</div>");
         // 桌面小组件：部分 ROM（ColorOS/MIUI 等）组件库里找不到第三方组件，
         // 提供主动添加入口，直接弹系统确认框，绕开组件库
@@ -4999,6 +5075,36 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  var s=document.getElementById('splashSwitch');");
         sb.append("  if(s)s.classList.toggle('on',splashOn);");
         sb.append("  Android.onSetSplashAnim(splashOn?1:0);}");
+        // ===== 字体大小 =====
+        // 整页字号都是 calc(<原字号> * var(--fs))，所以改 :root 上的 --fs 就能立刻缩放，
+        // 不需要重载页面（重载会把用户从设置页弹回课表）。
+        // --fsg 是课表网格内的温和系数：格子高度固定，字放太大地点会被裁掉。
+        sb.append("var FONT_PCT=").append(fsPct).append(";");
+        sb.append("function setFontCss(p){");
+        sb.append("  var r=document.documentElement.style;");
+        sb.append("  r.setProperty('--fs',(p/100).toFixed(2));");
+        sb.append("  r.setProperty('--fsg',(1+(p/100-1)*0.45).toFixed(2));}");
+        // 拖动滑块：只在停顿后落盘，避免一次拖动写几十次配置
+        sb.append("function onFontSlide(v){");
+        sb.append("  var p=parseInt(v,10)||100;");
+        sb.append("  FONT_PCT=p;setFontCss(p);fontUi(p);");
+        sb.append("  clearTimeout(window.__fsTimer);");
+        sb.append("  window.__fsTimer=setTimeout(function(){Android.onSetFontScale(p);},180);}");
+        // 档位按钮：直接落盘并同步滑块
+        sb.append("function setFontScale(p){");
+        sb.append("  p=Math.max(80,Math.min(150,p));");
+        sb.append("  FONT_PCT=p;setFontCss(p);fontUi(p);");
+        sb.append("  var r=document.getElementById('fsRange');if(r)r.value=p;");
+        sb.append("  Android.onSetFontScale(p);}");
+        // 同步数值文字、滑块位置与档位高亮（只有恰好等于档位值时那个按钮才点亮）
+        sb.append("function fontUi(p){");
+        sb.append("  var v=document.getElementById('fsVal');if(v)v.textContent=p+'%';");
+        sb.append("  var presets={80:'fsP80',100:'fsP100',120:'fsP120',140:'fsP140'};");
+        sb.append("  for(var k in presets){var b=document.getElementById(presets[k]);if(!b)continue;");
+        sb.append("    var on=(parseInt(k,10)===p);");
+        sb.append("    b.style.background=on?'#667eea':'';b.style.color=on?'#fff':'';");
+        sb.append("    b.style.borderColor=on?'#667eea':'';}}");
+        sb.append("fontUi(FONT_PCT);");
         // 冲突优先显示
         sb.append("function setConflictPriority(v){");
         sb.append("  updateConflictBtn(v);");
@@ -5377,6 +5483,25 @@ public class MainActivity extends AppCompatActivity {
                 store.setConflictPriority(mode);
                 Log.d(TAG, "conflict priority = " + store.getConflictPriority());
                 renderWeekSchedule(currentDisplayWeek);
+            });
+        }
+
+        /**
+         * 界面字体缩放（80~150）。
+         *
+         * 前端已经就地改好了 --fs，这里**不再重渲染**：重载整页会把用户从设置页
+         * 弹回课表，调档时体验很跳。只负责落盘 + 让缓存失效，下次切周/重开自然带上。
+         * 但内存里的旧缓存是用旧字号拼的，必须清掉，否则切周回来又变回原大小。
+         */
+        @JavascriptInterface
+        public void onSetFontScale(int percent) {
+            handler.post(() -> {
+                if (store == null) store = new ScheduleStore(MainActivity.this);
+                if (store.getFontScale() == percent) return;
+                store.setFontScale(percent);
+                weekHtmlCache.clear();
+                weekHtmlStateSig = "";
+                Log.d(TAG, "font scale = " + store.getFontScale() + "%");
             });
         }
 

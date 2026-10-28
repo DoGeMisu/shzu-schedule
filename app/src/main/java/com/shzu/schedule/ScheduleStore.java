@@ -35,6 +35,12 @@ public class ScheduleStore {
     private static final String KEY_BG = "bg_image";                // 自定义背景图文件名
     private static final String KEY_SPLASH_ANIM = "splash_anim";    // 是否播放开屏动画（关闭则启动直达课表）
     /**
+     * 界面字体缩放百分比（80~150，默认 100）。
+     * 页面里所有字号都写死在 CSS 里，渲染后由 JS 按这个比例统一放大/缩小，
+     * 所以它必须参与周课表 HTML 的缓存指纹（见 MainActivity.scheduleStateSignature）。
+     */
+    private static final String KEY_FONT_SCALE = "font_scale";
+    /**
      * 用户自己添加的课程。与教务抓取的数据完全分离：
      * 刷新/覆盖/清空教务课表都不会影响这里，反之亦然。
      */
@@ -77,6 +83,8 @@ public class ScheduleStore {
     private String theme = "light";
     private String bgImage = "";
     private boolean splashAnimEnabled = true;
+    /** 界面字体缩放百分比（80~150，默认 100） */
+    private int fontScale = 100;
     /** 自定义课程（独立通道，结构见 normalizeCustom） */
     private JSONArray customCourses = new JSONArray();
     /** 冲突时优先显示的来源：school(默认) / custom */
@@ -129,6 +137,7 @@ public class ScheduleStore {
         theme = prefs.getString(KEY_THEME, "light");
         bgImage = prefs.getString(KEY_BG, "");
         splashAnimEnabled = prefs.getBoolean(KEY_SPLASH_ANIM, true);
+        fontScale = clampFontScale(prefs.getInt(KEY_FONT_SCALE, 100));
         conflictPriority = prefs.getString(KEY_CONFLICT_PRIORITY, "school");
         // 自动更新：节流时间戳、上次公共内容、待弹出的更新内容
         updateLastCheck = prefs.getLong(KEY_LAST_CHECK, 0);
@@ -289,6 +298,28 @@ public class ScheduleStore {
     public void setSplashAnimEnabled(boolean enabled) {
         splashAnimEnabled = enabled;
         prefs.edit().putBoolean(KEY_SPLASH_ANIM, enabled).apply();
+    }
+
+    // ====== 界面字体缩放 ======
+    //
+    // 只影响 HTML 里的字号，不动布局尺寸：卡片高度由网格 1fr 分配，
+    // 放大字号只会让字更满，不会把卡片撑变形。
+
+    /** 字体缩放百分比，80~150，默认 100 */
+    public int getFontScale() {
+        return fontScale;
+    }
+
+    public void setFontScale(int percent) {
+        fontScale = clampFontScale(percent);
+        prefs.edit().putInt(KEY_FONT_SCALE, fontScale).apply();
+    }
+
+    /** 越界值一律夹到 80~150，防止旧数据或误传把页面字撑爆 */
+    private static int clampFontScale(int v) {
+        if (v < 80) return 80;
+        if (v > 150) return 150;
+        return v;
     }
 
     // ====== 自定义课程（独立通道） ======
