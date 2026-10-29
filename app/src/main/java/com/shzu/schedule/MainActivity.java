@@ -91,6 +91,8 @@ public class MainActivity extends AppCompatActivity {
     private android.widget.ImageView bgImageView;
     /** 顶部渐变遮罩：只在有背景图时显示，给状态栏图标和标题一点对比度 */
     private View topScrim;
+    /** 底部手势条区域遮罩：页面盖住课表时把手势条后面的照片换成页面色调 */
+    private View bottomCover;
     private View loadingOverlay;
     private View errorOverlay;
     private View splashOverlay;
@@ -181,6 +183,7 @@ public class MainActivity extends AppCompatActivity {
         webView = findViewById(R.id.webView);
         bgImageView = findViewById(R.id.bgImage);
         topScrim = findViewById(R.id.topScrim);
+        bottomCover = findViewById(R.id.bottomCover);
         installInsetsListener();
         // WebView 透明：露出下层自定义背景图，切周重载时不会闪白
         webView.setBackgroundColor(0x00000000);
@@ -499,6 +502,16 @@ public class MainActivity extends AppCompatActivity {
                     topScrim.setVisibility(View.GONE);
                 }
             }
+            // 底部遮罩：颜色 = 页面玻璃的等效实色（0.82 白 / 0.72 深灰），
+            // 叠在照片上与标签栏的玻璃观感一致；只在有背景图时存在
+            if (bottomCover != null) {
+                if (hasBgFile) {
+                    bottomCover.setBackgroundColor(dark ? 0xB808080A : 0xD1FFFFFF);
+                    bottomCover.setVisibility(View.VISIBLE);
+                } else {
+                    bottomCover.setVisibility(View.GONE);
+                }
+            }
 
             appliedBgName = bgName;
             appliedDark = dark;
@@ -664,6 +677,12 @@ public class MainActivity extends AppCompatActivity {
         if (top == appliedInsetTop && bottom == appliedInsetBottom) return;
         appliedInsetTop = top;
         appliedInsetBottom = bottom;
+        // 底部遮罩高度跟随导航条 inset：正好盖住 WebView 让出来的那段照片
+        if (bottomCover != null) {
+            ViewGroup.LayoutParams clp = bottomCover.getLayoutParams();
+            clp.height = bottom;
+            bottomCover.setLayoutParams(clp);
+        }
         if (webView == null) return;
         try {
             ViewGroup.LayoutParams lp = webView.getLayoutParams();
@@ -4047,6 +4066,11 @@ public class MainActivity extends AppCompatActivity {
         sb.append("body.hasbg.dark .tabbar{background:linear-gradient(180deg,");
         sb.append("rgba(10,10,12,0) 0%,rgba(10,10,12,0.50) 30%,rgba(10,10,12,0.72) 100%);");
         sb.append("border-top-color:transparent;}");
+        // 页面盖住课表时（我的/设置），标签栏改用与 .page 相同的玻璃底：
+        // 照片底部往往比页面处深得多，渐变再淡也会透出一条暗带，
+        // 用户看到的"底栏和刘海颜色不一致"就是这条。统一成页面色后整屏一块玻璃。
+        sb.append("body.hasbg.pagecover .tabbar{background:rgba(255,255,255,0.82);}");
+        sb.append("body.hasbg.dark.pagecover .tabbar{background:rgba(8,8,10,0.72);}");
         sb.append("body.hasbg .page{background:rgba(255,255,255,0.76);");
         sb.append("-webkit-backdrop-filter:blur(12px) saturate(118%);");
         sb.append("backdrop-filter:blur(12px) saturate(118%);}");
@@ -5389,6 +5413,7 @@ public class MainActivity extends AppCompatActivity {
         // 同时通知原生层收起顶部刘海渐变，避免切页面后顶部颜色不一致。
         sb.append("function setTabviewHidden(h){var tv=document.querySelector('.tabview');");
         sb.append("  if(tv)tv.style.display=h?'none':'';");
+        sb.append("  document.body.classList.toggle('pagecover',!!h);");
         sb.append("  if(window.Android&&Android.onPageCoverChanged)Android.onPageCoverChanged(h?1:0);}");
         // 恢复栈顶页的显示（打开二级页时它下面的页被藏掉了，关回来要还原）
         sb.append("function showStackTop(){var n=pageStack.length;");
@@ -6083,8 +6108,14 @@ public class MainActivity extends AppCompatActivity {
         @JavascriptInterface
         public void onPageCoverChanged(int covered) {
             handler.post(() -> {
-                if (topScrim == null) return;
-                topScrim.animate().alpha(covered == 1 ? 0f : 1f).setDuration(180).start();
+                float a = covered == 1 ? 0f : 1f;
+                if (topScrim != null) {
+                    topScrim.animate().alpha(a).setDuration(180).start();
+                }
+                // 页面盖住课表时遮罩淡入（盖住手势条后面的照片），露出时淡出
+                if (bottomCover != null) {
+                    bottomCover.animate().alpha(covered == 1 ? 1f : 0f).setDuration(180).start();
+                }
             });
         }
 

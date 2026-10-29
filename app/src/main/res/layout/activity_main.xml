@@ -20,6 +20,17 @@
         android:layout_height="104dp"
         android:visibility="gone" />
 
+    <!-- 底部遮罩：页面盖住课表时把手势条区域的照片换成页面色调。
+         WebView 为了让出系统栏用了底部 margin，玻璃页/标签栏都够不到
+         手势条后面那段照片，深色照片会露出一条暗带。高度运行时按
+         navigationBarInset 设置，页面盖住时淡入。 -->
+    <View
+        android:id="@+id/bottomCover"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_gravity="bottom"
+        android:visibility="gone" />
+
     <!-- Main WebView -->
     <WebView
         android:id="@+id/webView"
