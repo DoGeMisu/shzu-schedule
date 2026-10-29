@@ -13,7 +13,29 @@
 
 > 两处源码与版本完全同步，功能一致。若 Gitee 打不开，请改用 GitHub，反之亦然。
 
-![Platform](https://img.shields.io/badge/Platform-Android-3DDC84) ![Language](https://img.shields.io/badge/Language-Java-orange) ![UI](https://img.shields.io/badge/UI-WebView%20HTML%2FCSS%2FJS-blue) ![Version](https://img.shields.io/badge/Version-1.5.0-667eea)
+![Platform](https://img.shields.io/badge/Platform-Android-3DDC84) ![Language](https://img.shields.io/badge/Language-Java-orange) ![UI](https://img.shields.io/badge/UI-WebView%20HTML%2FCSS%2FJS-blue) ![Version](https://img.shields.io/badge/Version-1.5.1-667eea)
+
+## ✨ v1.5.1 更新日志
+
+**新增功能**
+
+- 📅 **点「第 N 周」可直接跳到指定周**：点标题下方的周次会弹出周次列表，选哪一周就落到哪一周，不用再一格一格地翻。
+- 👆 周次按钮加了小块浅色底与圆角，一眼就能看出它可以点。
+
+**优化**
+
+- 🪟 **自定义背景下的页面观感统一**：切到「我的」「设置」等页面时，顶部状态栏、页面主体与底部导航栏显示的是同一块背景，不再出现顶部透明、页面发暗两种颜色并存。
+- 🌫 底部导航栏改为完全透明：去掉那层由浅到深的渐变压暗，背景图原样透出，与顶部保持一致。
+- 🧱 页面里的卡片改为半透明玻璃底，标题、返回箭头与设置齿轮在背景上换成深色描边字，既看得清又不挡背景。
+- ⚡ **主题切换改为整屏同时换色**：深浅主题互相切换时，标签栏、按钮、开关与页面不再先后错开变色，一次性完成。
+- 🪟 页面叠页面时不再层层加叠半透明，二级页面看起来更干净。
+- 🖐 快速连滑切周时，新手势会先结算上一次翻页，不再出现卡住不动。
+
+**修复**
+
+- 🩹 **修复底部导航栏与页面之间有一条细缝**：两者高度对齐，接缝处不再透出背景。
+- 🩹 **修复打开周次选择、课程详情时手势条区域没被遮住**：底部那条 home 横线所在的区域现在会跟随浮层一起压暗或铺同色底。
+- 🩹 修复在「我的」「设置」页里标题与齿轮在浅色背景上看不见。
 
 ## ✨ v1.5.0 更新日志
 

@@ -12,30 +12,35 @@
         android:scaleType="centerCrop"
         android:visibility="gone" />
 
-    <!-- 顶部渐变遮罩：有背景图时盖一条很轻的渐变，否则状态栏的时间/信号
-         压在照片上几乎看不见。放在 WebView 之下，页面文字也能借到这层对比度。 -->
-    <View
-        android:id="@+id/topScrim"
-        android:layout_width="match_parent"
-        android:layout_height="104dp"
-        android:visibility="gone" />
-
-    <!-- 底部遮罩：页面盖住课表时把手势条区域的照片换成页面色调。
-         WebView 为了让出系统栏用了底部 margin，玻璃页/标签栏都够不到
-         手势条后面那段照片，深色照片会露出一条暗带。高度运行时按
-         navigationBarInset 设置，页面盖住时淡入。 -->
-    <View
-        android:id="@+id/bottomCover"
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_gravity="bottom"
-        android:visibility="gone" />
+    <!-- 有背景图时整屏只有这一张照片：状态栏、内容、手势条后面都是同一张图，
+         上面不再叠任何渐变遮罩。
+         曾经在顶部有 topScrim、底部有 bottomCover（页面盖住课表时给手势条
+         区域垫一块页面色），结果顶部露照片、底部垫实色，两边颜色永远对不上；
+         bottomCover 那块在深色主题下看起来就是「一条由透明到黑的阴影」。
+         可读性交给卡片自身的半透明底，不再靠整屏蒙版。 -->
 
     <!-- Main WebView -->
     <WebView
         android:id="@+id/webView"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
+
+    <!-- 手势条区域补色条。
+         WebView 为了让出系统栏用了 bottomMargin，所以它根本没画到手势条那段，
+         CSS 里的 .pk-mask / .modal-bg 也就盖不到那里：打开周次选择或课程详情时，
+         屏幕最下面会留一条没被压暗的照片，看着像遮罩缺了一块。
+         这条 View 正好补在那段高度上（运行时按 navigationBarInset 设置），
+         颜色由 JS 按当前浮层状态通过 setBottomShade 指定：
+           0=透明（没有浮层，照片原样透出来）
+           1=黑 42%（与 .modal-bg 的 scrim 同色）
+           2=页面底色（与底部面板 .pk-sheet 同色，面板开到底时接得上）
+         不设 clickable，触摸会继续向下派发，不挡 WebView 的手势。 -->
+    <View
+        android:id="@+id/bottomShade"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_gravity="bottom"
+        android:visibility="gone" />
 
     <!-- Loading overlay -->
     <LinearLayout

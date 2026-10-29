@@ -89,10 +89,8 @@ public class MainActivity extends AppCompatActivity {
     // ====== UI ======
     private WebView webView;
     private android.widget.ImageView bgImageView;
-    /** 顶部渐变遮罩：只在有背景图时显示，给状态栏图标和标题一点对比度 */
-    private View topScrim;
-    /** 底部手势条区域遮罩：页面盖住课表时把手势条后面的照片换成页面色调 */
-    private View bottomCover;
+    /** 手势条区域的补色条：WebView 让出了那段，CSS 浮层盖不到，由它补上 */
+    private View bottomShade;
     private View loadingOverlay;
     private View errorOverlay;
     private View splashOverlay;
@@ -182,8 +180,7 @@ public class MainActivity extends AppCompatActivity {
 
         webView = findViewById(R.id.webView);
         bgImageView = findViewById(R.id.bgImage);
-        topScrim = findViewById(R.id.topScrim);
-        bottomCover = findViewById(R.id.bottomCover);
+        bottomShade = findViewById(R.id.bottomShade);
         installInsetsListener();
         // WebView 透明：露出下层自定义背景图，切周重载时不会闪白
         webView.setBackgroundColor(0x00000000);
@@ -487,31 +484,6 @@ public class MainActivity extends AppCompatActivity {
             // 背景图存在时才沉浸：状态栏和手势条后面也画图，不需要就没有必要改窗口结构
             boolean hasBgFile = f != null && f.exists();
             applyEdgeToEdge(hasBgFile, dark);
-            // 顶部渐变：照片压在状态栏后面时，时间和信号往往读不出来，
-            // 深色主题压一层黑、浅色主题压一层白，越往下越透明。
-            if (topScrim != null) {
-                if (hasBgFile) {
-                    android.graphics.drawable.GradientDrawable g =
-                        new android.graphics.drawable.GradientDrawable(
-                            android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
-                            dark ? new int[]{0x8C000000, 0x00000000}
-                                 : new int[]{0x73FFFFFF, 0x00FFFFFF});
-                    topScrim.setBackground(g);
-                    topScrim.setVisibility(View.VISIBLE);
-                } else {
-                    topScrim.setVisibility(View.GONE);
-                }
-            }
-            // 底部遮罩：颜色 = 页面玻璃的等效实色（0.82 白 / 0.72 深灰），
-            // 叠在照片上与标签栏的玻璃观感一致；只在有背景图时存在
-            if (bottomCover != null) {
-                if (hasBgFile) {
-                    bottomCover.setBackgroundColor(dark ? 0xB808080A : 0xD1FFFFFF);
-                    bottomCover.setVisibility(View.VISIBLE);
-                } else {
-                    bottomCover.setVisibility(View.GONE);
-                }
-            }
 
             appliedBgName = bgName;
             appliedDark = dark;
@@ -677,11 +649,13 @@ public class MainActivity extends AppCompatActivity {
         if (top == appliedInsetTop && bottom == appliedInsetBottom) return;
         appliedInsetTop = top;
         appliedInsetBottom = bottom;
-        // 底部遮罩高度跟随导航条 inset：正好盖住 WebView 让出来的那段照片
-        if (bottomCover != null) {
-            ViewGroup.LayoutParams clp = bottomCover.getLayoutParams();
-            clp.height = bottom;
-            bottomCover.setLayoutParams(clp);
+        // 补色条高度跟随导航条 inset：正好盖住 WebView 让出来的那段
+        if (bottomShade != null) {
+            ViewGroup.LayoutParams slp = bottomShade.getLayoutParams();
+            slp.height = bottom;
+            bottomShade.setLayoutParams(slp);
+            // 没高度就没什么可盖的，占着反而可能挡住系统手势
+            bottomShade.setVisibility(bottom > 0 ? View.VISIBLE : View.GONE);
         }
         if (webView == null) return;
         try {
@@ -3597,6 +3571,13 @@ public class MainActivity extends AppCompatActivity {
         // 备一层极暗的分隔色（--line）与卡片色（--card），纯黑底上才看得出层次。
         sb.append("body.dark{--bg:#000000;--fg:#EDEDF2;--sub:#8E8E9E;--card:#0A0A0C;--card2:#000000;");
         sb.append("--line:#1C1C20;--empty:#050506;--modal:#0C0C0E;}");
+        // 主题切换的「同步」开关。
+        // 各控件的过渡时长并不相同（body 0.35s、.grid 0.35s、.page 0.3s、
+        // 标签栏与各种按钮压根没写过渡 → 瞬间跳变），所以切主题时会看到
+        // 有的地方在慢慢褪色、有的地方已经换完了 —— 用户说的「时间差」就是这个。
+        // 切主题的那一帧直接禁掉所有过渡，让全部控件在同一帧完成换色；
+        // 换完立刻恢复，不影响其它动画。
+        sb.append("html.theme-swap *{transition:none!important;}");
         sb.append("body{font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;");
         // 底部给标签栏留出固定高度，网格用 flex 自动吃掉剩余空间
         sb.append("background-color:var(--bg);height:100vh;color:var(--fg);");
@@ -3611,9 +3592,18 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".subline{display:flex;justify-content:center;align-items:baseline;gap:8px;}");
         sb.append(".subline .sdate{font-size:calc(12px * var(--fs,1));color:#999;}");
         sb.append(".subline .sweek{font-size:calc(15px * var(--fs,1));font-weight:700;color:var(--fg);letter-spacing:0.5px;");
-        // 可点击暗示：负 margin 扩大热区不挤占排版，按下时给一层品牌色底
-        sb.append("cursor:pointer;padding:3px 8px;margin:-3px -8px;border-radius:8px;}");
-        sb.append(".subline .sweek:active{background:rgba(102,126,234,0.15);}");
+        // 可点击暗示：给一块小胶囊底 + 一点点圆角，让人看出它能点。
+        // 这里**不能**用负 margin 去撑热区：之前是 padding:3px 10px + margin:-3px -10px，
+        // 负外边距会让背景左右各外扩 10px，而旁边的日期只隔 8px，
+        // 结果底色直接糊到「11月10日」上面，把字盖住了。
+        // 现在的口径是「背景只比文字大一圈」，热区靠 padding 本身（约 62×22）也够点。
+        sb.append("cursor:pointer;padding:2px 7px;border-radius:6px;");
+        sb.append("background:var(--card2);transition:background-color 0.16s ease,color 0.16s ease;}");
+        sb.append(".subline .sweek:active{background:rgba(102,126,234,0.18);}");
+        // 深色主题的 --card2 是纯黑，和 --bg 同色，胶囊会完全看不见；
+        // 这里单独给一层极淡的白，才有「这里是块按钮」的观感。
+        sb.append("body.dark .subline .sweek{background:rgba(255,255,255,0.10);}");
+        sb.append("body.dark .subline .sweek:active{background:rgba(102,126,234,0.32);}");
                 // min-height 用 em（跟随自身字号）：无论有没有文字，这一行的高度都固定，
         // 各周课表网格分到的高度才会完全一致。
         sb.append(".hint{text-align:center;font-size:calc(11px * var(--fs,1));color:#999;");
@@ -3628,7 +3618,10 @@ public class MainActivity extends AppCompatActivity {
         // ===== 底部标签栏 =====
         // 固定在最下方并高于设置页（z-index 96），任何页面下都可见，像真正的 tab。
         // 页面容器 .page 的 bottom 也要让出这一段（见 .page 规则）。
-        sb.append(".tabbar{position:fixed;left:0;right:0;bottom:0;height:56px;z-index:96;");
+        // 高度写成 56px+env：56px 是按钮区，env 是手势条留白（padding-bottom 吃掉）。
+        // 必须与 .page 的 bottom 算式一模一样，否则页面底边和标签栏上缘错位露缝。
+        sb.append(".tabbar{position:fixed;left:0;right:0;bottom:0;z-index:96;");
+        sb.append("height:calc(56px + env(safe-area-inset-bottom,0px));");
         sb.append("display:flex;align-items:stretch;background:var(--bg);");
         sb.append("border-top:1px solid var(--line);");
         sb.append("padding-bottom:env(safe-area-inset-bottom,0px);}");
@@ -4052,29 +4045,26 @@ public class MainActivity extends AppCompatActivity {
         sb.append("body.hasbg .modal{background:rgba(255,255,255,0.72);}");
         sb.append("body.hasbg.dark .modal{background:rgba(0,0,0,0.72);}");
         sb.append("body.hasbg .modal-close{background:rgba(102,126,234,0.92);}");
-        // 底部标签栏与整页容器：有背景图时改成半透明毛玻璃，图能透出来。
-        // 不加这两条的话，标签栏用的是不透明的 --bg，背景图到最底下就被一块实色截断了。
-        // 底部标签栏镜像顶部 scrim 的做法：上缘完全透明、往下渐实。
-        // 均匀半透明色带会在深色照片上切出一条生硬的亮带（用户反馈"和刘海颜色不一致"），
-        // 渐变后顶边融进照片，与顶部 scrim「从边缘往里渐实」的方向感一致。
-        // blur 仍作用于整个元素：透明上缘处露出的是柔化后的照片，过渡更自然。
-        sb.append("body.hasbg .tabbar{background:linear-gradient(180deg,");
-        sb.append("rgba(255,255,255,0) 0%,rgba(255,255,255,0.60) 30%,rgba(255,255,255,0.85) 100%);");
-        sb.append("border-top-color:transparent;");
-        sb.append("-webkit-backdrop-filter:blur(20px) saturate(120%);");
-        sb.append("backdrop-filter:blur(20px) saturate(120%);}");
-        sb.append("body.hasbg.dark .tabbar{background:linear-gradient(180deg,");
-        sb.append("rgba(10,10,12,0) 0%,rgba(10,10,12,0.50) 30%,rgba(10,10,12,0.72) 100%);");
-        sb.append("border-top-color:transparent;}");
-        // 页面盖住课表时（我的/设置），标签栏改用与 .page 相同的玻璃底：
-        // 照片底部往往比页面处深得多，渐变再淡也会透出一条暗带，
-        // 用户看到的"底栏和刘海颜色不一致"就是这条。统一成页面色后整屏一块玻璃。
-        sb.append("body.hasbg.pagecover .tabbar{background:rgba(255,255,255,0.82);}");
-        sb.append("body.hasbg.dark.pagecover .tabbar{background:rgba(8,8,10,0.72);}");
-        sb.append("body.hasbg .page{background:rgba(255,255,255,0.76);");
-        sb.append("-webkit-backdrop-filter:blur(12px) saturate(118%);");
-        sb.append("backdrop-filter:blur(12px) saturate(118%);}");
-        sb.append("body.hasbg.dark .page{background:rgba(8,8,10,0.62);}");
+        // 底部标签栏与整页容器：有背景图时必须完全透明。
+        // 之前写的半透明色带/渐变都是错的方向：照片本身就深浅不一，任何一层
+        // 统一的底色叠上去都会在顶部（只露照片）和底部（照片+色带）之间产生色差。
+        // 不做 blur 也是有意的：这个 WebView 没有硬件合成保证，大面积的
+        // backdrop-filter 会在底栏上下缘采样并糊出一圈更暗的边，看起来像一条阴影。
+        // 现在照片原样铺满整屏，可读性交给卡片自己的半透明底。
+        sb.append("body.hasbg .tabbar{background:transparent;border-top-color:transparent;}");
+        sb.append("body.hasbg .page{background:transparent;}");
+        // 底栏文字直接压在照片上：不给底色（那会变成色带），改用一圈极淡的
+        // 同色描边式阴影提对比度。纯阴影不改变像素底色，不会破坏"完全透明"。
+        sb.append("body.hasbg .tabbar .tabitem{text-shadow:0 1px 3px rgba(0,0,0,0.35);}");
+        sb.append("body.hasbg.dark .tabbar .tabitem{text-shadow:0 1px 3px rgba(0,0,0,0.65);}");
+        // 页面容器透明后，页头标题/返回箭头/齿轮直接压在照片上。
+        // 文字一律改成黑色（用户在浅色照片上完全看不见白色标题和齿轮），
+        // 再配一圈白色外发光，深色照片上也能勾出轮廓，不用给它们垫底色。
+        sb.append("body.hasbg .header h1,body.hasbg .ph-title,");
+        sb.append("body.hasbg .ph-back,body.hasbg .ph-gear{color:#000;");
+        sb.append("text-shadow:0 0 6px rgba(255,255,255,0.9),0 0 2px rgba(255,255,255,0.9);}");
+        sb.append("body.hasbg .page-hint,body.hasbg .about-note,");
+        sb.append("body.hasbg .cr-status{text-shadow:0 1px 3px rgba(0,0,0,0.35);}");
         // 我的/设置页里的卡片与按钮模块玻璃化：之前只有整页容器半透明，
         // 卡片还是实色 --card，页面看起来"黑一块白一块"。
         sb.append("body.hasbg .me-card,body.hasbg .nav-card,body.hasbg .about-card,");
@@ -4153,7 +4143,11 @@ public class MainActivity extends AppCompatActivity {
         String theme = store != null ? store.getTheme() : "light";
         String bgName = store != null ? store.getBgImage() : "";
         // ===== 独立设置页样式 =====
-        // 页面让出底部标签栏：bottom 不写 0，标签栏才能在任何页面下都露出来
+        // 页面让出底部标签栏。这里的算式必须与 .tabbar 的 height 完全一致：
+        // 标签栏原本是 height:56px + 内部 padding-bottom:env(…)，总高恒为 56px；
+        // 页面却按 56px+env 让位，一旦 WebView 报出非 0 的手势条 inset，
+        // 页面底边就会比标签栏上缘高出一截，中间透出后面那层 —— 用户看到的细缝。
+        // 现在两边都写成 56px+env，逐像素对齐。
         sb.append(".page{position:fixed;top:0;left:0;right:0;");
         sb.append("bottom:calc(56px + env(safe-area-inset-bottom,0px));background:var(--bg);z-index:95;");
         sb.append("display:flex;flex-direction:column;visibility:hidden;transform:translateX(100%);");
@@ -4911,6 +4905,7 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  pkRender();");
         sb.append("  document.getElementById('pkMask').classList.add('show');");
         sb.append("  document.getElementById('pkSheet').classList.add('show');");
+        sb.append("  shade(2);");
         sb.append("  var l=document.getElementById('pkList');if(l)l.scrollTop=0;}");
         // 提交：更新标题区文字（表头不滑动，只能原地改），再补齐两侧面板
         sb.append("window.applyWeekHeader=function(m){");
@@ -5372,6 +5367,8 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  /* 遮罩淡出由 .show 类的 CSS transition 负责，这里只移除类 */");
         sb.append("  playCloseAnim(mEl, r, window.__modalColor, function(){");
         sb.append("    modal.classList.remove('show');");
+        // 遮罩都没了，手势条那条补色也要一起撤掉（否则 home 横线后面是块黑的）
+        sb.append("    shade(0);");
         // 卡片渐显已在 120ms 时启动、250ms 结束，这里只做收尾清理。
         // 不要再设 opacity/transition —— 会打断正在播放的淡入导致闪跳。
         sb.append("    if(oc){setTimeout(function(){oc.style.transition='';oc.style.transform='';");
@@ -5384,6 +5381,7 @@ public class MainActivity extends AppCompatActivity {
         sb.append("function closeModalNow(){");
         sb.append("  var modal=document.getElementById('courseModal');");
         sb.append("  if(modal)modal.classList.remove('show');");
+        sb.append("  shade(0);");
         sb.append("  var mEl=document.querySelector('#courseModal .modal');");
         sb.append("  if(mEl){mEl.style.transition='none';mEl.style.left='';mEl.style.top='';");
         sb.append("    mEl.style.width='';mEl.style.height='';mEl.style.borderRadius='';mEl.style.background='';}");
@@ -5408,13 +5406,12 @@ public class MainActivity extends AppCompatActivity {
         sb.append("function resetPage(el){if(!el)return;");
         sb.append("  el.classList.remove('show','leave-left','leave-right','enter-right','enter-left');");
         sb.append("  el.style.display='';}");
-        // 有全屏页盖住课表时隐藏课表主体：玻璃页（半透明+blur）叠在课表上，
-        // 会透出错位的课表内容；藏掉后玻璃页后面就是背景图，观感干净。
-        // 同时通知原生层收起顶部刘海渐变，避免切页面后顶部颜色不一致。
+        // 有全屏页盖住课表时隐藏课表主体：页面是透明的，会透出错位的课表内容；
+        // 藏掉后页面后面就是背景图，观感干净。
+        // (pagecover 类与桥接回调保留：CSS 与老缓存仍可能引用，但已无实际蒙版。)
         sb.append("function setTabviewHidden(h){var tv=document.querySelector('.tabview');");
         sb.append("  if(tv)tv.style.display=h?'none':'';");
-        sb.append("  document.body.classList.toggle('pagecover',!!h);");
-        sb.append("  if(window.Android&&Android.onPageCoverChanged)Android.onPageCoverChanged(h?1:0);}");
+        sb.append("  document.body.classList.toggle('pagecover',!!h);}");
         // 恢复栈顶页的显示（打开二级页时它下面的页被藏掉了，关回来要还原）
         sb.append("function showStackTop(){var n=pageStack.length;");
         sb.append("  setTabviewHidden(n>0);");
@@ -5543,6 +5540,7 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  pkRender();");
         sb.append("  document.getElementById('pkMask').classList.add('show');");
         sb.append("  document.getElementById('pkSheet').classList.add('show');");
+        sb.append("  shade(2);");
         sb.append("  var l=document.getElementById('pkList');if(l)l.scrollTop=0;}");
         sb.append("function pkRender(){");
         sb.append("  var box=document.getElementById('pkList');if(!box)return;");
@@ -5563,8 +5561,13 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  if(id==='crCampus')crPickCampus();");
         sb.append("  else if(id==='crBuilding')crPickBuilding();");
         sb.append("  else if(id==='eqCampus')crPickCampusFor('eqBuilding');}");
+        // 手势条区域（home 横线）在 WebView 之外，CSS 遮罩够不到，必须通知原生补色。
+        // mode: 0=无浮层 / 1=半透明黑遮罩 / 2=底部面板（页面底色）
+        sb.append("function shade(mode){");
+        sb.append("  if(window.Android&&Android.onShadeChanged)Android.onShadeChanged(mode);}");
         sb.append("function pkClose(){var m=document.getElementById('pkMask'),sh=document.getElementById('pkSheet');");
         sb.append("  if(m)m.classList.remove('show');if(sh)sh.classList.remove('show');");
+        sb.append("  shade(0);");
         // 搜索框保持焦点会把软键盘留到面板关闭之后，必须主动失焦
         sb.append("  var q=document.getElementById('pkSearch');if(q&&q.blur)q.blur();");
         sb.append("  var a=document.activeElement;if(a&&a.blur&&a!==document.body)a.blur();}");
@@ -5686,8 +5689,9 @@ public class MainActivity extends AppCompatActivity {
         sb.append("    h+=\"<div class='cd-row'><span>\"+crEsc(row[0])+\"</span><b>\"+crEsc(row[1])+\"</b></div>\";}");
         sb.append("  var b=document.getElementById('cdBody');if(b)b.innerHTML=h;");
         sb.append("  var a=document.getElementById('cdActions');if(a)a.innerHTML=actionHtml||'';");
-        sb.append("  m.classList.add('show');}");
-        sb.append("function cdClose(){var m=document.getElementById('cdModal');if(m)m.classList.remove('show');}");
+        sb.append("  m.classList.add('show');shade(1);}");
+        sb.append("function cdClose(){var m=document.getElementById('cdModal');");
+        sb.append("  if(m)m.classList.remove('show');shade(0);}");
         // 教务的格子文本是「课程 / 教师 / (周次) / 班级」四段，按特征拆开比整段堆着清楚
         sb.append("function crSplit(lines){");
         sb.append("  var name=lines[0]||'',weeks='',rest=[];");
@@ -5882,11 +5886,21 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  if(bar)bar.style.width=p+'%';");
         sb.append("  var t=document.getElementById('upProgTxt');");
         sb.append("  if(t)t.textContent=p+'%';}");
-        // 主题切换（带背景过渡动画）
+        // 主题切换：整屏一次性换色，不做逐控件渐变。
+        // 之前给 body/.grid/.page 各写了一套 0.3~0.35s 的过渡，本意是柔和，
+        // 但漏掉的控件（标签栏、按钮、开关、页头）没有过渡，于是同一时刻
+        // 屏幕上同时存在「已换完」「正在褪色」「还没开始」三种状态，看着很不整齐。
+        // 现在：先挂 html.theme-swap 关掉全部过渡 → 同一帧内换类 → 下一帧撤掉开关。
         sb.append("function setTheme(m){");
+        sb.append("  var r=document.documentElement;");
+        sb.append("  r.classList.add('theme-swap');");
         sb.append("  document.body.classList.toggle('dark',m==='dark');");
         sb.append("  document.body.classList.toggle('light',m!=='dark');");
         sb.append("  updateThemeBtn(m);applyGlass();");
+        // 强制读一次计算样式，确保「无过渡」这一帧真的生效，
+        // 否则浏览器可能把两次修改合并成一帧，过渡依旧会跑。
+        sb.append("  void r.offsetWidth;");
+        sb.append("  requestAnimationFrame(function(){r.classList.remove('theme-swap');});");
         sb.append("  Android.onSetTheme(m);}");
         sb.append("function updateThemeBtn(m){");
         sb.append("  var l=document.getElementById('themeLight'),d=document.getElementById('themeDark');");
@@ -6101,21 +6115,48 @@ public class MainActivity extends AppCompatActivity {
         }
 
         /**
-         * 有全屏页（我的/设置等）盖住课表时由 JS 通知：covered=1 收起顶部刘海渐变。
-         * 页面自身已是浅色玻璃底（0.76 白 + blur），再叠一层 scrim 会比课表页深一截，
-         * 表现为「切页面后刘海区域颜色不统一」。盖住时藏 scrim、露出时淡回来。
+         * 页面盖住课表时的通知。
+         *
+         * 这里原本用来收放顶部 scrim / 底部遮罩，现在原生层已经没有任何整屏
+         * 蒙版了（有背景图时全屏就是同一张照片），所以不需要再做事。
+         * 桥接方法保留：老版本的 HTML 缓存里仍会调用它，删掉会抛 JS 异常。
          */
         @JavascriptInterface
         public void onPageCoverChanged(int covered) {
+            // no-op：整屏统一为背景图，不存在需要切换的图层
+        }
+
+        /**
+         * 底部浮层状态 → 手势条区域的补色条。
+         *
+         * 为什么需要：WebView 让出了 navigationBarInset 那么高的一段，
+         * CSS 里的 .pk-mask（rgba 黑 0.42）与 .pk-sheet（页面底色）都只画到
+         * WebView 的可视区内，手势条那条横线区域完全没被覆盖 —— 打开周次
+         * 选择面板时，最底下会留一条亮着的照片，看着像遮罩缺了一块。
+         *
+         * mode：0=无浮层（透明，照片透出）；1=半透明黑遮罩打开；
+         *       2=底部面板打开（与 .pk-sheet 同色，面板底边与手势条连成一片）。
+         */
+        @JavascriptInterface
+        public void onShadeChanged(int mode) {
             handler.post(() -> {
-                float a = covered == 1 ? 0f : 1f;
-                if (topScrim != null) {
-                    topScrim.animate().alpha(a).setDuration(180).start();
+                if (bottomShade == null) return;
+                boolean darkTheme = store != null && "dark".equals(store.getTheme());
+                if (mode == 0) {
+                    bottomShade.setBackgroundColor(0x00000000);
+                    bottomShade.setAlpha(1f);
+                    return;
                 }
-                // 页面盖住课表时遮罩淡入（盖住手势条后面的照片），露出时淡出
-                if (bottomCover != null) {
-                    bottomCover.animate().alpha(covered == 1 ? 1f : 0f).setDuration(180).start();
+                if (mode == 2) {
+                    // 与 .pk-sheet 的背景一致：浅色主题 var(--bg)=#FFFFFF，
+                    // 深色主题 #000000；有背景图那套半透明玻璃不适用于这条窄带，
+                    // 那里本来就看不见照片，直接用实色才不会露出色差。
+                    bottomShade.setBackgroundColor(darkTheme ? 0xFF000000 : 0xFFFFFFFF);
+                } else {
+                    // 与 .modal-bg.show / .pk-mask 的 scrim 同色，压暗程度才对得上
+                    bottomShade.setBackgroundColor(0x6B000000);
                 }
+                bottomShade.setAlpha(1f);
             });
         }
 
@@ -6864,6 +6905,8 @@ public class MainActivity extends AppCompatActivity {
             // 采样中表现为"弹窗先出现在居中大尺寸，再突然跳到卡片位置"。
             js.append("playOpenAnim(mEl, window.__cardRect, '").append(startBg).append("', '").append(paleBg).append("');");
             js.append("modal.classList.add('show');");
+            // 手势条那条横线区域在 WebView 之外，CSS 遮罩压不到，得让原生补
+            js.append("shade(1);");
             js.append("})()");
 
             webView.evaluateJavascript(js.toString(), null);
