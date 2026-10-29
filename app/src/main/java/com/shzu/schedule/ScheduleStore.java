@@ -34,6 +34,8 @@ public class ScheduleStore {
     private static final String KEY_WIDGET_THEME = "widget_theme";   // 小组件配色 light/dark
     private static final String KEY_BG = "bg_image";                // 自定义背景图文件名
     private static final String KEY_SPLASH_ANIM = "splash_anim";    // 是否播放开屏动画（关闭则启动直达课表）
+    /** 通知栏常驻当前课程（前台服务）；关闭后停服务并撤掉通知 */
+    private static final String KEY_NOTIFY_PERSIST = "notify_persist";
     /**
      * 界面字体缩放百分比（80~150，默认 100）。
      * 页面里所有字号都写死在 CSS 里，渲染后由 JS 按这个比例统一放大/缩小，
@@ -83,6 +85,8 @@ public class ScheduleStore {
     private String theme = "light";
     private String bgImage = "";
     private boolean splashAnimEnabled = true;
+    /** 通知栏是否常驻当前课程 */
+    private boolean notifyPersist = false;
     /** 界面字体缩放百分比（80~150，默认 100） */
     private int fontScale = 100;
     /** 自定义课程（独立通道，结构见 normalizeCustom） */
@@ -137,6 +141,7 @@ public class ScheduleStore {
         theme = prefs.getString(KEY_THEME, "light");
         bgImage = prefs.getString(KEY_BG, "");
         splashAnimEnabled = prefs.getBoolean(KEY_SPLASH_ANIM, true);
+        notifyPersist = prefs.getBoolean(KEY_NOTIFY_PERSIST, false);
         fontScale = clampFontScale(prefs.getInt(KEY_FONT_SCALE, 100));
         conflictPriority = prefs.getString(KEY_CONFLICT_PRIORITY, "school");
         // 自动更新：节流时间戳、上次公共内容、待弹出的更新内容
@@ -155,10 +160,12 @@ public class ScheduleStore {
         } catch (Exception ignored) {
             customCourses = new JSONArray();
         }
+        touchHashes();
     }
 
     /** 把内存数据写回磁盘（仅在变更时调用） */
     private void persist() {
+        touchHashes();
         try {
             if (data != null) prefs.edit().putString(KEY_DATA, data.toString()).apply();
         } catch (Exception ignored) {
@@ -192,6 +199,7 @@ public class ScheduleStore {
         windowEnd = 0;
         totalWeeks = 0;
         courses = null;
+        touchHashes();
     }
 
     /**
@@ -218,6 +226,7 @@ public class ScheduleStore {
         bgImage = "";
         customCourses = new JSONArray();
         conflictPriority = "school";
+        touchHashes();
     }
 
     // ====== 课程位置（拖动覆盖） ======
@@ -291,6 +300,16 @@ public class ScheduleStore {
     }
 
     /** 是否播放开屏动画（默认开启）；关闭后启动直接进入课表 */
+    /** 通知栏是否常驻当前课程 */
+    public boolean isNotifyPersist() {
+        return notifyPersist;
+    }
+
+    public void setNotifyPersist(boolean enabled) {
+        notifyPersist = enabled;
+        prefs.edit().putBoolean(KEY_NOTIFY_PERSIST, enabled).apply();
+    }
+
     public boolean isSplashAnimEnabled() {
         return splashAnimEnabled;
     }
@@ -425,6 +444,7 @@ public class ScheduleStore {
     }
 
     private void persistCustom() {
+        touchHashes();
         try {
             prefs.edit().putString(KEY_CUSTOM, customCourses.toString()).apply();
         } catch (Exception ignored) {
@@ -588,10 +608,27 @@ public class ScheduleStore {
     }
 
     /**
-     * 自定义课程指纹（进渲染缓存签名）。
-     * 增删改任何一条都会改变它，从而让后台预热的周页面缓存失效。
+     * 课程指纹缓存（进渲染缓存签名 scheduleStateSignature）。
+     *
+     * 签名在每次渲染/预热步骤都会调用两个指纹，而逐条 optString + 拼串并不便宜
+     * （整学期课表上百条 × 6 个字段）。这里按脏标记缓存：课程数据的所有变更路径
+     * （load/persist/persistCustom/clear/clearAll/saveNewData）统一置脏。
+     */
+    private int coursesHashCache = 0;
+    private boolean coursesHashDirty = true;
+    private int customHashCache = 0;
+    private boolean customHashDirty = true;
+
+    private void touchHashes() {
+        coursesHashDirty = true;
+        customHashDirty = true;
+    }
+
+    /**
+     * 自定义课程指纹。增删改任何一条都会改变它，从而让后台预热的周页面缓存失效。
      */
     public int getCustomCoursesHash() {
+        if (!customHashDirty) return customHashCache;
         int h = 1;
         for (int i = 0; i < customCourses.length(); i++) {
             JSONObject c = customCourses.optJSONObject(i);
@@ -602,6 +639,8 @@ public class ScheduleStore {
                     + c.optString("color", "") + "|" + c.optInt("day", 0) + "|" + c.optInt("row", 0)
                     + "|" + (c.optBoolean("overlap", false) ? "o" : "-")).hashCode();
         }
+        customHashCache = h;
+        customHashDirty = false;
         return h;
     }
 
@@ -623,6 +662,7 @@ public class ScheduleStore {
      */
     public int getCoursesHash() {
         if (courses == null) return 0;
+        if (!coursesHashDirty) return coursesHashCache;
         int h = 1;
         for (int i = 0; i < courses.length(); i++) {
             JSONObject c = courses.optJSONObject(i);
@@ -631,6 +671,8 @@ public class ScheduleStore {
                     + c.optString("location", "") + "|" + c.optString("weeks", "") + "|"
                     + c.optInt("day", 0) + "|" + c.optInt("row", 0)).hashCode();
         }
+        coursesHashCache = h;
+        coursesHashDirty = false;
         return h;
     }
 
@@ -718,6 +760,7 @@ public class ScheduleStore {
             persist();
             windowStart = start; windowEnd = end; totalWeeks = total;
             courses = newCourses;
+            touchHashes();   // persist() 在 courses 赋值之前，这里必须再置一次脏
             if (newPeriodTimes != null && newPeriodTimes.length > 0) periodTimes = newPeriodTimes;
         } catch (Exception ignored) {
         }

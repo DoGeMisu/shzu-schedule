@@ -12,6 +12,14 @@
         android:scaleType="centerCrop"
         android:visibility="gone" />
 
+    <!-- 顶部渐变遮罩：有背景图时盖一条很轻的渐变，否则状态栏的时间/信号
+         压在照片上几乎看不见。放在 WebView 之下，页面文字也能借到这层对比度。 -->
+    <View
+        android:id="@+id/topScrim"
+        android:layout_width="match_parent"
+        android:layout_height="104dp"
+        android:visibility="gone" />
+
     <!-- Main WebView -->
     <WebView
         android:id="@+id/webView"

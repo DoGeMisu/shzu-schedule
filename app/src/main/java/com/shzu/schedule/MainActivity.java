@@ -89,6 +89,8 @@ public class MainActivity extends AppCompatActivity {
     // ====== UI ======
     private WebView webView;
     private android.widget.ImageView bgImageView;
+    /** 顶部渐变遮罩：只在有背景图时显示，给状态栏图标和标题一点对比度 */
+    private View topScrim;
     private View loadingOverlay;
     private View errorOverlay;
     private View splashOverlay;
@@ -178,6 +180,8 @@ public class MainActivity extends AppCompatActivity {
 
         webView = findViewById(R.id.webView);
         bgImageView = findViewById(R.id.bgImage);
+        topScrim = findViewById(R.id.topScrim);
+        installInsetsListener();
         // WebView 透明：露出下层自定义背景图，切周重载时不会闪白
         webView.setBackgroundColor(0x00000000);
         loadingOverlay = findViewById(R.id.loadingOverlay);
@@ -185,6 +189,9 @@ public class MainActivity extends AppCompatActivity {
         loadingText = findViewById(R.id.loadingText);
         btnRetry = findViewById(R.id.btnRetry);
         splashOverlay = findViewById(R.id.splashOverlay);
+        // 上次开着常驻通知就重新拉起服务（必须早于首屏 HTML 生成，
+        // 否则设置页会按旧状态画出开关）
+        restorePersistentNotify();
 
         prefs = getSharedPreferences("shzu_schedule", MODE_PRIVATE);
         savedUser = prefs.getString("username", "");
@@ -364,6 +371,14 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        // 与 onPause 的挂起配对：恢复 WebView 与它的定时器
+        try {
+            if (webView != null) {
+                webView.onResume();
+                webView.resumeTimers();
+            }
+        } catch (Exception ignored) {
+        }
         applyAppBackground();
         // 同步桌面小组件：用户可能切了周/改了布局/刚同步完课表
         NextCourseWidgetProvider.refreshAll(this);
@@ -466,11 +481,248 @@ public class MainActivity extends AppCompatActivity {
                 bgImageView.setVisibility(View.GONE);
             }
 
+            // 背景图存在时才沉浸：状态栏和手势条后面也画图，不需要就没有必要改窗口结构
+            boolean hasBgFile = f != null && f.exists();
+            applyEdgeToEdge(hasBgFile, dark);
+            // 顶部渐变：照片压在状态栏后面时，时间和信号往往读不出来，
+            // 深色主题压一层黑、浅色主题压一层白，越往下越透明。
+            if (topScrim != null) {
+                if (hasBgFile) {
+                    android.graphics.drawable.GradientDrawable g =
+                        new android.graphics.drawable.GradientDrawable(
+                            android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
+                            dark ? new int[]{0x8C000000, 0x00000000}
+                                 : new int[]{0x73FFFFFF, 0x00FFFFFF});
+                    topScrim.setBackground(g);
+                    topScrim.setVisibility(View.VISIBLE);
+                } else {
+                    topScrim.setVisibility(View.GONE);
+                }
+            }
+
             appliedBgName = bgName;
             appliedDark = dark;
             appliedOnce = true;
         } catch (Exception e) {
             Log.e(TAG, "applyAppBackground error", e);
+        }
+    }
+
+    // ====== 通知栏常驻课程 ======
+
+    private static final int REQ_NOTIFY_PERM = 2002;
+
+    /** Android 13+ 通知需要运行时授权，13 以下默认有 */
+    private boolean canPostNotifications() {
+        if (Build.VERSION.SDK_INT < 33) return true;
+        return checkSelfPermission("android.permission.POST_NOTIFICATIONS")
+                == android.content.pm.PackageManager.PERMISSION_GRANTED;
+    }
+
+    /**
+     * 开关入口。askPermission=true 时会弹系统授权框，授权回调里再真正落地。
+     *
+     * 之所以不直接写配置就启动服务：没有通知权限时前台服务虽然能跑，
+     * 但通知不会显示，用户会看到"开关是开的、通知栏里什么都没有"。
+     */
+    private void applyPersistentNotify(boolean enabled, boolean askPermission) {
+        try {
+            if (store == null) store = new ScheduleStore(this);
+            if (enabled && !canPostNotifications()) {
+                if (askPermission) {
+                    requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, REQ_NOTIFY_PERM);
+                    return;
+                }
+                store.setNotifyPersist(false);
+                Toast.makeText(this, "没有通知权限，无法常驻通知", Toast.LENGTH_SHORT).show();
+                syncNotifySwitch();
+                return;
+            }
+            store.setNotifyPersist(enabled);
+            if (enabled) {
+                startNotifyService();
+            } else {
+                stopNotifyService();
+            }
+            syncNotifySwitch();
+        } catch (Exception e) {
+            Log.w(TAG, "applyPersistentNotify failed", e);
+        }
+    }
+
+    private void startNotifyService() {
+        try {
+            Intent i = new Intent(this, CourseNotifyService.class);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(i);
+            } else {
+                startService(i);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "startNotifyService failed", e);
+        }
+    }
+
+    private void stopNotifyService() {
+        try {
+            stopService(new Intent(this, CourseNotifyService.class));
+        } catch (Exception e) {
+            Log.w(TAG, "stopNotifyService failed", e);
+        }
+    }
+
+    /** 把开关的实际状态回写给设置页（页面上可能已经乐观翻转过了） */
+    private void syncNotifySwitch() {
+        if (webView == null) return;
+        boolean on = store != null && store.isNotifyPersist();
+        try {
+            webView.evaluateJavascript("window.setNotifySwitch&&setNotifySwitch(" + (on ? "true" : "false") + ")", null);
+        } catch (Exception ignored) {
+        }
+    }
+
+    /**
+     * 启动时恢复常驻通知。
+     *
+     * 进程被系统回收后通知会随进程消失，回到应用时得重新拉起；
+     * 若用户在系统设置里撤掉了通知权限，这里顺手把开关关掉，
+     * 避免出现"开关显示开着、通知栏却是空的"。
+     */
+    private void restorePersistentNotify() {
+        try {
+            if (store == null) store = new ScheduleStore(this);
+            if (!store.isNotifyPersist()) return;
+            if (!canPostNotifications()) {
+                store.setNotifyPersist(false);
+                return;
+            }
+            startNotifyService();
+        } catch (Exception e) {
+            Log.w(TAG, "restorePersistentNotify failed", e);
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != REQ_NOTIFY_PERM) return;
+        boolean granted = grantResults.length > 0
+                && grantResults[0] == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        if (granted) {
+            applyPersistentNotify(true, false);
+        } else {
+            applyPersistentNotify(false, false);
+            Toast.makeText(this, "没有通知权限，无法常驻通知", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    // ====== 背景图铺到系统栏后面（沉浸式） ======
+
+    /**
+     * 监听系统栏高度。只有边缘到边缘时才把 insets 变成 WebView 的上下 margin，
+     * 其余情况一律 return 原样，避免影响原有的安全区行为。
+     */
+    private void installInsetsListener() {
+        try {
+            final View dv = getWindow().getDecorView();
+            dv.setOnApplyWindowInsetsListener((v, insets) -> {
+                if (edgeToEdge) {
+                    int top;
+                    int bottom;
+                    if (Build.VERSION.SDK_INT >= 30) {
+                        android.graphics.Insets bars =
+                                insets.getInsets(android.view.WindowInsets.Type.systemBars());
+                        // 边缘到边缘之后系统不再因为键盘自动缩小窗口，
+                        // 这里把键盘高度也算进下边距，否则输入框会被键盘直接盖住。
+                        android.graphics.Insets ime =
+                                insets.getInsets(android.view.WindowInsets.Type.ime());
+                        top = bars.top;
+                        bottom = Math.max(bars.bottom, ime.bottom);
+                    } else {
+                        // API 30 以下 getSystemWindowInsetBottom 本身就包含键盘高度
+                        top = insets.getSystemWindowInsetTop();
+                        bottom = insets.getSystemWindowInsetBottom();
+                    }
+                    setWebSafeInsets(top, bottom);
+                }
+                return insets;
+            });
+            dv.requestApplyInsets();
+        } catch (Exception e) {
+            Log.w(TAG, "installInsetsListener failed", e);
+        }
+    }
+
+    /**
+     * 把系统栏高度转成 WebView 的外边距。
+     *
+     * 为什么用 margin 而不是给 WebView 加 padding：padding 不会裁剪内容，
+     * WebView 滚动时页面会从 padding 区域里穿出来；margin 是把 WebView 整个
+     * 缩小到安全区，页面 100vh 也跟着变，布局不会被拉伸。
+     */
+    private void setWebSafeInsets(int top, int bottom) {
+        if (top == appliedInsetTop && bottom == appliedInsetBottom) return;
+        appliedInsetTop = top;
+        appliedInsetBottom = bottom;
+        if (webView == null) return;
+        try {
+            ViewGroup.LayoutParams lp = webView.getLayoutParams();
+            if (lp instanceof ViewGroup.MarginLayoutParams) {
+                ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
+                m.topMargin = top;
+                m.bottomMargin = bottom;
+                webView.setLayoutParams(m);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "setWebSafeInsets failed", e);
+        }
+    }
+
+    /**
+     * 开关沉浸式。开：状态栏/导航条透明，窗口延伸到它们后面，背景图铺满整屏；
+     * 关：恢复主题色状态栏与安全区布局（没有背景图时不需要露出什么）。
+     */
+    private void applyEdgeToEdge(boolean on, boolean dark) {
+        try {
+            android.view.Window w = getWindow();
+            View dv = w.getDecorView();
+            if (on) {
+                if (Build.VERSION.SDK_INT >= 30) {
+                    w.setDecorFitsSystemWindows(false);
+                } else {
+                    int f = dv.getSystemUiVisibility()
+                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                            | View.SYSTEM_UI_FLAG_LAYOUT_STABLE;
+                    dv.setSystemUiVisibility(f);
+                }
+                w.setStatusBarColor(0x00000000);
+                w.setNavigationBarColor(0x00000000);
+                if (Build.VERSION.SDK_INT >= 29) {
+                    // 默认的系统会在这两条上垫一层半透明遮罩，背景图会被压灰
+                    w.setNavigationBarContrastEnforced(false);
+                }
+            } else {
+                if (Build.VERSION.SDK_INT >= 30) {
+                    w.setDecorFitsSystemWindows(true);
+                } else {
+                    int f = dv.getSystemUiVisibility()
+                            & ~(View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+                    dv.setSystemUiVisibility(f);
+                }
+                setWebSafeInsets(0, 0);
+                applyStatusBar(dark);
+                w.setNavigationBarColor(dark ? 0xFF000000 : 0xFFFFFFFF);
+                if (Build.VERSION.SDK_INT >= 29) {
+                    w.setNavigationBarContrastEnforced(true);
+                }
+            }
+            edgeToEdge = on;
+            // 切换后系统栏尺寸要重新算一遍（尤其从有背景图切到无背景图时）
+            dv.requestApplyInsets();
+        } catch (Exception e) {
+            Log.w(TAG, "applyEdgeToEdge failed", e);
         }
     }
 
@@ -483,7 +735,8 @@ public class MainActivity extends AppCompatActivity {
     private void applyStatusBar(boolean dark) {
         try {
             android.view.Window w = getWindow();
-            w.setStatusBarColor(dark ? 0xFF0F1016 : 0xFFFFFFFF);
+            // 沉浸式下状态栏要透明（露出背景图），这里只负责图标明暗
+            w.setStatusBarColor(edgeToEdge ? 0x00000000 : (dark ? 0xFF0F1016 : 0xFFFFFFFF));
             View dv = w.getDecorView();
             int flags = dv.getSystemUiVisibility();
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -1006,10 +1259,22 @@ public class MainActivity extends AppCompatActivity {
         // 退到后台就不必再预热其余周次了（下次回到前台由 renderWeekSchedule 重新排入）
         handler.removeCallbacks(prewarmStep);
         prewarmQueue.clear();
+        // 把主 WebView 也挂起：不挂起时它会在后台继续跑 CSS 动画、JS 定时器与合成，
+        // 屏幕关着也照样吃 CPU/电量 —— 这是"待机也耗电"的常见来源。
+        // 静默刷新用的是另一个隐藏 WebView，pauseTimers 会连它一起停，
+        // 所以后台刷新进行中就不动定时器，只挂起主界面。
+        try {
+            if (webView != null) webView.onPause();
+            if (!silentRunning && webView != null) webView.pauseTimers();
+        } catch (Exception ignored) {
+        }
     }
 
     @Override
     protected void onDestroy() {
+        // 预热是自续定时器（140ms 一步），Activity 销毁后若还在跑，
+        // 会继续触碰已销毁的 WebView（loadDataWithBaseURL），必须先摘掉
+        handler.removeCallbacks(prewarmStep);
         // 后台静默刷新用的隐藏 WebView 必须显式释放，否则会泄漏 Activity
         silentAbort("activity destroy");
         releaseStudentWv();
@@ -1059,8 +1324,10 @@ public class MainActivity extends AppCompatActivity {
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
         s.setJavaScriptCanOpenWindowsAutomatically(true);
-        s.setSupportZoom(true);
-        s.setBuiltInZoomControls(true);
+        // 页面是固定视口（viewport 里写死 initial-scale=1），不需要手势缩放：
+        // 开着 zoom 会让 WebView 常驻一层缩放手势识别与合成层，纯属浪费。
+        s.setSupportZoom(false);
+        s.setBuiltInZoomControls(false);
         s.setDisplayZoomControls(false);
         s.setLoadWithOverviewMode(true);
         s.setUseWideViewPort(true);
@@ -2838,6 +3105,18 @@ public class MainActivity extends AppCompatActivity {
 
     private int currentDisplayWeek = 1;
 
+    /**
+     * 是否处于「背景图铺满全屏」状态：有自定义背景图时开启。
+     *
+     * 开启后窗口内容延伸到状态栏与系统导航条后面，背景图能一直画到刘海和手势条，
+     * WebView 再用 margin 让出这两条高度 —— 页面布局与字号完全不受影响，
+     * 只是「窗口」变高了。关掉背景图就恢复成原来的安全区布局。
+     */
+    private boolean edgeToEdge = false;
+    /** 当前已应用的系统栏高度（px），用来判断是否真的需要改 margin */
+    private int appliedInsetTop = 0;
+    private int appliedInsetBottom = 0;
+
     /** 课程配色。必须与 NextCourse.COLORS 完全一致，否则小组件与课表页颜色会对不上 */
     private static final String[] COURSE_COLORS = {
         "#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4", "#FFA07A",
@@ -2859,8 +3138,14 @@ public class MainActivity extends AppCompatActivity {
     private static final int MIN_PERIOD_MINUTES = 25;
     private static final String[] WEEKDAY_CN = {"", "周一", "周二", "周三", "周四", "周五", "周六", "周日"};
 
-    /** 后台预热周数上限：只备邻近几周，避免无意义地占内存 */
-    private static final int PREWARM_MAX_WEEKS = 6;
+    /**
+     * 后台预热周数上限：只备邻近几周，避免无意义地占内存。
+     *
+     * 从 6 降到 4：每预生成一周都要拼一次完整 HTML（几十 KB 字符串 + 全部卡片），
+     * 6 周在主线程上累计明显可感（启动后 CPU 会顶一小会儿）。
+     * 热门方向是"往后翻"，所以队列本身也是先正向后负向，4 周已覆盖绝大多数切换。
+     */
+    private static final int PREWARM_MAX_WEEKS = 4;
     /**
      * 周课表 HTML 缓存（LRU，只留邻近几周）。
      *
@@ -2913,6 +3198,73 @@ public class MainActivity extends AppCompatActivity {
      * 周课表 HTML 里烘焙了主题、背景、拖动后的位置以及课表数据本身，
      * 任何一项变化都必须让旧缓存作废，否则会渲染出与当前设置不一致的页面。
      */
+    /**
+     * 取某一周的「网格片段」（`<div class='grid'>…</div>`），给横条两侧的相邻周面板用。
+     *
+     * 不重新拼装整页：优先复用 weekHtmlCache 里已有的整页 HTML，按 <!--/grid--> 标记
+     * 切出网格部分（两次 indexOf，几十 KB 字符串，耗时 <1ms）；缺失时才生成一次并缓存 ——
+     * 那份缓存以后整页渲染也能直接命中，不浪费。
+     */
+    private String gridFragment(int week) {
+        if (store == null) return "";
+        if (!store.hasData() && store.getCustomCourseCount() == 0) return "";
+        int total = store.getTotalWeeks();
+        if (week < 1 || (total > 0 && week > total)) return "";
+        String full = weekHtmlCache.get(week);
+        if (full == null) {
+            full = generateWeekHTML(week, store.coursesForWeek(week));
+            weekHtmlCache.put(week, full);
+        }
+        int a = full.indexOf("<!--grid--><div class='grid");
+        int b = full.indexOf("<!--/grid-->", a);
+        if (a < 0 || b < 0) return "";
+        // 从标记之后开始，避免把 <!--grid--> 本身带进面板
+        return full.substring(a + "<!--grid-->".length(), b);
+    }
+
+    /** 当前是周几（1=周一 … 7=周日），与课表里「今日高亮」的判定口径保持一致 */
+    private static int currentDow() {
+        int dw = Calendar.getInstance().get(Calendar.DAY_OF_WEEK);
+        return dw == Calendar.SUNDAY ? 7 : dw - 1;
+    }
+
+    /**
+     * 某一周在「标题区 + 表头」上的全部文字。
+     *
+     * 切周只滑网格、不重载整页，所以这些固定不动的文字要单独回填：
+     * 日期、第 N 周、本周提示、7 个日期、今日列高亮、◀▶ 是否可用。
+     */
+    private String weekMetaJson(int week) {
+        JSONObject o = new JSONObject();
+        try {
+            int total = store == null ? 0 : store.getTotalWeeks();
+            long monday = (store != null && store.getWeek1Monday() > 0) ? store.mondayOf(week) : 0;
+            int todayWeek = store == null ? -1 : store.todayWeek();
+            boolean isToday = (week == todayWeek);
+            o.put("w", week);
+            o.put("label", "第" + week + "周");
+            o.put("date", monday > 0 ? ScheduleStore.fmtDate(monday) + " 起" : "");
+            JSONArray days = new JSONArray();
+            for (int d = 1; d <= 7; d++) {
+                days.put(monday > 0 ? ScheduleStore.fmtDate(monday + (d - 1) * 86400000L) : "");
+            }
+            o.put("days", days);
+            o.put("todayDow", isToday ? currentDow() : 0);
+            o.put("hint", isToday
+                    ? "本周 · 今天 " + ScheduleStore.fmtDate(System.currentTimeMillis())
+                      + " " + ScheduleStore.fmtWeekday(System.currentTimeMillis())
+                    : "");
+            o.put("canPrev", week > 1);
+            o.put("canNext", total > 0 && week < total);
+        } catch (Exception ignored) {
+        }
+        // 与 updateInfoJson 同样的口径：只转义 < > &，保持对象字面量、不要再套 JSONObject.quote
+        return o.toString()
+                .replace("<", "\\u003c")
+                .replace(">", "\\u003e")
+                .replace("&", "\\u0026");
+    }
+
     private String scheduleStateSignature() {
         if (store == null) return "";
         JSONObject ov = store.getOverrides();
@@ -2974,6 +3326,8 @@ public class MainActivity extends AppCompatActivity {
     private final Runnable prewarmStep = new Runnable() {
         @Override
         public void run() {
+            // 兜底：销毁中的 Activity 不再继续预热（正常路径 onDestroy 已摘掉回调）
+            if (isFinishing() || isDestroyed()) return;
             if (prewarmQueue.isEmpty() || store == null || !store.hasData()) return;
             String sig = scheduleStateSignature();
             if (!sig.equals(weekHtmlStateSig)) {
@@ -2986,8 +3340,10 @@ public class MainActivity extends AppCompatActivity {
                 weekHtmlCache.put(w, generateWeekHTML(w, store.coursesForWeek(w)));
                 Log.d(TAG, "prewarm week " + w + " ready");
             }
-            // 一周一帧地做，主线程每次只承担一次拼装的耗时
-            handler.postDelayed(this, 80);
+            // 一周一帧地做，主线程每次只承担一次拼装的耗时。
+            // 间隔从 80ms 放宽到 140ms：相邻两帧之间至少要留出一次正常输入的时间，
+            // 否则连点切换周/拖动时会跟预渲染抢主线程（表现为掉帧、发烫）。
+            handler.postDelayed(this, 140);
         }
     };
 
@@ -3218,8 +3574,10 @@ public class MainActivity extends AppCompatActivity {
           .append(";--fsg:").append(gridFontScaleFactor()).append(";");
         sb.append("--bg:#FFFFFF;--fg:#333;--sub:#999;--card:#F0F0F5;--card2:#F8F8FA;");
         sb.append("--line:#F0F0F5;--empty:#FAFAFC;--modal:#FFFFFF;}");
-        sb.append("body.dark{--bg:#0F1016;--fg:#E9E9F2;--sub:#A9A9BE;--card:#1E1F2A;--card2:#161722;");
-        sb.append("--line:#2A2B38;--empty:#191A24;--modal:#1A1B26;}");
+        // 深色主题直接用纯黑：OLED 屏上黑像素不发光，既省电也不刺眼。
+        // 备一层极暗的分隔色（--line）与卡片色（--card），纯黑底上才看得出层次。
+        sb.append("body.dark{--bg:#000000;--fg:#EDEDF2;--sub:#8E8E9E;--card:#0A0A0C;--card2:#000000;");
+        sb.append("--line:#1C1C20;--empty:#050506;--modal:#0C0C0E;}");
         sb.append("body{font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;");
         // 底部给标签栏留出固定高度，网格用 flex 自动吃掉剩余空间
         sb.append("background-color:var(--bg);height:100vh;color:var(--fg);");
@@ -3234,7 +3592,10 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".subline{display:flex;justify-content:center;align-items:baseline;gap:8px;}");
         sb.append(".subline .sdate{font-size:calc(12px * var(--fs,1));color:#999;}");
         sb.append(".subline .sweek{font-size:calc(15px * var(--fs,1));font-weight:700;color:var(--fg);letter-spacing:0.5px;}");
-        sb.append(".hint{text-align:center;font-size:calc(11px * var(--fs,1));color:#999;margin-top:3px;}");
+                // min-height 用 em（跟随自身字号）：无论有没有文字，这一行的高度都固定，
+        // 各周课表网格分到的高度才会完全一致。
+        sb.append(".hint{text-align:center;font-size:calc(11px * var(--fs,1));color:#999;");
+        sb.append("margin-top:3px;line-height:1.5;min-height:1.5em;}");
         sb.append(".btns{display:flex;justify-content:center;align-items:center;gap:8px;margin-top:8px;}");
         sb.append(".btn{background:var(--card);border:none;color:var(--fg);font-size:calc(12px * var(--fs,1));");
         sb.append("border-radius:16px;padding:0 14px;height:32px;line-height:32px;flex:0 0 auto;}");
@@ -3268,7 +3629,6 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".me-info i{display:block;font-style:normal;font-size:calc(13px * var(--fs,1));color:var(--sub);margin-top:5px;}");
         sb.append(".me-empty{font-size:calc(13px * var(--fs,1));color:var(--sub);line-height:1.7;}");
         sb.append(".page-hint{font-size:calc(12px * var(--fs,1));color:var(--sub);line-height:1.7;padding:2px 4px 20px;}");
-        sb.append(".more-empty{text-align:center;color:var(--sub);font-size:calc(13px * var(--fs,1));line-height:2;padding:56px 0;}");
         // 查询教室：状态行 + 教务原始结果表的兜底样式
         sb.append(".cr-status{font-size:calc(13px * var(--fs,1));color:var(--sub);line-height:1.7;padding:8px 2px;}");
         sb.append(".cr-raw{margin-top:16px;overflow:auto;-webkit-overflow-scrolling:touch;}");
@@ -3353,9 +3713,15 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".grid{display:grid;grid-template-columns:34px repeat(7,1fr);gap:3px;");
         sb.append("flex:1;min-height:0;grid-auto-rows:1fr;background:var(--card2);border-radius:14px;padding:8px;");
         sb.append("transition:background-color 0.35s ease;}");
+        // 表头格子高度必须恒定：一行是「周一」+ 一行日期，共两行。
+        // 列宽只有 40 出头，「11月10日」比「11月9日」多一个数字就会折成两行，
+        // 把整行撑高、连带下面的课表网格一起往下跳 —— 所以这里锁死 nowrap。
         sb.append(".gh{text-align:center;font-weight:700;font-size:calc(12px * var(--fsg,1));padding:8px 2px;");
-        sb.append("background:var(--card);border-radius:8px;color:var(--fg);}");
-        sb.append(".gh-date{font-size:calc(10px * var(--fsg,1));font-weight:400;color:#999;margin-top:2px;}");
+        sb.append("background:var(--card);border-radius:8px;color:var(--fg);");
+        sb.append("white-space:nowrap;overflow:hidden;line-height:1.25;}");
+        // 日期用略小的字号 + 负字距，「11月10日」这种 5 字日期也能塞进一格
+        sb.append(".gh-date{font-size:calc(9px * var(--fsg,1));font-weight:400;color:#999;");
+        sb.append("margin-top:2px;letter-spacing:-0.2px;white-space:nowrap;line-height:1.35;}");
         sb.append(".gh.today{background:#667eea;color:#fff;}");
         sb.append(".gh.today .gh-date{color:#ddd;}");
         sb.append(".ts{font-size:calc(10px * var(--fsg,1));text-align:center;color:#777;");
@@ -3425,18 +3791,40 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".db-apply{background:#667eea;color:#fff;flex:2.2;order:2;font-size:calc(14px * var(--fs,1));}");
         sb.append(".db-cancel{background:#F0F0F5;color:#555;flex:1;order:1;}");
         sb.append(".db-undo{background:#F0F0F5;color:#555;flex:1;order:3;}");
-        // 课程卡片入场动画：由小变大（缩放淡入）
-        // 仅用于课表刷新场景（切周 / 首次加载 / 手动刷新导入）
+        // 课程卡片入场动画：由小变大（缩放淡入），**全屏卡片同时开始，不再按行列错峰**。
+        // 之前用 (row+d)*0.05s 的延迟做出「左上到右下依次弹出」的级联，整屏 60+ 张卡片
+        // 要花近 1 秒才铺满，而且每次都重播，观感很吵。现在统一 0 延迟一起弹。
         //
         // fill-mode 必须是 backwards：
-        //   - backwards：动画延迟期间就应用起始帧(opacity:0,scale:.72)，
+        //   - backwards：动画延迟期间就应用起始帧(opacity:0,scale)，
         //     否则卡片会先以最终样式整块闪出来、等延迟结束后再从头播，视觉上
         //     就是"先直接显示 → 消失 → 再放大"
         //   - 不能用 both/forwards：那会在结束后锁死 transform，
         //     导致 .dragging 的 scale(1.07) 与 :active 的 scale(0.96) 全部失效
-        sb.append("@keyframes popIn{from{opacity:0;transform:scale(0.72);}");
+        sb.append("@keyframes popIn{from{opacity:0;transform:scale(0.86);}");
         sb.append("to{opacity:1;transform:scale(1);}}");
-        sb.append(".course{animation:popIn 0.22s cubic-bezier(.34,1.4,.64,1) backwards;}");
+        sb.append(".course{animation:popIn 0.18s cubic-bezier(.34,1.32,.64,1) backwards;}");
+        // ===== 切周：网格横向跟手滑动（不重载整页）=====
+        // .tabview 是课表主体的容器（标题 + 日期行 + 按钮 + 表头 + 网格）。
+        // 切标签时它左移让位；切周只动里面的 .weekstrip。
+        // 这里刻意不写 will-change：常驻的 will-change 会把这整层永久提升为合成层，
+        // 白白占显存并让每次重绘都走 GPU 合成；动画期间浏览器自己会临时提升。
+        sb.append(".tabview{flex:1;display:flex;flex-direction:column;min-height:0;");
+        sb.append("transition:transform 0.22s cubic-bezier(.22,.68,.36,1);}");
+        // 切标签时课表主体左移让位：视觉上是"翻页推走"，而不是被新页盖住
+        sb.append(".tabview.shift-out{transform:translateX(-16%);}");
+        // ---- 周横条：视口裁切层 + 300% 宽的横条 + 三个等宽面板 ----
+        // 面板宽度取横条的 1/3（= 视口宽）。基准位移 -33.3333% 就是把中间那块对齐视口。
+        // 位移用 calc(-33.3333% + Npx)：百分比相对横条自身宽度，px 是手指位移，两者可叠加。
+        sb.append(".gridview{flex:1;min-height:0;overflow:hidden;position:relative;}");
+        sb.append(".weekstrip{display:flex;width:300%;height:100%;");
+        sb.append("transform:translateX(-33.3333%);");
+        sb.append("transition:transform 0.28s cubic-bezier(.22,.68,.36,1);}");
+        // 拖动中必须关掉过渡，否则每一帧都会被动画追尾，手感发黏
+        sb.append(".weekstrip.dragging{transition:none;}");
+        sb.append(".weekpanel{flex:0 0 33.3333%;height:100%;display:flex;flex-direction:column;min-width:0;}");
+        // 新插入的面板在屏幕外，别让它播卡片入场动画（白耗一帧合成）
+        sb.append(".weekpanel.nofx .course{animation:none;}");
         // 拖动落位/撤销：不要入场动画，直接从浮动状态静止落位
         sb.append(".course.no-anim{animation:none!important;}");
         // ===== 课程详情弹窗：仿鸿蒙/ColorOS「应用从图标展开成窗口」 =====
@@ -3518,7 +3906,12 @@ public class MainActivity extends AppCompatActivity {
         sb.append("background:#fff;box-shadow:0 1px 3px rgba(0,0,0,0.25);");
         sb.append("transition:left 0.2s cubic-bezier(.3,.8,.4,1);}");
         sb.append(".switch.on i{left:23px;}");
+        // 强制生效/不适用时置灰：开关仍显示真实状态，只是不可点
+        sb.append(".switch:disabled{cursor:default;opacity:0.55;}");
         sb.append("body.dark .switch{background:#3A3B4A;}");
+        // 深色下「开」的紫色底要被单独补回来：body.dark .switch 的特异性高于 .switch.on，
+        // 不补的话深色主题里所有开关都看不出是开着的（一直是灰底）。
+        sb.append("body.dark .switch.on{background:#667eea;}");
         // ===== 字体大小：滑块 + 档位按钮 =====
         // 滑块负责连续调节（实时预览），下面四个档位负责一键回到常用值。
         // 两者共用 applyFontScale()，每次调节都会同步滑块位置、数值文字与档位高亮。
@@ -3602,6 +3995,9 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".up-prog-txt{font-size:calc(12px * var(--fs,1));color:var(--sub);margin-top:6px;text-align:center;}");
         // 空课周提示
         sb.append(".emptyweek{grid-column:1/-1;text-align:center;color:var(--sub);font-size:calc(13px * var(--fs,1));padding:40px 0;}");
+        // 空周：唯一那一行撑满整块高度，提示文字垂直居中（否则空网格看着像塌了）
+        sb.append(".grid.empty-grid{grid-template-rows:1fr;}");
+        sb.append(".grid.empty-grid .emptyweek{align-self:center;padding:0;}");
         // 自定义图片背景：卡片/控件半透明，文字保持原色
         sb.append("body.hasbg .grid{background:transparent;}");
         sb.append("body.hasbg .gh{background:rgba(240,240,245,0.62);}");
@@ -3620,7 +4016,9 @@ public class MainActivity extends AppCompatActivity {
         sb.append("body.hasbg.dark .empty{background:transparent;}");
         sb.append("body.hasbg.dark .btn{background:rgba(30,31,42,0.62);}");
         sb.append("body.hasbg.dark .btn-nav{background:rgba(30,31,42,0.62);}");
-        sb.append("body.hasbg.dark .course::before{opacity:0.88;}");
+        // 深色 + 背景图：原来这里是 88% 的课程色（整屏彩色）。改成灰，
+        // 让背景图透过半透明灰卡显示，与无背景图时的纯灰卡一致。
+        sb.append("body.hasbg.dark .course::before{background:#1A1B1D!important;opacity:0.62;}");
         sb.append("body.hasbg.dark .course::after{opacity:0.88;}");
         // 有自定义背景图时弹窗半透明（毛玻璃观感）
         sb.append("body.hasbg .settings-modal{background:rgba(255,255,255,0.78);}");
@@ -3632,6 +4030,81 @@ public class MainActivity extends AppCompatActivity {
         sb.append("body.hasbg .modal{background:rgba(255,255,255,0.72);}");
         sb.append("body.hasbg.dark .modal{background:rgba(0,0,0,0.72);}");
         sb.append("body.hasbg .modal-close{background:rgba(102,126,234,0.92);}");
+        // 底部标签栏与整页容器：有背景图时改成半透明毛玻璃，图能透出来。
+        // 不加这两条的话，标签栏用的是不透明的 --bg，背景图到最底下就被一块实色截断了。
+        sb.append("body.hasbg .tabbar{background:rgba(255,255,255,0.72);");
+        sb.append("border-top-color:rgba(255,255,255,0.45);");
+        sb.append("-webkit-backdrop-filter:blur(20px) saturate(120%);");
+        sb.append("backdrop-filter:blur(20px) saturate(120%);}");
+        sb.append("body.hasbg.dark .tabbar{background:rgba(10,10,12,0.62);");
+        sb.append("border-top-color:rgba(255,255,255,0.10);}");
+        sb.append("body.hasbg .page{background:rgba(255,255,255,0.76);");
+        sb.append("-webkit-backdrop-filter:blur(12px) saturate(118%);");
+        sb.append("backdrop-filter:blur(12px) saturate(118%);}");
+        sb.append("body.hasbg.dark .page{background:rgba(8,8,10,0.62);}");
+        // ===== 雾面玻璃卡片（.glass）=====
+        // 为什么需要它：深色主题下卡片用的是高饱和实色（#667EEA 这类），
+        // 黑暗环境里整屏十几次亮度很高的色块，看着晃眼。
+        //
+        // 做法：卡片底色换成「极低透明度的白 + 一点点 --cc 色相」，
+        // 文字仍是白色；色相只留 20%，课程的区分度靠色相而不是靠亮度。
+        // 顺序很关键：这段必须放在 body.hasbg 的 ::before 之后，同特异性下后定义者胜出。
+        // 只有深色主题挂 .glass（浅色主题沿用原来的实色卡片，见下方 glassOn 判定）。
+        // 深色卡片用「灰底」而不是近纯黑：纯黑背景上若卡片也是黑的，
+        // 整屏就只剩十几道描边，分不清卡片边界。灰底 + 对角边缘光一起才读得出层次。
+        sb.append("body.dark.glass .course{background:radial-gradient(120% 90% at 0% 0%,");
+        sb.append("rgba(255,255,255,0.06),rgba(255,255,255,0) 62%),#1A1B1D!important;}");
+        // 有背景图时卡片必须半透明，否则整块灰会把背景图糊死；
+        // 这里的 alpha 与下方 backdrop-filter 配合，观感仍是「深色玻璃」。
+        sb.append("body.dark.glass.hasbg .course{background:radial-gradient(120% 90% at 0% 0%,");
+        sb.append("rgba(255,255,255,0.06),rgba(255,255,255,0) 62%),rgba(26,27,29,0.62)!important;}");
+        // 真·雾面：只在有背景图时开（平底色上模糊没有视觉收益，纯烧 GPU）
+        sb.append("body.glass.hasbg .course{-webkit-backdrop-filter:blur(14px) saturate(130%);");
+        sb.append("backdrop-filter:blur(14px) saturate(130%);}");
+        // 深色卡片不带任何课程色：纯灰底 + 白字 + 边缘光。
+        // 曾经叠过 8% 的 --cc 做科目区分，用户在真机上看还是"有颜色"，要求全灰。
+        // ::before 仍要占住（有背景图那套规则会用到），这里只把它置为透明。
+        sb.append("body.dark.glass .course::before{content:'';position:absolute;inset:0;");
+        sb.append("border-radius:inherit;background:transparent;opacity:0;z-index:0;}");
+        // 对角边缘光（模仿 ColorOS 按钮的边缘发光）：
+        // ::after 原本是底部淡出遮罩，这里改成 1.5px 的渐变描边环 ——
+        // 用 padding + mask 只保留边框那一圈，渐变沿 135° 走：
+        // 左上最亮 → 中间几乎透明 → 右下略微回亮，形成对角走向的「光」。
+        // 直接用 inset box-shadow 也能做，但那样只有均匀亮边，没有方向感。
+        sb.append(".glass .course::after{content:'';position:absolute;inset:0;top:0;height:auto;");
+        sb.append("left:0;right:0;bottom:0;border-radius:inherit;background:none;pointer-events:none;");
+        sb.append("padding:1.5px;box-sizing:border-box;");
+        sb.append("background:linear-gradient(135deg,rgba(255,255,255,0.78) 0%,");
+        sb.append("rgba(255,255,255,0.16) 28%,rgba(255,255,255,0.03) 50%,");
+        sb.append("rgba(255,255,255,0.03) 64%,rgba(255,255,255,0.26) 100%);");
+        sb.append("-webkit-mask:linear-gradient(#000,#000) content-box,linear-gradient(#000,#000);");
+        sb.append("-webkit-mask-composite:xor;");
+        sb.append("mask:linear-gradient(#000,#000) content-box,linear-gradient(#000,#000);");
+        sb.append("mask-composite:exclude;}");
+        // 深色主题的边缘光用课程色而不是白色：
+        // 卡片本身是统一的灰，唯一能区分科目的地方就是这一圈光。
+        // 左上最亮（0.95）→ 中段收薄（0.14）→ 右下回亮（0.70），保留 135° 的方向感。
+        sb.append("body.dark.glass .course::after{padding:2px;");
+        sb.append("background:linear-gradient(135deg,");
+        sb.append("rgba(var(--cc-rgb,150,160,175),0.98) 0%,");
+        sb.append("rgba(var(--cc-rgb,150,160,175),0.72) 26%,");
+        sb.append("rgba(var(--cc-rgb,150,160,175),0.60) 50%,");
+        sb.append("rgba(var(--cc-rgb,150,160,175),0.60) 66%,");
+        sb.append("rgba(var(--cc-rgb,150,160,175),0.86) 100%);}");
+        // 外发光：一圈极淡的同色晕，让边框有"亮着"的感觉而不是干瘪的线条。
+        // 用负扩展压掉大部分，只留贴着卡片的薄薄一层，避免整张卡片糊成一团。
+        sb.append("body.dark.glass .course{box-shadow:0 0 9px -3px var(--cc);}");
+        // 长按浮起必须压过上面这条（特异性更高），否则拖动时只剩一圈微光，
+        // 看不出卡片被"拿起来"了。
+        sb.append("body.dark.glass .course.dragging{");
+        sb.append("box-shadow:0 12px 30px rgba(0,0,0,0.6),0 0 10px -2px var(--cc)!important;}");
+        // 灰底上的文字用白色（浅色主题不挂 .glass，仍是原来的白字 + 实色卡）
+        sb.append(".glass .course .name{color:#FFFFFF;position:relative;z-index:1;}");
+        sb.append(".glass .course .info{color:rgba(255,255,255,0.86);opacity:1;");
+        sb.append("position:relative;z-index:1;}");
+        // 冲突/叠加的整格描边不能被雾面盖掉：这两种状态的优先级更高，单独再声明一次
+        sb.append(".glass .course.conflict{box-shadow:inset 0 0 0 2.5px #FF3B30,0 0 0 1px rgba(255,59,48,0.35);}");
+        sb.append(".glass .course.overlap{box-shadow:inset 0 0 0 2.5px #F2A24B,0 0 0 1px rgba(242,162,75,0.4);}");
         // 应用主题与自定义背景图
         String theme = store != null ? store.getTheme() : "light";
         String bgName = store != null ? store.getBgImage() : "";
@@ -3642,6 +4115,22 @@ public class MainActivity extends AppCompatActivity {
         sb.append("display:flex;flex-direction:column;visibility:hidden;transform:translateX(100%);");
         sb.append("transition:transform 0.26s cubic-bezier(.22,.68,.36,1),visibility 0.26s ease;}");
         sb.append(".page.show{visibility:visible;transform:translateX(0);}");
+        // ===== 标签之间横滑：旧页滑走、新页同时滑入，中间不再「收回再弹出」=====
+        // 用 animation 而不是 transition：切标签时旧页要往「与进入方向相反」的一侧滑走，
+        // 若靠 transition，先移除 .show 会让它往默认的 +100% 弹回，就是用户看到的抽搐。
+        // 动画跑完由 JS 把该页 display:none，避免它在后台又溜回原位。
+        sb.append("@keyframes tabOutLeft{from{transform:translateX(0);}to{transform:translateX(-100%);}}");
+        sb.append("@keyframes tabOutRight{from{transform:translateX(0);}to{transform:translateX(100%);}}");
+        sb.append("@keyframes tabInRight{from{transform:translateX(100%);}to{transform:translateX(0);}}");
+        sb.append("@keyframes tabInLeft{from{transform:translateX(-100%);}to{transform:translateX(0);}}");
+        sb.append(".page.leave-left{visibility:visible;transition:none;");
+        sb.append("animation:tabOutLeft 0.2s cubic-bezier(.4,0,.7,1) forwards;}");
+        sb.append(".page.leave-right{visibility:visible;transition:none;");
+        sb.append("animation:tabOutRight 0.2s cubic-bezier(.4,0,.7,1) forwards;}");
+        sb.append(".page.enter-right{visibility:visible;transition:none;");
+        sb.append("animation:tabInRight 0.22s cubic-bezier(.22,.68,.36,1) forwards;}");
+        sb.append(".page.enter-left{visibility:visible;transition:none;");
+        sb.append("animation:tabInLeft 0.22s cubic-bezier(.22,.68,.36,1) forwards;}");
         sb.append(".page-head{display:flex;align-items:center;padding:8px;border-bottom:1px solid var(--line);flex:0 0 auto;}");
         sb.append(".ph-back{background:transparent;border:none;font-size:calc(26px * var(--fs,1));color:var(--fg);width:48px;height:48px;cursor:pointer;}");
         sb.append(".ph-title{flex:1;text-align:center;font-size:calc(17px * var(--fs,1));font-weight:700;color:var(--fg);}");
@@ -3651,6 +4140,14 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".nav-item{display:flex;align-items:center;padding:16px;border-bottom:1px solid var(--line);cursor:pointer;}");
         sb.append(".nav-item:last-child{border-bottom:none;}");
         sb.append(".nav-item:active{background:rgba(102,126,234,0.12);}");
+        // 「重新获取资料」：与上面的功能入口同一种行样式，只把底色换成红，
+        // 表示这是「出问题时才点」的补救动作。放在卡片最后一行，靠 .nav-card 的
+        // overflow:hidden 自动收出圆角，不需要单独写 border-radius。
+        sb.append(".nav-item.danger{background:#E5484D;}");
+        sb.append(".nav-item.danger .ni-txt b{color:#fff;}");
+        sb.append(".nav-item.danger .ni-txt i{color:rgba(255,255,255,0.85);}");
+        sb.append(".nav-item.danger .ni-arrow{color:rgba(255,255,255,0.9);}");
+        sb.append(".nav-item.danger:active{background:#CF3F44;}");
         sb.append(".ni-txt{flex:1;}");
         sb.append(".ni-txt b{display:block;font-size:calc(15px * var(--fs,1));font-weight:600;color:var(--fg);}");
         sb.append(".ni-txt i{display:block;font-style:normal;font-size:calc(12px * var(--fs,1));color:var(--sub);margin-top:4px;}");
@@ -3670,11 +4167,22 @@ public class MainActivity extends AppCompatActivity {
         sb.append(".about-note{font-size:calc(12px * var(--fs,1));color:var(--sub);line-height:1.7;padding:0 4px 24px;}");
 
         boolean hasBg = !bgName.isEmpty() && new java.io.File(getFilesDir(), bgName).exists();
-        sb.append("</style></head><body class='").append("dark".equals(theme) ? "dark" : "light")
+        boolean darkTheme = "dark".equals(theme);
+        // 雾面卡片何时开启：深色主题（暗环境晃眼）、有自定义背景图（雾面才有意义）、
+        // 或用户在浅色主题里手动打开。JS 侧 applyGlass() 用的是同一套判断，
+        // 这样切主题时不用重渲染也能保持正确。
+        // 玻璃只给深色主题：浅色主题保持原来的实色卡片（用户要求「浅色保留以前的颜色」）。
+        // 有背景图时浅色也是实色卡，卡片自带 --cc 底色，同样能压住背景。
+        boolean glassOn = darkTheme;
+        sb.append("</style></head><body class='").append(darkTheme ? "dark" : "light")
           .append(hasBg ? " hasbg" : "")
+          .append(glassOn ? " glass" : "")
           .append("'>");
 
         // 头部：只保留标题 → 日期+周次 → 按钮行（设置已移到「我的」页右上角齿轮）
+        // 课表主体统一包一层 .tabview：切周推屏与切标签让位都作用在这一层上。
+        // 它必须保留 flex 纵向布局，否则 .grid 的 flex:1 会失去可分配的高度。
+        sb.append("<div class='tabview'>");
         sb.append("<div class='header'>");
         sb.append("<h1>石大课表</h1>");
         // 日期与周次同一行，周次用正文色加粗突出（不再是灰色小字）
@@ -3684,27 +4192,27 @@ public class MainActivity extends AppCompatActivity {
         }
         sb.append("<span class='sweek'>第").append(week).append("周</span>");
         sb.append("</div>");
+        // 这一行只在「本周」才有内容，但位置**每周都要占住**：
+        // 否则本周的网格比其他周少一行的高度，翻周时整块课表会跳一下。
+        // 非本周用一个不换行空格撑住同样的行高（空字符串会让这行塌成 0 高）。
+        sb.append("<div class='hint' id='weekHint'>");
         if (week == todayWeek) {
-            sb.append("<div class='hint'>本周 · 今天 ")
+            sb.append("本周 · 今天 ")
               .append(ScheduleStore.fmtDate(System.currentTimeMillis())).append(" ")
-              .append(ScheduleStore.fmtWeekday(System.currentTimeMillis())).append("</div>");
-        }
-        // 按钮行：◀ / 刷新课表 / ＋加课 / ▶ —— 四个按钮同一套 .btn 尺寸与圆角
-        sb.append("<div class='btns'>");
-        if (week > 1) {
-            sb.append("<button class='btn btn-nav' onclick='Android.onWeekChanged(")
-              .append(week - 1).append(")'>◀</button>");
+              .append(ScheduleStore.fmtWeekday(System.currentTimeMillis()));
         } else {
-            sb.append("<button class='btn btn-nav' disabled>◀</button>");
+            sb.append("&nbsp;");
         }
+        sb.append("</div>");
+        // 按钮行：◀ / 刷新课表 / ＋加课 / ▶ —— 四个按钮同一套 .btn 尺寸与圆角
+        // 左右按钮带 id：切周后表头与按钮都在原地，由 JS 按当前周改 disabled，不再整页重渲染
+        sb.append("<div class='btns'>");
+        sb.append("<button class='btn btn-nav' id='btnPrev' onclick='goWeek(-1)'")
+          .append(week <= 1 ? " disabled" : "").append(">◀</button>");
         sb.append("<button class='btn' onclick='Android.onRefreshRequested()'>刷新课表</button>");
         sb.append("<button class='btn btn-add' onclick='toggleAddMode()'>＋ 加课</button>");
-        if (week < totalWeeks) {
-            sb.append("<button class='btn btn-nav' onclick='Android.onWeekChanged(")
-              .append(week + 1).append(")'>▶</button>");
-        } else {
-            sb.append("<button class='btn btn-nav' disabled>▶</button>");
-        }
+        sb.append("<button class='btn btn-nav' id='btnNext' onclick='goWeek(1)'")
+          .append(totalWeeks <= 0 || week >= totalWeeks ? " disabled" : "").append(">▶</button>");
         sb.append("</div>");
         sb.append("<div class='addbar'><span>点击任意格子添加自定义课程（已有课也可叠加）</span>");
         sb.append("<button onclick='toggleAddMode()'>取消</button></div>");
@@ -3719,22 +4227,27 @@ public class MainActivity extends AppCompatActivity {
             String dateStr = "";
             if (monday > 0) {
                 long dayDate = monday + (d - 1) * 86400000L;
-                dateStr = "<div class='gh-date'>" + ScheduleStore.fmtDate(dayDate) + "</div>";
+                dateStr = "<div class='gh-date' id='ghd" + d + "'>" + ScheduleStore.fmtDate(dayDate) + "</div>";
             }
             String cls = "gh" + (today ? " today" : "");
-            sb.append("<div class='").append(cls).append("'>")
+            // id 供切周后局部改日期/今日高亮用（表头不参与滑动，只能原地更新）
+            sb.append("<div class='").append(cls).append("' id='ghd").append(d).append("'>")
               .append(days[d - 1]).append(dateStr).append("</div>");
         }
         sb.append("</div>");
 
-        // 课程网格
-        sb.append("<div class='grid'>");
-
+        // 课程网格：外面套一层横条容器，左右两侧各留一块给相邻周。
+        // 表头（.grid-head）留在外层不参与滑动 —— 切周只滑这一块。
+        sb.append("<div class='gridview'><div class='weekstrip' id='weekstrip'>");
+        sb.append("<div class='weekpanel' data-week='").append(week).append("'>");
         // 行数：至少铺满作息时间表（教务可能有 6 大节「中午延时」），
         // 再按实际课程往上探，上限 MAX_RENDER_ROWS，避免异常数据把网格撑爆
         int numRows = Math.min(Math.max(5, Math.max(maxRow, periodTimes.length)), MAX_RENDER_ROWS);
-        // 空课周：教务与自定义都没有课时才提示，只渲染提示不画空格子
+        // 空课周：教务与自定义都没有课时才提示，只渲染提示不画空格子。
+        // 这一周同样要占满整块高度（empty-grid 让唯一那一行撑满），
+        // 否则空周的网格会比有课的周矮一截，翻过去像课表塌了。
         if (courses.length() == 0 && customs.length() == 0) numRows = 0;
+        sb.append("<!--grid--><div class='grid").append(numRows == 0 ? " empty-grid" : "").append("'>");
         if (numRows == 0) {
             sb.append("<div class='emptyweek'>这一周没有课程</div>");
         }
@@ -3773,7 +4286,9 @@ public class MainActivity extends AppCompatActivity {
                     sb.append("<div class='course")
                       .append(clash ? " conflict" : (overlap ? " overlap" : ""))
                       .append("' style='--cc:").append(color)
-                      .append(";background:var(--cc);animation-delay:").append((row + d) * 0.05).append("s' data-detail='")
+                      // --cc-rgb 给深色边缘光用：rgba() 只能吃分量，hex 无法带透明度
+                      .append(";--cc-rgb:").append(ccRgb(color))
+                      .append(";background:var(--cc)' data-detail='")
                       .append(detail).append("' data-keys='").append(keysB).append("' data-day='").append(d).append("' data-row='").append(row).append("'>");
                     if (clash) sb.append("<div class='clash-mark'>!</div>");
                     // 显示所有课程名（多门用换行分隔）
@@ -3799,13 +4314,18 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
         }
-        sb.append("</div>");
+        sb.append("</div>");   // 网格
+        // 网格结束标记：Java 侧靠它从缓存的整页 HTML 里切出「网格片段」给相邻面板用，
+        // 不用重新拼装整页（成本只是两次 indexOf）。
+        sb.append("<!--/grid-->");
+        sb.append("</div>");   // .weekpanel
+        sb.append("</div></div>");   // .weekstrip + .gridview
+        sb.append("</div>");   // .tabview 结束（课表主体：头部 + 表头 + 网格）
 
         // ===== 底部标签栏（position:fixed，任何页面下都露在底部）=====
         sb.append("<div class='tabbar'>");
         sb.append("<button class='tabitem on' id='tabSchedule' onclick='switchTab(\"schedule\")'>课表</button>");
         sb.append("<button class='tabitem' id='tabMine' onclick='switchTab(\"mine\")'>我的</button>");
-        sb.append("<button class='tabitem' id='tabMore' onclick='switchTab(\"more\")'>更多功能</button>");
         sb.append("</div>");
 
         // ===== 通用底部选择面板（校区/教学楼/教室/周次/星期/节次共用）=====
@@ -3863,16 +4383,7 @@ public class MainActivity extends AppCompatActivity {
           .append(esc(stuName.isEmpty() ? "未获取到姓名" : stuName)).append("</b>");
         sb.append("<i id='meId'>")
           .append(esc(stuId.isEmpty() ? "学号未获取" : "学号 " + stuId)).append("</i></div></div>");
-        sb.append("<div class='page-hint'>姓名与学号在你登录教务系统时读取，只保存在本机，不上传云端。"
-                + "显示「未获取」时点下面的按钮，或回课表点一次「刷新课表」。</div>");
-        sb.append("<button class='adv-btn' style='width:100%;' onclick='reFetchMe()'>重新获取资料</button>");
-        sb.append("</div></div>");
-
-        // ===== 更多功能 =====
-        sb.append("<div class='page' id='pageMore'>");
-        sb.append("<div class='page-head'><div class='ph-pad'></div>");
-        sb.append("<div class='ph-title'>更多功能</div><div class='ph-pad'></div></div>");
-        sb.append("<div class='page-body'>");
+        // 功能入口（原「更多功能」页已并入本页）
         sb.append("<div class='nav-card'>");
         sb.append("<div class='nav-item' onclick='openClassroomQuery()'>");
         sb.append("<div class='ni-txt'><b>查询教室</b><i>查看某间教室在指定周次的占用情况</i></div>");
@@ -3880,8 +4391,11 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<div class='nav-item' onclick='openEmptyRoom()'>");
         sb.append("<div class='ni-txt'><b>找空教室</b><i>按校区/教学楼找某时段没课的教室</i></div>");
         sb.append("<div class='ni-arrow'>›</div></div>");
+        // 重新获取资料：与上面同一种行样式，只用红底区分它是「补救动作」而非功能入口
+        sb.append("<div class='nav-item danger' onclick='reFetchMe()'>");
+        sb.append("<div class='ni-txt'><b>重新获取资料</b><i>姓名学号显示不出来时，到这里重抓一次</i></div>");
+        sb.append("<div class='ni-arrow'>›</div></div>");
         sb.append("</div>");
-        sb.append("<div class='more-empty' id='moreProbe'>其余功能开发中<br>后续会在这里加入实用工具</div>");
         sb.append("</div></div>");
 
         // ===== 查询教室（原生表单 + 隐藏 WebView 驱动教务自身的联调逻辑）=====
@@ -4030,6 +4544,14 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<div class='si-desc'>关闭后启动直接显示课表，下次启动生效</div></div>");
         sb.append("<button class='switch").append(splashAnimOn ? " on" : "")
           .append("' id='splashSwitch' onclick='toggleSplash()'><i></i></button>");
+        sb.append("</div>");
+        // 通知栏常驻：靠前台服务维持，内容由 CourseNotifyService 每分钟校正
+        boolean notifyOn = store != null && store.isNotifyPersist();
+        sb.append("<div class='settings-item'><div><div class='si-label'>通知栏常驻课程</div>");
+        sb.append("<div class='si-desc'>一直挂在通知栏显示当前课程：标题是课程名和时间，");
+        sb.append("下面一行是地点与老师。关闭后通知立即撤掉</div></div>");
+        sb.append("<button class='switch").append(notifyOn ? " on" : "")
+          .append("' id='notifySwitch' onclick='toggleNotify()'><i></i></button>");
         sb.append("</div>");
         // 字体大小：滑块连续调节（实时预览），档位按钮一键回到常用值。
         // 页面字号全部写成 calc(<原字号> * var(--fs))，所以改 --fs 就能整页缩放。
@@ -4236,6 +4758,194 @@ public class MainActivity extends AppCompatActivity {
         // JS
         sb.append("<script>");
         sb.append("var CUR_WEEK=").append(week).append(";");
+        sb.append("var TOTAL_WEEKS=").append(totalWeeks).append(";");
+        // ===== 切周：网格横条跟手滑动（不重载整页）=====
+        //
+        // 结构：.gridview(裁切) > .weekstrip(300% 宽) > 三个 .weekpanel（上一周/本周/下一周）。
+        // 基准位移是 -33.3333%（横条自身宽度的 1/3 = 一个视口宽），把中间面板对齐屏幕。
+        //
+        // 关键：整个文档不换。所以标题、按钮、表头、底部标签栏都不会闪，
+        // 网格也能实时跟着手指走 —— 而不是等松手才开始播动画。
+        sb.append("var strip=null,swDragging=false,swDecided=false,swDx=0,swStartX=0,swStartY=0,swT0=0,swWidth=0;");
+        sb.append("function stripEl(){if(!strip)strip=document.getElementById('weekstrip');return strip;}");
+        sb.append("function setStripX(px,animate){");
+        sb.append("  var s=stripEl();if(!s)return;");
+        sb.append("  if(animate)s.classList.remove('dragging');else s.classList.add('dragging');");
+        sb.append("  s.style.transform='translateX(calc(-33.3333% + '+px+'px))';}");
+        // 该方向还有没有相邻周：没有就加阻尼，滑不动但给一点回弹余量
+        sb.append("function hasNeighbor(dir){");
+        sb.append("  var t=CUR_WEEK+dir;return t>=1&&t<=TOTAL_WEEKS;}");
+        sb.append("function resist(px){");
+        sb.append("  var dir=px<0?1:-1;");
+        sb.append("  if(hasNeighbor(dir))return px;");
+        sb.append("  return px*0.3;}");
+        // 面板里新插入的卡片要重新绑事件：内联 onclick 只管空格和加课，
+        // 长按浮起、点开详情都是这里用 addEventListener 绑的，新面板必须补绑。
+        sb.append("function bindCards(root){");
+        sb.append("  (root||document).querySelectorAll('.course').forEach(function(el){bindCard(el);});}");
+        sb.append("function bindCard(el){");
+        sb.append("  if(el.__bound)return;el.__bound=true;");
+        sb.append("  el.addEventListener('touchstart',function(e){");
+        sb.append("    if(dragEl)return;if(addMode)return;");
+        sb.append("    var card=this;");
+        sb.append("    pressX=e.touches[0].clientX;pressY=e.touches[0].clientY;");
+        sb.append("    if(dragMode){startLift(card);}");
+        sb.append("    else{pressTimer=setTimeout(function(){pressTimer=null;startLift(card);");
+        sb.append("      if(window.Android&&Android.onDragStart)Android.onDragStart();},700);}");
+        sb.append("  },false);");
+        sb.append("  el.addEventListener('touchmove',function(e){");
+        sb.append("    if(dragEl===this){e.preventDefault();moveDrag(e.touches[0].clientX,e.touches[0].clientY);}");
+        sb.append("    else if(pressTimer){var t=e.touches[0];");
+        sb.append("      if(Math.abs(t.clientX-pressX)>12||Math.abs(t.clientY-pressY)>12){");
+        sb.append("        clearTimeout(pressTimer);pressTimer=null;}}");
+        sb.append("  },false);");
+        sb.append("  el.addEventListener('touchend',function(e){");
+        sb.append("    if(pressTimer){clearTimeout(pressTimer);pressTimer=null;}");
+        sb.append("    if(dragEl===this){endDrag(e.changedTouches[0]);}});");
+        sb.append("  el.addEventListener('touchcancel',function(){");
+        sb.append("    if(pressTimer){clearTimeout(pressTimer);pressTimer=null;}");
+        sb.append("    if(dragEl===this)endDrag(null);});");
+        // 用 click 而不是 touchend 开详情：click 天然排除滚动与滑动，误触更少
+        sb.append("  el.addEventListener('click',function(){");
+        sb.append("    if(didDrag){didDrag=false;return;}");
+        sb.append("    if(dragMode)return;");
+        sb.append("    if(addMode){onCardPick(this);return;}");
+        sb.append("    var d=this.getAttribute('data-detail');");
+        // 入场动画没播完就量矩形会拿到缩放后的尺寸，窗口起点会算错；
+        // 这里把动画快进到终态（不要删 animation，否则会从头重播一次 popIn）
+        sb.append("    if(d){");
+        sb.append("      if(this.getAnimations){this.getAnimations().forEach(function(a){try{a.finish();}catch(e){}});}");
+        sb.append("      var rc=this.getBoundingClientRect();");
+        sb.append("      window.__cardRect={left:rc.left,top:rc.top,width:rc.width,height:rc.height};");
+        sb.append("      window.__openedCard=this;Android.onCourseClick(d);}});");
+        sb.append("}");
+        // ---- 面板管理：固定三块（左/中/右），缺的先放占位块，等 Java 回填 ----
+        sb.append("function panelByWeek(w){");
+        sb.append("  var s=stripEl();if(!s)return null;");
+        sb.append("  var ns=s.querySelectorAll('.weekpanel');");
+        sb.append("  for(var i=0;i<ns.length;i++){if(parseInt(ns[i].getAttribute('data-week'),10)===w)return ns[i];}");
+        sb.append("  return null;}");
+        sb.append("function panelFilled(w){var p=panelByWeek(w);return !!(p&&p.getAttribute('data-filled')==='1');}");
+        sb.append("function makePanel(week,html){");
+        sb.append("  var p=document.createElement('div');");
+        sb.append("  p.className='weekpanel nofx';p.setAttribute('data-week',week);");
+        sb.append("  p.setAttribute('data-filled','1');");
+        sb.append("  p.innerHTML=html;bindCards(p);return p;}");
+        // Java 回传面板片段（异步）：有占位块就直接填，没有就插到对应一侧
+        sb.append("window.__applyPanel=function(week,html){");
+        sb.append("  var s=stripEl();if(!s||!html)return;");
+        sb.append("  if(panelFilled(week))return;");
+        sb.append("  var p=panelByWeek(week);");
+        sb.append("  if(p){p.innerHTML=html;p.setAttribute('data-filled','1');bindCards(p);}");
+        sb.append("  else{p=makePanel(week,html);");
+        sb.append("    if(week<CUR_WEEK)s.insertBefore(p,s.firstChild);else s.appendChild(p);}");
+        // 用户点过箭头但当时面板还没生成：现在到了就补上这一步，避免"点了没反应"
+        sb.append("  var pd=window.__pendingDir;");
+        sb.append("  if(pd&&week===CUR_WEEK+pd){window.__pendingDir=0;setTimeout(function(){goWeek(pd);},0);}");
+        sb.append("};");
+        sb.append("function requestPanel(w){");
+        sb.append("  if(w<1||w>TOTAL_WEEKS)return;");
+        sb.append("  if(panelFilled(w))return;");
+        sb.append("  if(window.Android&&Android.onRequestPanel)Android.onRequestPanel(w);}");
+        // 提交：更新标题区文字（表头不滑动，只能原地改），再补齐两侧面板
+        sb.append("window.applyWeekHeader=function(m){");
+        sb.append("  if(!m||m.w!==CUR_WEEK)return;");
+        sb.append("  var d=document.querySelector('.subline .sdate');");
+        sb.append("  if(d)d.textContent=m.date;");
+        sb.append("  var wk=document.querySelector('.subline .sweek');");
+        sb.append("  if(wk)wk.textContent=m.label;");
+        sb.append("  var h=document.getElementById('weekHint');");
+        sb.append("  if(h)h.textContent=m.hint?m.hint:'\\u00a0';");
+        sb.append("  for(var i=1;i<=7;i++){");
+        sb.append("    var el=document.getElementById('ghd'+i);if(!el)continue;");
+        sb.append("    el.classList.toggle('today',m.todayDow===i);");
+        sb.append("    var dt=el.querySelector('.gh-date');");
+        sb.append("    if(dt)dt.textContent=(m.days&&m.days[i-1])?m.days[i-1]:'';}");
+        sb.append("  var pb=document.getElementById('btnPrev');if(pb)pb.disabled=!m.canPrev;");
+        sb.append("  var nb=document.getElementById('btnNext');if(nb)nb.disabled=!m.canNext;");
+        sb.append("};");
+        // 落位：把横条重排成「左=week-1 / 中=week / 右=week+1」再归位到中间。
+        // 必须重排 DOM：归位是把 transform 打回 -33.3333%，屏幕显示的永远是中间那块。
+        sb.append("function settleWeek(week){");
+        sb.append("  var s=stripEl();if(!s)return;");
+        sb.append("  CUR_WEEK=week;");
+        sb.append("  var L=panelByWeek(week-1),M=panelByWeek(week),R=panelByWeek(week+1);");
+        sb.append("  s.innerHTML='';");
+        sb.append("  var lp=document.createElement('div');lp.className='weekpanel nofx';");
+        sb.append("  lp.setAttribute('data-week',week-1);lp.setAttribute('data-filled','0');");
+        sb.append("  var rp=document.createElement('div');rp.className='weekpanel nofx';");
+        sb.append("  rp.setAttribute('data-week',week+1);rp.setAttribute('data-filled','0');");
+        sb.append("  s.appendChild(L||lp);if(M)s.appendChild(M);s.appendChild(R||rp);");
+        sb.append("  if(M)M.setAttribute('data-week',week);");
+        // 重排后把位移打回居中，必须瞬时完成：
+        // 带着 transition 会把刚落到中间的面板再"滑"一次，看起来像回弹。
+        sb.append("  s.classList.add('dragging');");
+        sb.append("  s.style.transform='translateX(-33.3333%)';");
+        sb.append("  void s.offsetWidth;");
+        sb.append("  s.classList.remove('dragging');");
+        sb.append("  if(window.Android&&Android.onWeekSettled)Android.onWeekSettled(week);");
+        sb.append("  requestPanel(week-1);requestPanel(week+1);}");
+        // ◀ ▶ 按钮：与手势同一条提交路径，只是位移由代码补完
+        sb.append("var weekAnimating=false;");
+        sb.append("function goWeek(dir){");
+        sb.append("  if(weekAnimating)return;");
+        sb.append("  if(!hasNeighbor(dir))return;");
+        sb.append("  var s=stripEl();if(!s)return;");
+        sb.append("  if(!panelFilled(CUR_WEEK+dir)){");
+        sb.append("    window.__pendingDir=dir;requestPanel(CUR_WEEK+dir);return;}");
+        sb.append("  weekAnimating=true;swWidth=s.clientWidth/3;");
+        sb.append("  setStripX(-dir*swWidth,true);");
+        sb.append("  setTimeout(function(){weekAnimating=false;settleWeek(CUR_WEEK+dir);},300);}");
+        // 手势：跟手拖动网格横条
+        sb.append("function gridBlocked(){");
+        sb.append("  if(dragMode||addMode||dragEl)return true;");
+        sb.append("  if(window.__suppressSwipe)return true;");
+        sb.append("  if(typeof pageStack!=='undefined'&&pageStack.length)return true;");
+        sb.append("  var cm=document.getElementById('courseModal');");
+        sb.append("  if(cm&&cm.classList.contains('show'))return true;");
+        sb.append("  var cd=document.getElementById('cdModal');");
+        sb.append("  if(cd&&cd.classList.contains('show'))return true;");
+        sb.append("  return false;}");
+        sb.append("function onGridStart(e){");
+        // 上一次翻周还在补完动画时不接新手势，否则两次落位会打架
+        sb.append("  if(weekAnimating)return;");
+        sb.append("  if(gridBlocked())return;");
+        sb.append("  var t=e.touches[0];");
+        sb.append("  swStartX=t.clientX;swStartY=t.clientY;swT0=Date.now();");
+        sb.append("  swDx=0;swDecided=false;swDragging=false;");
+        sb.append("  var s=stripEl();swWidth=s?s.clientWidth/3:0;}");
+        sb.append("function onGridMove(e){");
+        sb.append("  if(!swStartX)return;");
+        sb.append("  var t=e.touches[0];");
+        sb.append("  var dx=t.clientX-swStartX,dy=t.clientY-swStartY;");
+        sb.append("  if(!swDecided){");
+        // 纵向为主就让页面自己滚，不要在横条上抢手势
+        sb.append("    if(Math.abs(dy)>12&&Math.abs(dy)>=Math.abs(dx)){swStartX=0;return;}");
+        sb.append("    if(Math.abs(dx)<8)return;");
+        sb.append("    if(gridBlocked()){swStartX=0;return;}");
+        sb.append("    swDecided=true;swDragging=true;");
+        // 手指一动就取消已排队的长按浮起，避免拖到一半卡片突然跳起来
+        sb.append("    if(pressTimer){clearTimeout(pressTimer);pressTimer=null;}");
+        sb.append("  }");
+        sb.append("  if(!swDragging)return;");
+        sb.append("  e.preventDefault();");
+        sb.append("  swDx=resist(dx);setStripX(swDx,false);}");
+        sb.append("function onGridEnd(){");
+        sb.append("  if(!swDragging){swStartX=0;return;}");
+        sb.append("  swDragging=false;swDecided=false;swStartX=0;");
+        sb.append("  var dt=Math.max(1,Date.now()-swT0);");
+        sb.append("  var v=Math.abs(swDx)/dt;");
+        sb.append("  var far=Math.abs(swDx)>swWidth*0.22;");
+        sb.append("  var fast=v>0.35&&Math.abs(swDx)>swWidth*0.06;");
+        sb.append("  var dir=swDx<0?1:-1;");
+        sb.append("  if((far||fast)&&hasNeighbor(dir)&&panelFilled(CUR_WEEK+dir)){");
+        sb.append("    weekAnimating=true;");
+        sb.append("    setStripX(-dir*swWidth,true);");
+        sb.append("    setTimeout(function(){weekAnimating=false;settleWeek(CUR_WEEK+dir);},300);");
+        sb.append("  }else{");
+        sb.append("    setStripX(0,true);");
+        sb.append("  }");
+        sb.append("  swDx=0;}");
         // 查询教室的默认条件：当前周 / 今天 / 第1大节起（注入 todayDow，免去用户逐项选）
         sb.append("var TODAY_DOW=").append(todayDow).append(";");
         // ===== 轻量 toast（不依赖原生 Toast，错误提示不会打断操作）=====
@@ -4436,70 +5146,30 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  Android.onApplyMoves(JSON.stringify(moves),CUR_WEEK);");
         sb.append("}");
         sb.append("function cancelMoves(){Android.onCancelMoves(CUR_WEEK);}");
-        // 课程卡事件：长按500ms浮起/拖动模式即时浮起；拖动后抑制click
-        sb.append("document.querySelectorAll('.course').forEach(function(el){");
-        sb.append("  el.addEventListener('touchstart',function(e){");
-        sb.append("    if(dragEl)return;");
-        // 加课模式下禁掉长按浮起：否则停手 700ms 会误进入拖动，与「点格子加课」冲突
-        sb.append("    if(addMode)return;");
-        sb.append("    var card=this;");
-        sb.append("    pressX=e.touches[0].clientX;pressY=e.touches[0].clientY;");
-        sb.append("    if(dragMode){startLift(card);}");
-        sb.append("    else{pressTimer=setTimeout(function(){pressTimer=null;startLift(card);if(window.Android&&Android.onDragStart)Android.onDragStart();},700);}");
-        sb.append("  },false);");
-        sb.append("  el.addEventListener('touchmove',function(e){");
-        sb.append("    if(dragEl===this){");
-        sb.append("      e.preventDefault();");
-        sb.append("      moveDrag(e.touches[0].clientX,e.touches[0].clientY);");
-        sb.append("    }else if(pressTimer){");
-        sb.append("      var t=e.touches[0];");
-        sb.append("      if(Math.abs(t.clientX-pressX)>12||Math.abs(t.clientY-pressY)>12){clearTimeout(pressTimer);pressTimer=null;}");
-        sb.append("    }");
-        sb.append("  },false);");
-        sb.append("  el.addEventListener('touchend',function(e){");
-        sb.append("    if(pressTimer){clearTimeout(pressTimer);pressTimer=null;}");
-        sb.append("    if(dragEl===this){e.preventDefault();endDrag(e.changedTouches[0]);}");
-        sb.append("  },false);");
-        sb.append("  el.addEventListener('touchcancel',function(){");
-        sb.append("    if(pressTimer){clearTimeout(pressTimer);pressTimer=null;}");
-        sb.append("    if(dragEl===this)endDrag(null);");
-        sb.append("  },false);");
-        sb.append("  el.addEventListener('click',function(){");
-        sb.append("    if(didDrag){didDrag=false;return;}");
-        sb.append("    if(dragMode)return;");
-        // 加课模式下点卡片：走「在这一格叠加」分支
-        sb.append("    if(addMode){onCardPick(this);return;}");
-        sb.append("    var d=this.getAttribute('data-detail');");
-        // 取 rect 时若入场动画(popIn)还在播，scale 会让 getBoundingClientRect
-        // 返回缩放后的矩形，窗口起点就算错了。
-        //
-        // 但不能用「禁用动画再恢复」的办法：恢复的那一刻元素重新匹配 CSS 的
-        // animation 规则，popIn 会连 animation-delay 一起从头播放，首帧 opacity:0 —— 
-        // 表现为「点一下卡片消失」或「卡片又播了一次入场动画」。
-        // 这里改成把动画直接快进到终态并保持，不动 animation 属性。
-        sb.append("    if(d){");
-        sb.append("      if(this.getAnimations){");
-        sb.append("        this.getAnimations().forEach(function(a){try{a.finish();}catch(e){}});");
-        sb.append("      }");
-        sb.append("      var rc=this.getBoundingClientRect();");
-        sb.append("      window.__cardRect={left:rc.left,top:rc.top,width:rc.width,height:rc.height};");
-        sb.append("      window.__openedCard=this;Android.onCourseClick(d);}");
-        sb.append("  });");
-        sb.append("});");
-        // 触摸滑动切周（拖动中/拖动模式下禁用）
-        sb.append("var touchStartX=0,touchEndX=0;");
-        sb.append("document.addEventListener('touchstart',function(e){touchStartX=e.changedTouches[0].screenX;},false);");
-        sb.append("document.addEventListener('touchend',function(e){");
-        sb.append("  if(window.__suppressSwipe||dragEl){window.__suppressSwipe=false;return;}");
-        sb.append("  if(dragMode||addMode)return;");
-        // 详情/设置弹窗打开时不响应滑动切周，避免误触跳周
-        sb.append("  var cm=document.getElementById('courseModal');");
-        sb.append("  if(cm&&cm.classList.contains('show'))return;");
-        sb.append("  if(pageStack.length)return;");
-        sb.append("  touchEndX=e.changedTouches[0].screenX;");
-        sb.append("  var dx=touchEndX-touchStartX;");
-        sb.append("  if(Math.abs(dx)>80){Android.onWeekChanged(").append(week + "+(dx>0?-1:1)").append(");}");
-        sb.append("},false);");
+        // 初始化：把当前周的面板居中，两侧放占位块并异步向 Java 要网格片段。
+        // 占位块先占住宽度，横条几何从一开始就是三块等宽，拉的时候不会错位。
+        sb.append("function initStrip(){");
+        sb.append("  var s=stripEl();if(!s)return;");
+        sb.append("  var mid=panelByWeek(CUR_WEEK);if(!mid)return;");
+        sb.append("  mid.setAttribute('data-filled','1');");
+        sb.append("  var lp=document.createElement('div');lp.className='weekpanel nofx';");
+        sb.append("  lp.setAttribute('data-week',CUR_WEEK-1);lp.setAttribute('data-filled','0');");
+        sb.append("  var rp=document.createElement('div');rp.className='weekpanel nofx';");
+        sb.append("  rp.setAttribute('data-week',CUR_WEEK+1);rp.setAttribute('data-filled','0');");
+        sb.append("  s.innerHTML='';s.appendChild(lp);s.appendChild(mid);s.appendChild(rp);");
+        sb.append("  s.style.transform='translateX(-33.3333%)';");
+        sb.append("  requestPanel(CUR_WEEK-1);requestPanel(CUR_WEEK+1);}");
+        sb.append("bindCards(document);");
+        sb.append("initStrip();");
+        // 手势只绑在网格区：标题、按钮、底部标签栏都不参与滑动
+        // touchmove 必须 passive:false，否则 preventDefault 无效、页面会跟着一起滚
+        sb.append("var gvEl=document.querySelector('.gridview');");
+        sb.append("if(gvEl){");
+        sb.append("  gvEl.addEventListener('touchstart',onGridStart,{passive:true});");
+        sb.append("  gvEl.addEventListener('touchmove',onGridMove,{passive:false});");
+        sb.append("  gvEl.addEventListener('touchend',onGridEnd);");
+        sb.append("  gvEl.addEventListener('touchcancel',onGridEnd);");
+        sb.append("}");
         // ===== 课程详情弹窗：窗口生长动画（仿鸿蒙/ColorOS 应用展开） =====
         //
         // 关键点：只动窗口边界(left/top/width/height/border-radius)，不动内容。
@@ -4646,8 +5316,25 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  if(mEl){mEl.getBoundingClientRect();mEl.style.transition='';}}");
         // ===== 设置页导航（独立页面，从右侧滑入）=====
         sb.append("var pageStack=[];");
+        // 标签顺序决定滑动方向：课表(0) → 我的(1)
+        // 「更多功能」页已并入「我的」，标签只剩两个。
+        sb.append("var TAB_ORDER=['schedule','mine'];");
+        sb.append("var curTab='schedule';");
+        sb.append("function tabPageEl(t){return document.getElementById(t==='mine'?'pageMine':'');}");
+        sb.append("function tabOfPage(id){return id==='pageMine'?'mine':'';}");
+        // 课表主体是否让位：只有停在标签级页面（我的）时才左移，
+        // 设置、检查更新这类二级页仍然整页盖上来，不推课表。
+        sb.append("function applyTabShift(){var tv=document.querySelector('.tabview');");
+        sb.append("  if(tv)tv.classList.toggle('shift-out',curTab!=='schedule');}");
+        // 把一个页面恢复到「未打开」的干净状态：
+        // 必须同时清掉滑动动画类与 display，否则下次进入会从错误的位置起跑。
+        sb.append("function resetPage(el){if(!el)return;");
+        sb.append("  el.classList.remove('show','leave-left','leave-right','enter-right','enter-left');");
+        sb.append("  el.style.display='';}");
         sb.append("function openPage(id){var p=document.getElementById(id);if(!p)return;");
-        sb.append("  p.classList.add('show');pageStack.push(id);}");
+        sb.append("  p.classList.remove('leave-left','leave-right','enter-right','enter-left');");
+        sb.append("  p.style.display='';p.classList.add('show');pageStack.push(id);");
+        sb.append("  var tb=tabOfPage(id);if(tb){curTab=tb;applyTabShift();updateTabs(curTab);}}");
         // 跨功能跳转用：openPage 不会隐藏上一个页面，若目标页在 DOM 里更靠前
         // （查询教室就排在找空教室之前），旧页会盖在上面，看起来像没跳转。
         sb.append("function gotoPage(id){");
@@ -4655,29 +5342,67 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  for(var i=0;i<ps.length;i++)ps[i].classList.remove('show');");
         sb.append("  pageStack.length=0;openPage(id);}");
         sb.append("function closePage(){var id=pageStack.pop();if(!id)return;");
-        sb.append("  var p=document.getElementById(id);if(p)p.classList.remove('show');");
-        // 关页后同步底部标签：栈空了就回到「课表」，栈顶是我的/更多则保持对应标签
-        sb.append("  syncTabWithStack();}");
+        sb.append("  resetPage(document.getElementById(id));");
+        // 关掉的若正是当前标签页（从「我的」按返回），回到课表
+        sb.append("  var tb=tabOfPage(id);if(tb&&tb===curTab)curTab='schedule';");
+        sb.append("  updateTabs(curTab);applyTabShift();}");
         // ===== 底部标签栏 =====
         sb.append("function updateTabs(t){");
-        sb.append("  var ids={schedule:'tabSchedule',mine:'tabMine',more:'tabMore'};");
+        sb.append("  var ids={schedule:'tabSchedule',mine:'tabMine'};");
         sb.append("  for(var k in ids){var el=document.getElementById(ids[k]);");
         sb.append("    if(el)el.classList.toggle('on',k===t);}}");
-        sb.append("function syncTabWithStack(){");
-        sb.append("  var top=pageStack.length?pageStack[pageStack.length-1]:'';");
-        sb.append("  if(top==='pageMine')updateTabs('mine');");
-        sb.append("  else if(top==='pageMore')updateTabs('more');");
-        sb.append("  else if(!pageStack.length)updateTabs('schedule');}");
+        // 兼容旧调用点（拖动/刷新等会调它）：统一按 curTab 同步标签与课表让位
+        sb.append("function syncTabWithStack(){updateTabs(curTab);applyTabShift();}");
+        // ===== 标签切换：旧页滑走、新页同时滑入，中间不再「收回再弹出」=====
+        // 所有非目标页立刻归位（无动画）：切标签时不该看到残留的二级页
+        sb.append("function hideAllPages(except){");
+        sb.append("  var ps=document.querySelectorAll('.page');");
+        sb.append("  for(var i=0;i<ps.length;i++){var p=ps[i];if(p===except)continue;");
+        sb.append("    resetPage(p);p.style.display='none';}}");
         sb.append("function switchTab(t){");
-        sb.append("  while(pageStack.length){closePage();}");
-        sb.append("  if(t==='mine')openPage('pageMine');");
-        sb.append("  else if(t==='more')openPage('pageMore');");
+        // 已在目标标签：只把二级页（设置等）收掉，不播滑动动画
+        sb.append("  if(t===curTab){");
+        sb.append("    var keep=tabPageEl(t);");
+        sb.append("    while(pageStack.length){");
+        sb.append("      var topId=pageStack[pageStack.length-1];");
+        sb.append("      if(keep&&topId===keep.id)break;");
+        sb.append("      resetPage(document.getElementById(pageStack.pop()));}");
+        sb.append("    var ps=document.querySelectorAll('.page');");
+        sb.append("    for(var i=0;i<ps.length;i++){if(keep&&ps[i]===keep)continue;");
+        sb.append("      resetPage(ps[i]);ps[i].style.display='none';}");
+        sb.append("    if(keep){keep.style.display='';keep.classList.add('show');}");
+        sb.append("    applyTabShift();updateTabs(curTab);return;}");
+        sb.append("  var from=TAB_ORDER.indexOf(curTab),to=TAB_ORDER.indexOf(t);");
+        sb.append("  var dir=to>from?1:-1;");
+        sb.append("  var prev=tabPageEl(curTab),next=tabPageEl(t);");
+        // 二级页（设置/检查更新/查询教室…）直接收起，不参与滑动
+        sb.append("  hideAllPages(prev);");
+        sb.append("  pageStack.length=0;");
+        sb.append("  curTab=t;applyTabShift();");
+        // 旧页：向左（正向）或向右（反向）滑走，动画结束再彻底隐藏，
+        // 否则它会带着 leave 类停在半路，下次进入时从错误的位置开始。
+        sb.append("  if(prev){");
+        sb.append("    prev.style.display='';prev.classList.remove('show');");
+        sb.append("    prev.classList.add(dir>0?'leave-left':'leave-right');");
+        sb.append("    prev.addEventListener('animationend',function h(){");
+        sb.append("      prev.removeEventListener('animationend',h);");
+        sb.append("      prev.classList.remove('leave-left','leave-right');");
+        sb.append("      if(!prev.classList.contains('show'))prev.style.display='none';},false);}");
+        // 新页：从另一侧滑入；动画结束后保留 .show 作为最终静止态
+        sb.append("  if(next){");
+        sb.append("    next.style.display='';next.classList.remove('show','leave-left','leave-right');");
+        sb.append("    next.classList.add(dir>0?'enter-right':'enter-left');");
+        sb.append("    next.addEventListener('animationend',function h(){");
+        sb.append("      next.removeEventListener('animationend',h);");
+        sb.append("      next.classList.remove('enter-right','enter-left');");
+        sb.append("      next.classList.add('show');},false);");
+        sb.append("    pageStack.push(next.id);}");
+        sb.append("  curTab=t;");
         // 打开「我的」时用本地最新资料刷新卡片：
         // 启动时可能还没抓到姓名（要等教务首页），之后课表页不再重渲染，卡片会停在空态。
         sb.append("  if(t==='mine'&&window.Android&&Android.onMineTabOpened)Android.onMineTabOpened();");
         sb.append("  updateTabs(t);}");
         // 我的页「重新获取资料」：先回课表再触发刷新，避免用户停在覆盖页看不到进度
-        sb.append("function refreshAndBack(){switchTab('schedule');Android.onRefreshRequested();}");
         // 「重新获取资料」：直接去教务首页抓姓名/学号（不必刷新整个课表，也不必退出重登）
         sb.append("function reFetchMe(){Android.onRefreshStudentInfo();}");
         // 更多功能 → 查询教室
@@ -5062,12 +5787,19 @@ public class MainActivity extends AppCompatActivity {
         // 主题切换（带背景过渡动画）
         sb.append("function setTheme(m){");
         sb.append("  document.body.classList.toggle('dark',m==='dark');");
-        sb.append("  updateThemeBtn(m);");
+        sb.append("  document.body.classList.toggle('light',m!=='dark');");
+        sb.append("  updateThemeBtn(m);applyGlass();");
         sb.append("  Android.onSetTheme(m);}");
         sb.append("function updateThemeBtn(m){");
         sb.append("  var l=document.getElementById('themeLight'),d=document.getElementById('themeDark');");
         sb.append("  if(l){l.style.background=m==='dark'?'':'#667eea';l.style.color=m==='dark'?'':'#fff';}");
         sb.append("  if(d){d.style.background=m==='dark'?'#667eea':'';d.style.color=m==='dark'?'#fff':'';}}");
+        // ===== 玻璃卡片（只跟主题走，没有开关）=====
+        // 切主题时必须就地换类，否则要等下一次重渲染才有玻璃卡片。
+        // 判定口径与 Java 生成 body 时一致：只有深色主题挂 .glass。
+        sb.append("function applyGlass(){");
+        sb.append("  var b=document.body;");
+        sb.append("  b.classList.toggle('glass',b.classList.contains('dark'));}");
         // 开屏动画：单个开关（写入后下次启动生效）
         sb.append("var splashOn=").append(splashAnimOn ? "true" : "false").append(";");
         sb.append("function toggleSplash(){");
@@ -5075,6 +5807,18 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  var s=document.getElementById('splashSwitch');");
         sb.append("  if(s)s.classList.toggle('on',splashOn);");
         sb.append("  Android.onSetSplashAnim(splashOn?1:0);}");
+        // 通知栏常驻：真实状态由 Java 决定（可能因为没给通知权限而回滚），
+        // 所以这里先乐观翻转，收到 setNotifySwitch 回调再以 Java 的结果为准。
+        sb.append("var notifyOn=").append(notifyOn ? "true" : "false").append(";");
+        sb.append("function toggleNotify(){");
+        sb.append("  notifyOn=!notifyOn;");
+        sb.append("  var s=document.getElementById('notifySwitch');");
+        sb.append("  if(s)s.classList.toggle('on',notifyOn);");
+        sb.append("  Android.onSetPersistentNotify(notifyOn?1:0);}");
+        sb.append("window.setNotifySwitch=function(on){");
+        sb.append("  notifyOn=!!on;");
+        sb.append("  var s=document.getElementById('notifySwitch');");
+        sb.append("  if(s)s.classList.toggle('on',notifyOn);};");
         // ===== 字体大小 =====
         // 整页字号都是 calc(<原字号> * var(--fs))，所以改 :root 上的 --fs 就能立刻缩放，
         // 不需要重载页面（重载会把用户从设置页弹回课表）。
@@ -5331,6 +6075,51 @@ public class MainActivity extends AppCompatActivity {
             handler.post(() -> renderWeekSchedule(week));
         }
 
+        /**
+         * 前端要一块相邻周的网格（横条左右两侧的面板）。
+         *
+         * 只回传网格片段而不是整页，页面不重载 —— 底部标签栏、标题、按钮都不会闪。
+         * 片段来自缓存整页里的切取，第一次访问某周时才真正拼一次。
+         */
+        @JavascriptInterface
+        public void onRequestPanel(int week) {
+            handler.post(() -> {
+                try {
+                    if (store == null) store = new ScheduleStore(MainActivity.this);
+                    String html = gridFragment(week);
+                    if (html.isEmpty()) return;
+                    String js = "window.__applyPanel(" + week + "," + jsStr(html) + ")";
+                    webView.evaluateJavascript(js, null);
+                } catch (Exception e) {
+                    Log.e(TAG, "request panel error", e);
+                }
+            });
+        }
+
+        /**
+         * 横条已经停到某一周：记下当前周并回填标题区文字。
+         *
+         * 这里**不重渲染**：整页重载会把刚做完的手势动画全部抹掉，也会让标签栏闪一下。
+         */
+        @JavascriptInterface
+        public void onWeekSettled(int week) {
+            handler.post(() -> {
+                try {
+                    if (store == null) store = new ScheduleStore(MainActivity.this);
+                    int total = store.getTotalWeeks();
+                    int w = week;
+                    if (w < 1) w = 1;
+                    if (total > 0 && w > total) w = total;
+                    currentDisplayWeek = w;
+                    Log.d(TAG, "week settled: " + w);
+                    webView.evaluateJavascript(
+                            "window.applyWeekHeader(" + weekMetaJson(w) + ")", null);
+                } catch (Exception e) {
+                    Log.e(TAG, "week settled error", e);
+                }
+            });
+        }
+
         @JavascriptInterface
         public void onRefreshRequested() {
             handler.post(() -> {
@@ -5473,6 +6262,12 @@ public class MainActivity extends AppCompatActivity {
                     enabled ? "开屏动画已开启，下次启动生效" : "开屏动画已关闭，下次启动直接进入课表",
                     Toast.LENGTH_SHORT).show();
             });
+        }
+
+        /** 通知栏常驻开关：可能要临时申请通知权限，所以不能直接落盘 */
+        @JavascriptInterface
+        public void onSetPersistentNotify(int on) {
+            handler.post(() -> applyPersistentNotify(on == 1, true));
         }
 
         /** 位置冲突时优先显示哪一路课程 */
@@ -5857,7 +6652,15 @@ public class MainActivity extends AppCompatActivity {
             } else {
                 paleBg = dark ? "#000000" : "#FFFFFF";
             }
-            startBg = color.isEmpty() ? paleBg : color;
+            // 起点色必须等于「卡片此刻的实际底色」，否则弹窗一开就跳色：
+            // 浅色主题卡片是 --cc 实色，直接用课程色；
+            // 深色主题卡片是灰底 + 8% 色相，这里算同一个混合结果。
+            if (dark) {
+                // 深色卡片是统一的灰，弹窗起点也用同一个灰，动画才从卡片里"长"出来
+                startBg = DARK_CARD_BG;
+            } else {
+                startBg = color.isEmpty() ? paleBg : color;
+            }
             String title = list.length() > 1 ? firstName + " 等" + list.length() + "门" : firstName;
 
             StringBuilder js = new StringBuilder();
@@ -5952,6 +6755,30 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    /**
+     * 把 #RRGGBB（兼容 #RGB）转成 "r,g,b"，供 CSS 的 rgba(var(--cc-rgb),a) 使用。
+     *
+     * 深色卡片的边缘光要用课程色，而内联只能塞 hex，hex 带不了透明度，
+     * 所以额外烘一个分量串。解析失败就退回中性灰分量，不会让整条规则失效。
+     */
+    private static String ccRgb(String color) {
+        try {
+            String h = color == null ? "" : color.trim();
+            if (h.startsWith("#")) h = h.substring(1);
+            if (h.length() == 3) {
+                h = "" + h.charAt(0) + h.charAt(0) + h.charAt(1) + h.charAt(1)
+                        + h.charAt(2) + h.charAt(2);
+            }
+            if (h.length() < 6) return "150,160,175";
+            int c = Integer.parseInt(h.substring(0, 6), 16);
+            return ((c >> 16) & 0xFF) + "," + ((c >> 8) & 0xFF) + "," + (c & 0xFF);
+        } catch (Exception e) {
+            return "150,160,175";
+        }
+    }
+
+    /** 深色主题卡片底色（与 CSS 里 body.dark.glass .course 的 #1A1B1D 保持一致） */
+    private static final String DARK_CARD_BG = "#1A1B1D";
     /** 把字符串数组拼成 JS 数组字面量内容：'#a','#b' */
     private static String joinQuoted(String[] arr) {
         StringBuilder sb = new StringBuilder();

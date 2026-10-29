@@ -5,6 +5,10 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- 自动更新：安装下载好的新版本安装包（Android 8+ 还需用户在系统设置里授权） -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- 通知栏常驻课程：前台服务 + 通知权限（Android 13+ 通知还需运行时授权） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
     <application
         android:allowBackup="false"
@@ -24,6 +28,19 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- 通知栏常驻课程。
+             foregroundServiceType 必须声明（targetSdk 34 起强制）：
+             这里用 specialUse —— 它不是导航/通话/定位这类系统预设类型，
+             只是把课表信息一直挂在通知栏，SPECIAL_USE 的 subtype 说明其用途。 -->
+        <service
+            android:name=".CourseNotifyService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="persistent_course_notification" />
+        </service>
 
         <!-- 下一节课桌面小组件：支持 1x1 ~ 4x2 自由拉伸 -->
         <receiver

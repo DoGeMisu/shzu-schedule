@@ -13,7 +13,20 @@
 
 > 两处源码与版本完全同步，功能一致。若 Gitee 打不开，请改用 GitHub，反之亦然。
 
-![Platform](https://img.shields.io/badge/Platform-Android-3DDC84) ![Language](https://img.shields.io/badge/Language-Java-orange) ![UI](https://img.shields.io/badge/UI-WebView%20HTML%2FCSS%2FJS-blue) ![Version](https://img.shields.io/badge/Version-1.4.7-667eea)
+![Platform](https://img.shields.io/badge/Platform-Android-3DDC84) ![Language](https://img.shields.io/badge/Language-Java-orange) ![UI](https://img.shields.io/badge/UI-WebView%20HTML%2FCSS%2FJS-blue) ![Version](https://img.shields.io/badge/Version-1.5.0-667eea)
+
+## ✨ v1.5.0 更新日志
+
+**新增与改进**
+
+- 🔔 **新增通知栏常驻课程**：设置里开启后，通知栏常驻显示「正在上课 / 下一节课」的课程名、时间、地点与教师，每分钟自动刷新；采用前台服务保证进程被回收后依然准确，不打扰（静音、不震动、不响铃）。
+- 🎨 **全新应用图标**：以校徽行书为主角重新设计 —— 青绿渐变底上一张被长尾夹夹住的课表纸，右上角一枚白色书签，行书叠在格线上方并自动擦除周围的格线。
+- ✒️ 通知栏小图标同步换为校徽行书剪影，与应用图标呼应。
+
+**内部**
+
+- 🧹 图标资源按自适应图标规范重新拆层：背景层纯渐变矢量，前景层内容缩进安全区，圆形/方形遮罩下四角均完整。
+- ⚡ 代码整理与性能优化（见提交记录）。
 
 ## ✨ v1.4.7 更新日志
 
