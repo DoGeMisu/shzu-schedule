@@ -5018,7 +5018,7 @@ public class MainActivity extends AppCompatActivity {
         sb.append("<div class='kv'><span>微信</span><b class='tap' onclick='copyTxt(\"m1SuCode\")'>m1SuCode</b></div>");
         sb.append("<div class='kv'><span>邮箱</span><b class='tap' onclick='copyTxt(\"19633187@qq.com\")'>19633187@qq.com</b></div>");
         sb.append("<div class='kv'><span>GitHub</span><b class='tap' onclick='copyTxt(\"https://github.com/DoGeMisu/shzu-schedule\")'>DoGeMisu / shzu-schedule</b></div>");
-        sb.append("<div class='kv'><span>个人站点</span><b class='tap' onclick='copyTxt(\"https://misuhub.cc.cd\")'>misuhub.cc.cd</b></div>");
+        sb.append("<div class='kv'><span>个人站点</span><b class='tap' onclick='copyTxt(\"https://misuhub.top\")'>misuhub.top</b></div>");
         sb.append("<div class='kv'><span>开源协议</span><b>MIT License</b></div>");
         sb.append("</div>");
         sb.append("<div class='about-note'>点击 QQ / 微信 / 邮箱 / GitHub / 个人站点可复制。本项目为在校学生利用课余时间出于学习目的独立开发维护，不收取任何费用，请勿用于商业用途。</div>");

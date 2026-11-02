@@ -49,18 +49,25 @@ public class UpdateManager {
     private static final String TAG = "UpdateManager";
 
     /**
-     * 更新服务 Base URL。本期按对接文档 §6 使用 IPv4 直连地址：
-     * 域名 misuhub.top 尚未完成 ICP 备案，备案完成前不得在客户端出现任何域名。
-     * 备案完成后由站长发布新安装包，把这一行换成正式域名即可 —— 服务端两个入口并存，
-     * 老版本继续用 IP 不受影响。因此 Base URL 只允许出现在这一个常量里。
+     * 更新服务 Base URL。
      *
-     * 历史教训（v1.4.1 的 bug「打开软件不检查更新」）：
-     * 当时在 network_security_config 里给 IP 配了明文放行，但 Android 的
-     * &lt;domain&gt; 只匹配主机名、**不支持 IP 字面量**，放行实际无效，请求被
-     * cleartextTrafficPermitted="false" 拦掉。故本期的明文放行必须写在
-     * base-config 上（见 res/xml/network_security_config.xml 的说明）。
+     * v1.5.3 起切换为正式域名 HTTPS（ICP 备案已完成）。
+     * 历史：此前因域名未备案，客户端只能用 IPv4 直连 http://120.26.246.218:8080，
+     * 而 Android 的 &lt;domain&gt; 不支持 IP 字面量，明文放行只能写在 base-config 上，
+     * 等于整个应用的 HTTP 出口都被放开（v1.4.1「打开软件不检查更新」就是踩的这个坑）。
+     * 现在走域名 + HTTPS，明文可以整体关闭，见 res/xml/network_security_config.xml。
+     *
+     * 服务端两个入口仍并存，老版本继续用 IP 不受影响。
+     * Base URL 只允许出现在这一个常量里，下载地址也必须落在下面的白名单主机内。
      */
-    public static final String BASE_URL = "http://120.26.246.218:8080";
+    public static final String BASE_URL = "https://misuhub.top";
+
+    /**
+     * 允许的更新服务主机。用域名白名单约束**服务端返回的 download_url**：
+     * 即使更新接口被入侵或被错误配置，也不能把安装包指向任意主机。
+     * 与 BASE_URL 解耦，是为了将来换 CDN 时只改这里。
+     */
+    private static final String[] TRUSTED_HOSTS = {"misuhub.top"};
     /** 本应用在 m1SuHub 后台登记的 App Key（站长创建） */
     public static final String APP_KEY = "shzu-schedule";
 
@@ -328,6 +335,14 @@ public class UpdateManager {
             dest.delete();
 
             String url = info.downloadUrl;
+            // 安全：v1.5.3 起约束服务端返回的下载地址。
+            // 这里校验的是**主机**而不是整个字符串：服务端会给签名链接（ak/sig/exp），
+            // 路径与参数会变，但主机必须是自己的域名。
+            if (!isTrustedUpdateHost(url)) {
+                Log.w(TAG, "download url rejected, untrusted host: " + maskHost(url));
+                post(listener, l -> l.onFailed("更新地址异常，已拒绝下载"));
+                return;
+            }
             int attempt = 0;
             boolean urlRefreshed = false;
             while (attempt < MAX_RETRY) {
@@ -513,6 +528,42 @@ public class UpdateManager {
      */
     private static boolean sizeMatches(File f, long expect) {
         return expect > 0 && f.length() == expect;
+    }
+
+    /**
+     * 下载地址是否指向自己的更新服务。
+     *
+     * 只接受 https，且主机必须命中 TRUSTED_HOSTS（允许子域）。
+     * 拒绝 http 的理由：明文链路下中间人可以把 download_url 改成任意地址，
+     * 虽然还有 SHA-256 与签名校验兜底，但没有任何理由再允许明文下载。
+     */
+    static boolean isTrustedUpdateHost(String url) {
+        if (url == null || url.isEmpty()) return false;
+        String u = url.trim().toLowerCase();
+        if (!u.startsWith("https://")) return false;
+        String host;
+        try {
+            host = android.net.Uri.parse(u).getHost();
+        } catch (Exception e) {
+            return false;
+        }
+        if (host == null) return false;
+        host = host.toLowerCase();
+        for (String h : TRUSTED_HOSTS) {
+            if (host.equals(h) || host.endsWith("." + h)) return true;
+        }
+        return false;
+    }
+
+    /** 日志里只留主机名，不打印签名参数（sig/exp 属于凭据） */
+    private static String maskHost(String url) {
+        if (url == null) return "";
+        try {
+            String h = android.net.Uri.parse(url).getHost();
+            return h == null ? "(no host)" : h;
+        } catch (Exception e) {
+            return "(unparsable)";
+        }
     }
 
     /**
@@ -783,10 +834,18 @@ public class UpdateManager {
      * HttpURLConnection 的 setInstanceFollowRedirects 不跨协议跟随
      * （http→https 会直接返回 301），而文档 §4 明确要求客户端必须能跟随 301，
      * 因此这里自己走 Location，最多 MAX_REDIRECTS 跳。
+     *
+     * 安全：v1.5.3 起**每一跳都要重新过白名单**。
+     * 只在调用方校验初始 download_url 是不够的 —— 服务端（或被劫持的响应）
+     * 完全可以用一个合法域名的 302 把客户端引到任意主机，
+     * 白名单会在第一跳之后彻底失效。这里对 current 与每跳的 Location 都做校验。
      */
     private static HttpURLConnection openFollowing(String urlStr, int connectTimeout, int readTimeout,
                                                   String accept, String ua) throws IOException {
         String current = urlStr;
+        if (!isTrustedUpdateHost(current)) {
+            throw new IOException("拒绝连接非白名单主机: " + maskHost(current));
+        }
         for (int hop = 0; hop <= MAX_REDIRECTS; hop++) {
             HttpURLConnection c = (HttpURLConnection) new URL(current).openConnection();
             c.setConnectTimeout(connectTimeout);
@@ -803,7 +862,11 @@ public class UpdateManager {
                     throw new IOException("HTTP " + code + " 缺少 Location");
                 }
                 // 用 URL(base, location) 解析，兼容服务端给相对路径
-                current = new URL(new URL(current), loc.trim()).toString();
+                String next = new URL(new URL(current), loc.trim()).toString();
+                if (!isTrustedUpdateHost(next)) {
+                    throw new IOException("重定向跳出白名单: " + maskHost(next));
+                }
+                current = next;
                 Log.d(TAG, "redirect(" + code + ") -> " + current);
                 continue;
             }

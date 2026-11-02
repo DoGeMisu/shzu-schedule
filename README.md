@@ -13,7 +13,20 @@
 
 > 两处源码与版本完全同步，功能一致。若 Gitee 打不开，请改用 GitHub，反之亦然。
 
-![Platform](https://img.shields.io/badge/Platform-Android-3DDC84) ![Language](https://img.shields.io/badge/Language-Java-orange) ![UI](https://img.shields.io/badge/UI-WebView%20HTML%2FCSS%2FJS-blue) ![Version](https://img.shields.io/badge/Version-1.5.2-667eea)
+![Platform](https://img.shields.io/badge/Platform-Android-3DDC84) ![Language](https://img.shields.io/badge/Language-Java-orange) ![UI](https://img.shields.io/badge/UI-WebView%20HTML%2FCSS%2FJS-blue) ![Version](https://img.shields.io/badge/Version-1.5.3-667eea)
+
+## ✨ v1.5.3 更新日志
+
+**新增功能**
+
+- 🛡 **更新包下载地址纳入域名白名单**：服务端返回的下载链接必须落在自有域名内，防止更新接口被入侵或配置错误时把安装包指向外部主机。
+
+**优化**
+
+- 🔐 **更新链路全面升级为 HTTPS**：域名备案已完成，更新服务从 IPv4 明文直连切换到 `https://misuhub.top`，版本查询、公告与安装包下载全程走 TLS。
+- 🚫 **默认禁止明文流量**：网络策略从「全局放行明文」改为默认关闭，只对校内域名 `*.shzu.edu.cn` 保留例外（教务系统根路径会跳转 http）。
+- 📱 **兼容 Android 7.0 的证书校验**：内置 ISRG Root X1 根证书，修复 Android 7.0 设备可能出现的「永远检查不到更新」。
+- 🧩 **个人信息页域名同步**：站点入口更新为 `misuhub.top`。
 
 ## ✨ v1.5.2 更新日志
 
@@ -308,25 +321,31 @@ gradle assembleDebug
 
 - **密码加密存储**：学号密码使用 Android Keystore（AES-256-GCM）加密后落盘，密钥不出安全硬件；旧版明文凭据打开应用时自动迁移
 - **网络白名单**：WebView 导航仅允许 `*.shzu.edu.cn`（http/https），`javascript:` / `data:` / `about:` 与外部站点一律拦截
-- **证书校验**：只信任系统 CA（v1.5.2 起不再信任用户安装的 CA）；SSL 错误仅对校内域名放行，其余拒绝
-- **混合内容**：v1.5.2 起三处 WebView 均为 `MIXED_CONTENT_COMPATIBILITY_MODE`，不再无条件允许主动混合内容
+- **证书校验**：只信任系统 CA（不再信任用户安装的 CA）；SSL 错误仅对校内域名放行，其余拒绝
+- **混合内容**：三处 WebView 均为 `MIXED_CONTENT_COMPATIBILITY_MODE`，不再无条件允许主动混合内容
+- **更新链路全程 HTTPS**：v1.5.3 起更新服务走 `https://misuhub.top`，下载地址强制落在自有域名内
 - **更新包校验**：下载后同时校验文件大小、SHA-256、包名与签名证书摘要，任一不符即拒绝安装
 - **不参与备份**：`allowBackup=false`，应用数据无法被备份导出
 - **诊断包脱敏**：导出的诊断包在落盘前会抹掉学号、姓名、手机号、身份证号与邮箱
 
-### 关于明文 HTTP（如实说明）
+### 明文流量策略
 
-更新服务当前是 IPv4 直连 `http://120.26.246.218:8080`（域名未完成备案，需按对接约定不在请求中出现域名）。
-Android 的 `<domain>` 只匹配主机名、**不支持 IP 字面量**，所以明文放行只能写在 `base-config` 上，
-效果上等于整个应用的 HTTP 出口是放开的 —— 这一栏不再宣称「默认禁止明文」。
+v1.5.3 起 `base-config` 为 `cleartextTrafficPermitted="false"`，**默认禁止明文**，唯一例外是校内域名 `*.shzu.edu.cn`。
 
-风险已通过以下方式收敛：更新包必须通过 SHA-256 + 包名 + 签名摘要三重校验；
-WebView 导航限制在校内域名；校内域名访问走 HTTPS（`authserver` / `jwgl` 均使用系统 CA 签发的证书）。
-WebView 侧仍允许一定程度的明文，因为 `authserver.shzu.edu.cn` 的根路径 **302 跳转到 `http://`**，
-彻底关闭会直接导致登录失败。
+历史上之所以全局放开明文，是因为更新服务曾是 IPv4 直连地址，而 Android 的 `<domain>` 只匹配主机名、**不支持 IP 字面量**，给 IP 单独写 `domain-config` 不会生效（v1.4.1「打开软件不检查更新」即由此而来）。域名备案完成后改用域名 + HTTPS，这个限制不再存在。
 
-待备案完成、更新服务切到 HTTPS 域名后，`network_security_config.xml` 中
-`base-config` 的 `cleartextTrafficPermitted` 应改回 `false`，只保留校内域名例外。
+校内域名保留明文的原因：`authserver.shzu.edu.cn` 的根路径**会 302 跳转到 `http://`**，完全关闭会导致登录失败。`jwgl.shzu.edu.cn` 则带 HSTS（`max-age=15768000`）且全程 https。
+
+### 关于内置的 ISRG Root X1
+
+`res/xml/network_security_config.xml` 为 `misuhub.top` 额外内置了 ISRG Root X1 根证书（`res/raw/isrg_root_x1.pem`）。这是兼容措施，不是放宽校验：
+
+- `misuhub.top` 的证书由 Let's Encrypt 新的「Generation Y」层级签发：`misuhub.top ← YR2 ← ISRG Root YR ←(交叉签名)← ISRG Root X1`
+- Let's Encrypt 官方说明 `ISRG Root YR` 尚未进入任何主流信任库，验证必须依赖交叉签名回到 `ISRG Root X1`
+- 而 `ISRG Root X1` 是 **Android 7.1.1（API 25）** 才进入系统信任库的，本项目 `minSdk` 为 24（Android 7.0）
+- 若不内置，Android 7.0 设备会直接 `CertPathValidatorException: Trust anchor for certification path not found`，表现为「永远检查不到更新」
+
+内置的是根证书本身，签名仍需一路验到该根，中间人无法伪造；且该信任锚**只对本域生效**，不影响其他主机。
 
 ## 权限说明
 
@@ -338,8 +357,8 @@ WebView 侧仍允许一定程度的明文，因为 `authserver.shzu.edu.cn` 的�
 > v1.4.0 移除课前提醒后，通知、悬浮窗、前台服务、开机自启、震动与音频设置等权限已全部删除；v1.4.1 为支持自动更新增加了「安装未知应用」一项。
 >
 > 自动更新相关说明：
-> - 更新服务器：`http://120.26.246.218:8080`（IPv4 直连；域名未备案，客户端不使用域名）
-> - 只从服务器接口返回的 `download_url` 下载，不接受其他来源的更新地址
+> - 更新服务器：`https://misuhub.top`（ICP 备案已完成，全程 HTTPS）
+> - 只从服务器接口返回的 `download_url` 下载，且该地址必须落在 `misuhub.top` 白名单内（重定向的每一跳都会重新校验），不接受其他来源的更新地址
 > - 安装包下载后必须通过 SHA-256 校验才会交系统安装器，校验失败直接删除并提示
 > - 断网 / 接口超时静默跳过，不影响课表正常使用
 > - 下载过程可取消，取消后保留文件便于重试；安装完成后自动清理

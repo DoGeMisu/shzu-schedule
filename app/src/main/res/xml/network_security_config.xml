@@ -1,34 +1,37 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
+
     <!--
-      默认策略：允许明文 HTTP，只信任系统 CA。
+      ===== v1.5.3 起的网络策略 =====
 
-      为什么必须全局放开明文：更新服务本期是 IPv4 直连
-      http://120.26.246.218:8080（域名 misuhub.top 未完成备案，对接文档 §6 要求本期
-      请求与链接中不出现任何域名）。而 Android 的 <domain> 只匹配主机名、
-      **不支持 IP 字面量** —— 给 IP 单独写 domain-config 不会生效，
-      v1.4.1 就是这样踩的坑（现象是「打开软件不检查更新」）。
-      因此放行只能写在 base-config 上。
+      背景变化：域名 misuhub.top 的 ICP 备案已完成，更新服务从
+      http://120.26.246.218:8080（IPv4 直连、明文）切到 https://misuhub.top。
+      此前之所以在 base-config 上全局放行明文，是因为 Android 的 <domain> 只匹配
+      主机名、**不支持 IP 字面量**，给 IP 单独写 domain-config 不会生效
+      （v1.4.1「打开软件不检查更新」就是这个坑）。
+      改用域名后这个限制不再存在，明文可以整体关闭。
 
-      实际暴露面可控：原生 HTTP 请求只有版本接口与其签名下载链接（同一主机）；
-      WebView 导航被 shouldOverrideUrlLoading 限制在校内域名内，H5 页面不加载外部明文资源。
-
-      收紧时机：备案完成、更新服务切到 https://misuhub.top 后，把这里改回
-      cleartextTrafficPermitted="false"，只保留下方校内域名的例外。
+      明文关闭后仍能正常登录的理由（已实测）：
+        · authserver.shzu.edu.cn 根路径会 302 到 http://，所以校内域名仍单独
+          放行 cleartext —— 这是唯一保留的例外，且仅限 *.shzu.edu.cn。
+        · jwgl.shzu.edu.cn 带 HSTS（max-age 15768000）且全程 https。
     -->
-    <base-config cleartextTrafficPermitted="true">
+
+    <!-- 默认：禁止明文，只信任系统 CA -->
+    <base-config cleartextTrafficPermitted="false">
         <trust-anchors>
             <certificates src="system" />
         </trust-anchors>
     </base-config>
-    <!--
-      校内域名：教务系统可能用明文，故保留 cleartext。
 
-      信任锚只保留 system —— v1.5.2 起**不再信任用户安装的 CA**。
-      原实现信任 user CA 等于允许任意一张自签根证书解开登录流量（学号+密码+成绩），
-      而 onReceivedSslError 里对校内域名一律 proceed()，两层叠加后中间人可静默解密。
-      如果将来教务真的换成自签证书，应该在 WebView 层做「证书指纹白名单」，
-      而不是把信任面放大到任意 user CA。
+    <!--
+      校内域名：唯一保留的明文例外。
+
+      信任锚 = system + 内置的 ISRG Root X1（见下方说明）+ 不再信任 user CA。
+      v1.5.2 曾移除 user CA 信任：那等于允许任意一张自签根证书解开登录流量
+      （学号 + 密码 + 成绩），而 onReceivedSslError 对校内域名又会 proceed()，
+      两层叠加后中间人可静默解密。如果将来教务真的换成自签证书，
+      正确做法是做证书指纹白名单，而不是把信任面放大到任意 user CA。
     -->
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="true">shzu.edu.cn</domain>
@@ -36,4 +39,30 @@
             <certificates src="system" />
         </trust-anchors>
     </domain-config>
+
+    <!--
+      更新服务：https，并且额外信任内置的 ISRG Root X1。
+
+      为什么需要内置根证书：
+      misuhub.top 的证书由 Let's Encrypt 新「Generation Y」层级签发：
+          misuhub.top  ←  YR2  ←  ISRG Root YR  ←(交叉签名)←  ISRG Root X1
+      Let's Encrypt 官方明确说明 ISRG Root YR 尚未进入任何主流信任库，
+      所以要验证成功必须依赖交叉签名回到 ISRG Root X1。
+      而 ISRG Root X1 是 **Android 7.1.1（API 25）** 才进入系统信任库的，
+      本项目 minSdk 为 24（Android 7.0）—— 7.0 设备会直接
+      CertPathValidatorException: Trust anchor for certification path not found，
+      表现为「打开软件永远检查不到更新」。
+
+      这里内置的是**根证书本身**，不是放宽校验：签名仍然要一路验到该根，
+      中间人无法伪造。同时它只对本域生效，不污染其他主机的信任面。
+      以后若出现 Android 7.0 设备占比归零，这段可以删掉。
+    -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">misuhub.top</domain>
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="@raw/isrg_root_x1" />
+        </trust-anchors>
+    </domain-config>
+
 </network-security-config>

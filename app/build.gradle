@@ -20,8 +20,8 @@ android {
         applicationId "com.shzu.schedule"
         minSdk 24
         targetSdk 34
-        versionCode 20
-        versionName "1.5.2"
+        versionCode 21
+        versionName "1.5.3"
 
         // 更新服务 API Key：优先读本地凭据文件 keystore.properties（不入库），
         // 其次读 gradle.properties 的 shzuUpdateApiKey（供他人构建时自带）。
@@ -36,6 +36,14 @@ android {
     buildFeatures {
         // AGP 8 起 BuildConfig 默认关闭，这里显式打开以承载注入的 API Key
         buildConfig true
+    }
+
+    // Network Security Config 引用的根证书必须**未压缩**存放。
+    // 默认情况下 aapt2 会把 res/raw 下的 .pem 做 Deflate 压缩，而 NSC 解析
+    // trust-anchors 里的 @raw 资源时按原始字节读，压缩包会让解析失败
+    // （现象是应用启动即崩溃或该 domain-config 整段失效，且不会在编译期报错）。
+    androidResources {
+        noCompress 'pem'
     }
 
     // APK 统一命名规则（以后每次构建都按这个产出，不用再手动改名）：
