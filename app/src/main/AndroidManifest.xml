@@ -10,13 +10,19 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
+    <!--
+        v1.5.2：删除 android:usesCleartextTraffic。
+        minSdk 为 24 且已声明 networkSecurityConfig，该属性在 API 24+ 会被 NSC 完全覆盖，
+        留着只会让人误以为「全局放开明文」，而真实策略其实由 res/xml/network_security_config.xml 决定：
+        默认 base-config 放行明文（更新服务是未备案 IP，只能如此），校内域名单独放行，
+        信任锚一律只认 system CA。
+    -->
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
         android:theme="@style/Theme.SHZUSchedule"
-        android:usesCleartextTraffic="true"
         android:networkSecurityConfig="@xml/network_security_config">
 
         <activity

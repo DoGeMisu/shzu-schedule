@@ -28,7 +28,9 @@ import java.util.List;
  */
 public class NextCourseWidgetProvider extends AppWidgetProvider {
 
-    private static final String ACTION_REFRESH = "com.shzu.schedule.WIDGET_REFRESH";
+    // 只保留「切换配色」这一个跨进程动作（由桌面上的 ◐ 按钮 PendingIntent 投递）。
+    // 曾经还有一个 ACTION_REFRESH 常量用于"自己给自己发广播刷新"，
+    // 那正是死循环的入口，已连同 refreshAll 的广播实现一起删除。
     private static final String ACTION_TOGGLE_THEME = "com.shzu.schedule.WIDGET_TOGGLE_THEME";
 
     /** 最多渲染的行数，与 widget_next_course.xml 中预留的行数一致 */
@@ -76,11 +78,21 @@ public class NextCourseWidgetProvider extends AppWidgetProvider {
     @Override
     public void onReceive(Context context, Intent intent) {
         super.onReceive(context, intent);
-        String action = intent.getAction();
-        if (ACTION_REFRESH.equals(action)) {
-            refreshAll(context);
-        } else if (ACTION_TOGGLE_THEME.equals(action)) {
-            // 切换配色后立刻重绘
+        String action = intent == null ? null : intent.getAction();
+        // 注意：这里**绝对不能**再调 refreshAll()。
+        //
+        // 历史缺陷：refreshAll() 曾经的做法是自己发一条 ACTION_REFRESH 广播，
+        // 再由 onReceive 收到后去刷新 —— 于是形成
+        //   refreshAll → sendBroadcast → onReceive → refreshAll → …
+        // 的自激死循环。桌面只要摆着这个小部件，App 每次 onResume 就会起爆，
+        // 主线程一直在做「收广播 → 查 widget id → 发广播」的 Binder 调用，
+        // system_server 的 BroadcastQueue 被灌满，整机负载飙升；
+        // 且循环在退到后台后仍持续，只有 force-stop 才能停。
+        //
+        // 现在 refreshAll() 直接拿 AppWidgetManager 原地重绘（见下），
+        // 不再产生任何广播，环路从结构上被消除。
+        // 本方法只处理「跨进程投递进来」的真实用户操作：◐ 切换配色按钮。
+        if (ACTION_TOGGLE_THEME.equals(action)) {
             try {
                 new ScheduleStore(context).toggleWidgetTheme();
             } catch (Exception ignored) {
@@ -89,23 +101,38 @@ public class NextCourseWidgetProvider extends AppWidgetProvider {
         }
     }
 
-    /** 供 App 内部（课表变化、课程增删）调用，主动刷新所有小组件 */
+    /**
+     * 供 App 内部（课表变化、课程增删、回到前台）调用，主动重绘所有小组件。
+     *
+     * 实现要点：**直接**遍历 widget id 逐个 updateAppWidget，不经过广播。
+     * 这里跟组件自身在同一进程（同一 APK、无 process 属性），
+     * AppWidgetManager 完全可用，没有任何理由绕一圈广播再回来。
+     * 那种写法不仅多消耗一次 IPC + 广播分发，还会把自己重新拉进 onReceive，
+     * 正是上一版死循环的来源。
+     */
     public static void refreshAll(Context context) {
+        if (context == null) return;
         try {
             AppWidgetManager mgr = AppWidgetManager.getInstance(context);
-            ComponentName cn = new ComponentName(context, NextCourseWidgetProvider.class);
+            if (mgr == null) return;
+            ComponentName cn = new ComponentName(context.getApplicationContext(),
+                NextCourseWidgetProvider.class);
             int[] ids = mgr.getAppWidgetIds(cn);
+            // 桌面上没有这个小组件就直接结束（这也是热路径上最常见的分支）
             if (ids == null || ids.length == 0) return;
-            Intent it = new Intent(context, NextCourseWidgetProvider.class);
-            it.setAction(ACTION_REFRESH);
-            it.putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, ids);
-            context.sendBroadcast(it);
+            for (int id : ids) {
+                try {
+                    updateWidget(context, mgr, id);
+                } catch (Exception ignored) {
+                    // 单个实例失败不影响其它实例
+                }
+            }
         } catch (Exception ignored) {
             // 小组件刷新失败不应影响主流程
         }
     }
 
-    private void updateWidget(Context context, AppWidgetManager mgr, int id) {
+    private static void updateWidget(Context context, AppWidgetManager mgr, int id) {
         RemoteViews views = new RemoteViews(context.getPackageName(), R.layout.widget_next_course);
 
         boolean dark;
@@ -167,7 +194,7 @@ public class NextCourseWidgetProvider extends AppWidgetProvider {
     }
 
     /** 顶栏文字：有正在上的课就提示，否则给「接下来」并带上日期范围 */
-    private String labelFor(List<NextCourse.Item> items) {
+    private static String labelFor(List<NextCourse.Item> items) {
         NextCourse.Item first = items.get(0);
         if (first.ongoing) return "正在上课";
         if (items.size() == 1) {
@@ -181,7 +208,7 @@ public class NextCourseWidgetProvider extends AppWidgetProvider {
     }
 
     /** 渲染一行；item 为 null 时整行隐藏 */
-    private void setRow(RemoteViews views, int idx, NextCourse.Item it,
+    private static void setRow(RemoteViews views, int idx, NextCourse.Item it,
                         int cName, int cSub) {
         if (idx < 0 || idx >= MAX_ROWS) return;
         int rowId = ROW_IDS[idx], dotId = DOT_IDS[idx];
@@ -210,7 +237,7 @@ public class NextCourseWidgetProvider extends AppWidgetProvider {
     }
 
     /** 副行内容：地点 + 时间；跨天时前面带上星期 */
-    private String subLineFor(NextCourse.Item it) {
+    private static String subLineFor(NextCourse.Item it) {
         StringBuilder sb = new StringBuilder();
         if (!it.today) {
             sb.append(dayLabel(it.day));
@@ -230,7 +257,7 @@ public class NextCourseWidgetProvider extends AppWidgetProvider {
      * 依据启动器给出的可用尺寸决定显示几行。
      * 行高约 36dp，加上顶栏与内边距，据此估算。
      */
-    private int rowCountFor(AppWidgetManager mgr, int id) {
+    private static int rowCountFor(AppWidgetManager mgr, int id) {
         try {
             Bundle opt = mgr.getAppWidgetOptions(id);
             if (opt == null) return 2;

@@ -13,7 +13,29 @@
 
 > 两处源码与版本完全同步，功能一致。若 Gitee 打不开，请改用 GitHub，反之亦然。
 
-![Platform](https://img.shields.io/badge/Platform-Android-3DDC84) ![Language](https://img.shields.io/badge/Language-Java-orange) ![UI](https://img.shields.io/badge/UI-WebView%20HTML%2FCSS%2FJS-blue) ![Version](https://img.shields.io/badge/Version-1.5.1-667eea)
+![Platform](https://img.shields.io/badge/Platform-Android-3DDC84) ![Language](https://img.shields.io/badge/Language-Java-orange) ![UI](https://img.shields.io/badge/UI-WebView%20HTML%2FCSS%2FJS-blue) ![Version](https://img.shields.io/badge/Version-1.5.2-667eea)
+
+## ✨ v1.5.2 更新日志
+
+**新增功能**
+
+- 🛡 **更新包安装前校验包名与签名**：下载完成后除了大小与 SHA-256，还会比对包名和签名证书摘要，与当前应用不一致就拒绝安装并提示具体原因。
+
+**优化**
+
+- ⚡ **桌面小组件不再空转耗电**：刷新改为进程内直接重绘，不再靠广播自触发，修掉了小组件长期占用高 CPU、进而拖慢系统的连锁问题。
+- 🔒 **收紧证书与混合内容策略**：不再信任用户安装的根证书；三处 WebView 从「始终允许混合内容」改为兼容模式，主动混合内容会被拦下。
+- 🌐 **限制 WebView 可导航范围**：所有 `loadUrl` 前先过校内域名白名单，教务页面里抓出来的课表入口同样需要校验。
+- ⏱ **自动检查更新改为 12 小时节流**：不再每次冷启动都联网。
+- 📦 **补充 Gradle Wrapper**：克隆后可直接用 `./gradlew` 构建，不再依赖本机预装的 Gradle 版本。
+
+**修复**
+
+- 🩹 **修复第 6 大节起的课程被丢弃**：行号上限由写死的 5 改为实际网格行数，第 6 节以后的课不会再静默消失。
+- 🩹 **修复课程名/地点含英文单引号时卡片显示异常**：属性转义改用 HTML 实体，含 `'` 的课程数据不再截断卡片内容。
+- 🩹 **修复单双周混排的课程整门消失**：`1-8周(单),9-16周(双)` 这类写法此前 16 周全部判为不上课，现按周次段分别判断单双。
+- 🩹 **修复教务结果表可注入标签**：结果表改为白名单重建，只保留表格结构与排版属性。
+- 🩹 **诊断包自动脱敏**：导出前抹掉学号、姓名、手机号、身份证号与邮箱。
 
 ## ✨ v1.5.1 更新日志
 
@@ -285,11 +307,26 @@ gradle assembleDebug
 ## 隐私与安全
 
 - **密码加密存储**：学号密码使用 Android Keystore（AES-256-GCM）加密后落盘，密钥不出安全硬件；旧版明文凭据打开应用时自动迁移
-- **网络白名单**：仅允许访问 `*.shzu.edu.cn`，其余跳转一律拦截
-- **证书校验**：SSL 错误只对校内域名放行，其余直接拒绝（防中间人）
-- **禁明文流量**：默认策略禁止 HTTP 明文，仅校内域名放宽
+- **网络白名单**：WebView 导航仅允许 `*.shzu.edu.cn`（http/https），`javascript:` / `data:` / `about:` 与外部站点一律拦截
+- **证书校验**：只信任系统 CA（v1.5.2 起不再信任用户安装的 CA）；SSL 错误仅对校内域名放行，其余拒绝
+- **混合内容**：v1.5.2 起三处 WebView 均为 `MIXED_CONTENT_COMPATIBILITY_MODE`，不再无条件允许主动混合内容
+- **更新包校验**：下载后同时校验文件大小、SHA-256、包名与签名证书摘要，任一不符即拒绝安装
 - **不参与备份**：`allowBackup=false`，应用数据无法被备份导出
-- **无第三方服务器**：课表与凭据不经过任何第三方，本项目不含任何硬编码凭据
+- **诊断包脱敏**：导出的诊断包在落盘前会抹掉学号、姓名、手机号、身份证号与邮箱
+
+### 关于明文 HTTP（如实说明）
+
+更新服务当前是 IPv4 直连 `http://120.26.246.218:8080`（域名未完成备案，需按对接约定不在请求中出现域名）。
+Android 的 `<domain>` 只匹配主机名、**不支持 IP 字面量**，所以明文放行只能写在 `base-config` 上，
+效果上等于整个应用的 HTTP 出口是放开的 —— 这一栏不再宣称「默认禁止明文」。
+
+风险已通过以下方式收敛：更新包必须通过 SHA-256 + 包名 + 签名摘要三重校验；
+WebView 导航限制在校内域名；校内域名访问走 HTTPS（`authserver` / `jwgl` 均使用系统 CA 签发的证书）。
+WebView 侧仍允许一定程度的明文，因为 `authserver.shzu.edu.cn` 的根路径 **302 跳转到 `http://`**，
+彻底关闭会直接导致登录失败。
+
+待备案完成、更新服务切到 HTTPS 域名后，`network_security_config.xml` 中
+`base-config` 的 `cleartextTrafficPermitted` 应改回 `false`，只保留校内域名例外。
 
 ## 权限说明
 
@@ -301,7 +338,7 @@ gradle assembleDebug
 > v1.4.0 移除课前提醒后，通知、悬浮窗、前台服务、开机自启、震动与音频设置等权限已全部删除；v1.4.1 为支持自动更新增加了「安装未知应用」一项。
 >
 > 自动更新相关说明：
-> - 更新服务器：`https://misuhub.cc.cd`（m1SuHub，Cloudflare 隧道 + HTTPS）
+> - 更新服务器：`http://120.26.246.218:8080`（IPv4 直连；域名未备案，客户端不使用域名）
 > - 只从服务器接口返回的 `download_url` 下载，不接受其他来源的更新地址
 > - 安装包下载后必须通过 SHA-256 校验才会交系统安装器，校验失败直接删除并提示
 > - 断网 / 接口超时静默跳过，不影响课表正常使用

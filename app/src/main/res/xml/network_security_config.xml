@@ -21,12 +21,19 @@
             <certificates src="system" />
         </trust-anchors>
     </base-config>
-    <!-- 校内域名：教务系统可能用自签名证书或内网明文 -->
+    <!--
+      校内域名：教务系统可能用明文，故保留 cleartext。
+
+      信任锚只保留 system —— v1.5.2 起**不再信任用户安装的 CA**。
+      原实现信任 user CA 等于允许任意一张自签根证书解开登录流量（学号+密码+成绩），
+      而 onReceivedSslError 里对校内域名一律 proceed()，两层叠加后中间人可静默解密。
+      如果将来教务真的换成自签证书，应该在 WebView 层做「证书指纹白名单」，
+      而不是把信任面放大到任意 user CA。
+    -->
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="true">shzu.edu.cn</domain>
         <trust-anchors>
             <certificates src="system" />
-            <certificates src="user" />
         </trust-anchors>
     </domain-config>
 </network-security-config>

@@ -841,30 +841,49 @@ public class ScheduleStore {
                 .trim();
         if (t.isEmpty()) return true;
 
-        boolean matched = false;
+        // v1.5.2：单双周必须**按段**判定，不能拿整串 contains("单")/contains("双")。
+        // 旧实现对「1-8周(单),9-16周(双)」这种混排：只要整串里出现过「双」，
+        // 偶数周通过区间匹配后又被 contains("双") && week%2==1 判掉，
+        // 结果单周课在偶数周被误杀、双周课在奇数周被误杀，整门课只剩一半周次能显示。
+        boolean hasDigits = Pattern.compile("\\d").matcher(t).find();
+        if (!hasDigits) {
+            // 整串无数字（"单周"/"双周"）：不做区间限制，只按单双判断；
+            // 同时出现「单」「双」视为每周都上。
+            boolean s = t.contains("单"), d = t.contains("双");
+            if (s && !d && week % 2 == 0) return false;
+            if (d && !s && week % 2 == 1) return false;
+            return true;
+        }
+
         for (String raw : t.split(",")) {
             String seg = raw.trim();
             if (seg.isEmpty()) continue;
+            if (!Pattern.compile("\\d").matcher(seg).find()) continue;   // 无数字的残段跳过
+
+            boolean segMatch = false;
             // 区间段："3-16" / "3~16" / "3至16"
             Matcher r = Pattern.compile("(\\d+)\\s*[-~至]\\s*(\\d+)").matcher(seg);
             if (r.find()) {
                 int from = Integer.parseInt(r.group(1));
                 int to = Integer.parseInt(r.group(2));
                 if (to < from) { int tmp = from; from = to; to = tmp; }
-                if (week >= from && week <= to) { matched = true; break; }
-                continue;
+                segMatch = week >= from && week <= to;
+            } else {
+                // 单值段："9(周)" / "第3周" / "11"，一段里可能是多个单值
+                Matcher n = Pattern.compile("(\\d+)").matcher(seg);
+                while (n.find()) {
+                    if (Integer.parseInt(n.group(1)) == week) { segMatch = true; break; }
+                }
             }
-            // 单值段："9(周)" / "第3周" / "11"
-            Matcher n = Pattern.compile("(\\d+)").matcher(seg);
-            if (n.find() && Integer.parseInt(n.group(1)) == week) { matched = true; break; }
+            if (!segMatch) continue;
+
+            // 该段自己的单双标记只作用于该段
+            boolean segSingle = seg.contains("单"), segDouble = seg.contains("双");
+            if (segSingle && !segDouble && week % 2 == 0) continue;
+            if (segDouble && !segSingle && week % 2 == 1) continue;
+            return true;
         }
-
-        // 整串不含任何数字（如"单周"/"双周"）：不做区间限制，仅按单双判断
-        if (!matched && Pattern.compile("\\d").matcher(t).find()) return false;
-
-        if (t.contains("单") && week % 2 == 0) return false;
-        if (t.contains("双") && week % 2 == 1) return false;
-        return true;
+        return false;
     }
 
     /**

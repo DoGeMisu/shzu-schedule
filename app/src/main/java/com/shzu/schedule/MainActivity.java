@@ -776,17 +776,111 @@ public class MainActivity extends AppCompatActivity {
             java.io.File html = new java.io.File(getFilesDir(), "latest_schedule_capture.html");
             if (html.exists()) {
                 zip.putNextEntry(new java.util.zip.ZipEntry("jwgl-page.html"));
+                // v1.5.2：诊断包里的教务原始页面必须脱敏后落盘。
+                // 这份 HTML 是整页快照，含学号、姓名、学院班级、甚至成绩单入口链接；
+                // 用户把它发给开发者排查时，等于把这些信息一起发出去了。
                 try (java.io.FileInputStream in = new java.io.FileInputStream(html)) {
+                    java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
                     byte[] buf = new byte[8192]; int n;
-                    while ((n = in.read(buf)) > 0) zip.write(buf, 0, n);
+                    while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+                    zip.write(redactSensitive(new String(bos.toByteArray(), "UTF-8")).getBytes("UTF-8"));
                 }
                 zip.closeEntry();
             }
-            addZipEntry(zip, "stored-courses.json", store.getAllCourses().toString(2));
-            Toast.makeText(this, "诊断数据已保存", Toast.LENGTH_LONG).show();
+            // 已存课表也做同样的脱敏（教师姓名属于个人信息）
+            addZipEntry(zip, "stored-courses.json", redactSensitive(store.getAllCourses().toString(2)));
+            Toast.makeText(this, "诊断数据已保存（敏感信息已脱敏）", Toast.LENGTH_LONG).show();
         } catch (Exception e) {
             Log.e(TAG, "export schedule capture failed", e);
             Toast.makeText(this, "保存失败：" + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    /**
+     * 诊断包脱敏。
+     *
+     * 处理原则不是"删掉整段"，而是把可识别到个人的值替换成占位符，
+     * 保证开发者仍然能看出结构与字段长度（排查解析问题需要），但不含真人信息。
+     *
+     * 覆盖：身份证号、手机号、邮箱、学号/工号、姓名字段（学生与教师）。
+     *
+     * 注意**不能**把通用的 `name` 键一律脱敏 —— 课程数据里的 `name` 是课名
+     * （"高等数学"），脱掉之后诊断包就失去排查价值了。所以只认明确指向人的键名。
+     */
+    private static String redactSensitive(String s) {
+        if (s == null || s.isEmpty()) return s == null ? "" : s;
+        String r = s;
+        // 1. 身份证号（先于学号处理，否则 18 位会被学号规则切碎）
+        r = r.replaceAll("\\b\\d{17}[\\dXx]\\b", "[ID]");
+        // 2. 手机号
+        r = r.replaceAll("\\b1[3-9]\\d{9}\\b", "[PHONE]");
+        // 3. 邮箱
+        r = r.replaceAll("[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}", "[EMAIL]");
+        // 4. 学号/工号：教务页面与 JSON 里的 8-14 位纯数字
+        r = r.replaceAll("\\b\\d{8,14}\\b", "[SID]");
+        // 5. JSON 里的姓名/教师键（明确指向人的键名，避开课程 name）
+        //    覆盖：xm / studentName / student_name / teacher / teacherName / jsxm
+        r = r.replaceAll(
+                "(?i)([\"'](?:xm|studentName|student_name|teacher|teacherName|jsxm)[\"']\\s*:\\s*[\"'])([^\"'<>]{1,20})([\"'])",
+                "$1[R]$3");
+        // 6. HTML 表单里承载姓名/学号的 input：name 或 id 为 xm/xh/xm1 等，
+        //    value 属性可能在 name 之前也可能之后，所以按整个标签粒度处理。
+        r = redactTagValues(r);
+        return r;
+    }
+
+    /** 诊断包中出现即代表个人身份的控件标识 */
+    private static final java.util.regex.Pattern PERSONAL_CTRL =
+            java.util.regex.Pattern.compile(
+                    "(?i)\\b(?:name|id)\\s*=\\s*[\"']?(?:xm|xh|xm1|sfzh|sjh)[\"'\\s/>]");
+
+    /**
+     * 对 &lt;textarea&gt; 与 &lt;input&gt; 逐个检查，命中姓名/学号字段时抹掉内容。
+     *
+     * input 的姓名在 value 属性里；textarea 的姓名在两标签之间的文本里。
+     * 两者必须分开处理：用一个正则同时吞掉「自闭合标签」和「有闭合标签」，
+     * 会把后面的整段页面内容都当成 textarea 的内部文本。
+     */
+    private static String redactTagValues(String s) {
+        try {
+            // 1. 先处理 textarea（有闭合标签，内容在中间）
+            String stage1;
+            java.util.regex.Matcher t = java.util.regex.Pattern
+                    .compile("(?is)<textarea\\b((?:[^>\"']|\"[^\"]*\"|'[^']*')*)>(.*?)</textarea\\s*>")
+                    .matcher(s);
+            StringBuffer sb = new StringBuffer(s.length());
+            while (t.find()) {
+                String attrs = t.group(1) == null ? "" : t.group(1);
+                String inner = t.group(2) == null ? "" : t.group(2);
+                if (PERSONAL_CTRL.matcher(attrs + " ").find() && !inner.trim().isEmpty()) {
+                    inner = "[R]";
+                }
+                t.appendReplacement(sb, java.util.regex.Matcher.quoteReplacement(
+                        "<textarea" + attrs + ">" + inner + "</textarea>"));
+            }
+            t.appendTail(sb);
+            stage1 = sb.toString();
+
+            // 2. 再处理 input（只抹 value，保留其它属性便于排查表单结构）
+            StringBuilder out = new StringBuilder(stage1.length());
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("(?i)<input\\b((?:[^>\"']|\"[^\"]*\"|'[^']*')*)>")
+                    .matcher(stage1);
+            int last = 0;
+            while (m.find()) {
+                out.append(stage1, last, m.start());
+                last = m.end();
+                String attrs = m.group(1) == null ? "" : m.group(1);
+                if (PERSONAL_CTRL.matcher(attrs + " ").find()) {
+                    attrs = attrs.replaceAll(
+                            "(?i)(\\bvalue\\s*=\\s*[\"'])([^\"']*)([\"'])", "$1[R]$3");
+                }
+                out.append("<input").append(attrs).append('>');
+            }
+            out.append(stage1.substring(last));
+            return out.toString();
+        } catch (Exception e) {
+            return s;
         }
     }
 
@@ -984,10 +1078,30 @@ public class MainActivity extends AppCompatActivity {
     private static final int UPD_PAGE = 1;    // 每次进入「检查更新」页：静默刷新页面
     private static final int UPD_MANUAL = 2;  // 用户点「检查更新」：有提示
 
-    /** 每次进入软件都检查一次更新（不再做 24 小时节流） */
+    /**
+     * 每次进入软件都检查一次更新（不再做 24 小时节流）
+     */
     private void maybeAutoCheckUpdate() {
+        // v1.5.2：恢复节流。
+        // 原来每次冷启动都发一次明文 HTTP 请求，一天开关十几次就是十几次连接：
+        // 既浪费流量与电量，也让「启动即联网」成为固定行为特征（可被用于统计使用频次）。
+        // 现在 12 小时内最多自动查一次；用户手动点「检查更新」不受限制。
+        try {
+            if (store != null) {
+                long last = store.getUpdateLastCheck();
+                long now = System.currentTimeMillis();
+                if (last > 0 && now - last < AUTO_CHECK_INTERVAL_MS && now > last) {
+                    Log.d(TAG, "auto update check skipped, last=" + (now - last) / 60000 + "min ago");
+                    return;
+                }
+            }
+        } catch (Exception ignored) {
+        }
         checkUpdate(UPD_AUTO);
     }
+
+    /** 自动检查更新的最小间隔：12 小时 */
+    private static final long AUTO_CHECK_INTERVAL_MS = 12L * 60 * 60 * 1000;
 
     /**
      * 统一的更新检查。
@@ -1158,8 +1272,12 @@ public class MainActivity extends AppCompatActivity {
                         + " (" + apk.length() + " bytes)");
                 boolean ok = updateManager.installApk(apk);
                 if (!ok) {
+                    // 优先展示身份校验给出的具体原因（包名/签名不符），
+                    // 那是安全拦截而不是「调不起安装器」，两者提示不能混为一谈。
+                    String verr = updateManager.takeInstallError();
                     Toast.makeText(MainActivity.this,
-                            "已下载完成，但无法调起安装器", Toast.LENGTH_LONG).show();
+                            verr != null ? verr : "已下载完成，但无法调起安装器",
+                            Toast.LENGTH_LONG).show();
                 }
             }
 
@@ -1325,7 +1443,10 @@ public class MainActivity extends AppCompatActivity {
         s.setLoadWithOverviewMode(true);
         s.setUseWideViewPort(true);
         s.setCacheMode(WebSettings.LOAD_DEFAULT);
-        s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        // 安全：v1.5.2 起不再 MIXED_CONTENT_ALWAYS_ALLOW。
+        // 兼容模式仍允许图片等被动内容（教务页头像可能是 http），但会拦下
+        // 脚本 / iframe / XHR 这类主动混合内容，避免 https 页面被注入明文脚本。
+        s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
         // 允许 WebView 读取应用私有目录下的自定义背景图
         // 安全：页面不允许访问本地文件（自定义背景图由 Activity 层承载）
         s.setAllowFileAccess(false);
@@ -1442,10 +1563,18 @@ public class MainActivity extends AppCompatActivity {
 
     /** 加载教务系统页面，统一带中文语言头 */
     private void loadJwgl(String url) {
+        // v1.5.2：所有走 loadJwgl 的地址必须先过白名单。
+        // 这里的 url 有两条来源：一是常量（可信），二是教务页面 DOM 里抓出来的课表入口
+        // （onLinkFound → link），后者是外部数据，不校验就直接 loadUrl 等于让教务页面
+        // 决定我们加载什么。不合法时退回教务根地址，而不是静默失败卡住流程。
+        String target = isTrustedUrl(url) ? url : JWGL_BASE;
+        if (!target.equals(url)) {
+            Log.w(TAG, "loadJwgl blocked untrusted url: " + maskUrl(url));
+        }
         Map<String, String> headers = new HashMap<>();
         headers.put("Accept-Language", "zh-CN,zh;q=0.9");
-        Log.d(TAG, "loadJwgl: " + url);
-        webView.loadUrl(url, headers);
+        Log.d(TAG, "loadJwgl: " + target);
+        webView.loadUrl(target, headers);
     }
 
     /** 兜底：依次尝试预设的课表URL猜测 */
@@ -2160,7 +2289,7 @@ public class MainActivity extends AppCompatActivity {
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
         s.setCacheMode(WebSettings.LOAD_DEFAULT);
-        s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
         s.setAllowFileAccess(false);
         s.setAllowContentAccess(false);
         // 与主 WebView 保持同一 UA，避免教务/ CAS 按浏览器差异返回不同页面
@@ -2273,10 +2402,16 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         if (!found.isEmpty()) {
-            silentOnSchedulePage = true;
-            silentParseSent = false;
-            silentLoad(found);
-            return;
+            // v1.5.2：found 来自教务页面 DOM，是外部数据。不合法就当作没找到，
+            // 继续走下面的 URL 猜测，避免被页面控制加载目标。
+            if (!isTrustedUrl(found)) {
+                Log.w(TAG, "silent blocked untrusted link: " + maskUrl(found));
+            } else {
+                silentOnSchedulePage = true;
+                silentParseSent = false;
+                silentLoad(found);
+                return;
+            }
         }
         if (silentGuessIdx < SCHEDULE_URLS.length) {
             silentOnSchedulePage = true;
@@ -2591,7 +2726,7 @@ public class MainActivity extends AppCompatActivity {
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
         s.setCacheMode(WebSettings.LOAD_DEFAULT);
-        s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
         s.setAllowFileAccess(false);
         s.setAllowContentAccess(false);
         s.setUserAgentString(webView.getSettings().getUserAgentString());
@@ -2619,7 +2754,10 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void onReceivedSslError(WebView v, SslErrorHandler h, SslError e) {
-                h.proceed();   // 校内域名，与主 WebView 策略一致
+                // 安全：v1.5.2 起不再无条件 proceed()。
+                // 教室页同样带登录态 Cookie，无条件放行等于把这一路会话交给中间人。
+                String u = e == null ? "" : e.getUrl();
+                if (isTrustedUrl(u)) h.proceed(); else h.cancel();
             }
         });
         ViewGroup root = (ViewGroup) findViewById(android.R.id.content);
@@ -2883,8 +3021,12 @@ public class MainActivity extends AppCompatActivity {
                         Log.d(TAG, "classroom result dropped: seq=" + seq + " current=" + classroomSeq);
                         return;
                     }
-                    // 结果表来自另一个文档，去掉脚本再塞进我们的页面
-                    String html = o.optString("html", "").replaceAll("(?is)<script.*?</script>", "");
+                    // 结果表来自另一个文档（教务页面），要塞进我们的页面里当 HTML 用。
+                    // 原实现只删 <script>，`<img onerror>`、`<svg onload>`、`<iframe>`、
+                    // `javascript:` 链接全都放行 —— 教务页任何一处可写入的字段都能变成执行点。
+                    // 这里改成白名单重建：只留表格结构标签 + 少量行内标签，属性也只留排版类，
+                    // 其余标签连同属性一起丢掉（文字内容保留）。
+                    String html = cleanResultHtml(o.optString("html", ""));
                     o.put("html", html);
                     if (dump && !html.isEmpty()) {
                         try (java.io.FileOutputStream out = new java.io.FileOutputStream(
@@ -2907,9 +3049,96 @@ public class MainActivity extends AppCompatActivity {
     // ====== 课表展示 ======
 
     /**
+     * 把教务返回的结果表 HTML 按白名单重建，只保留纯排版结构。
+     *
+     * 为什么不能只删 &lt;script&gt;：`&lt;img onerror=…&gt;`、`&lt;svg onload=…&gt;`、
+     * `&lt;iframe src=javascript:…&gt;`、`&lt;a href="javascript:…"&gt;` 都不含 script 标签却照样执行。
+     * 结果表最终是 innerHTML 塞进主界面的，而主界面挂了 Android 桥，
+     * 一旦能执行脚本就能反过来调用原生方法，所以这里必须做标签 + 属性双层白名单。
+     *
+     * 保留：table/thead/tbody/tfoot/tr/td/th/caption/colgroup/col（结构），
+     *       span/b/i/em/strong/br/p（行内排版）。
+     * 属性：只留 colspan/rowspan/class/title（纯排版，且值做转义）。
+     * 其余一律丢弃标签、保留文字。
+     */
+    private static String cleanResultHtml(String html) {
+        if (html == null || html.isEmpty()) return "";
+        // 1. 先整体剥掉会被当作原始文本/脚本执行、且内容不该保留的块
+        String s = html.replaceAll("(?is)<(script|style|iframe|object|embed|link|meta|base)\\b[^>]*>.*?</\\1\\s*>", "");
+        s = s.replaceAll("(?is)<(script|style|iframe|object|embed|link|meta|base)\\b[^>]*/?>", "");
+        // 2. 再逐标签做白名单重建
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("(?is)<\\s*(/?)\\s*([a-zA-Z][a-zA-Z0-9]*)((?:[^>\"']|\"[^\"]*\"|'[^']*')*)>")
+                .matcher(s);
+        StringBuilder out = new StringBuilder(s.length());
+        int last = 0;
+        while (m.find()) {
+            out.append(s, last, m.start());
+            last = m.end();
+            String closing = m.group(1);
+            String tag = m.group(2) == null ? "" : m.group(2).toLowerCase();
+            if (!RESULT_HTML_TAGS.contains(tag)) {
+                continue;   // 标签丢掉，内部文字由后续 normal text 保留
+            }
+            if (!closing.isEmpty()) {
+                out.append("</").append(tag).append('>');
+                continue;
+            }
+            out.append('<').append(tag);
+            appendSafeAttrs(out, tag, m.group(3));
+            out.append('>');
+        }
+        out.append(s.substring(last));
+        return out.toString();
+    }
+
+    /** cleanResultHtml 允许保留的标签 */
+    private static final java.util.HashSet<String> RESULT_HTML_TAGS =
+            new java.util.HashSet<>(java.util.Arrays.asList(
+                    "table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption",
+                    "colgroup", "col", "span", "b", "i", "em", "strong", "br", "p"));
+
+    /** 从原始属性串里挑出安全属性重新输出（值统一 HTML 转义） */
+    private static void appendSafeAttrs(StringBuilder out, String tag, String raw) {
+        if (raw == null || raw.isEmpty()) return;
+        java.util.regex.Matcher a = java.util.regex.Pattern
+                .compile("([a-zA-Z_:][-a-zA-Z0-9_:.]*)\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)")
+                .matcher(raw);
+        while (a.find()) {
+            String name = a.group(1) == null ? "" : a.group(1).toLowerCase();
+            String val = a.group(2) == null ? "" : a.group(2);
+            if (val.length() >= 2 && (val.charAt(0) == '"' || val.charAt(0) == '\'')) {
+                val = val.substring(1, val.length() - 1);
+            }
+            boolean keep;
+            if ("colspan".equals(name) || "rowspan".equals(name)) {
+                keep = val.matches("\\d{1,2}");
+            } else if ("class".equals(name) || "title".equals(name)) {
+                // class 是我们自己 CSS 用的语义名，限死字符集
+                keep = val.matches("[A-Za-z0-9_\\-\\s]{0,64}");
+            } else {
+                keep = false;
+            }
+            if (!keep) continue;
+            out.append(' ').append(name).append("=\"").append(htmlAttrEscape(val)).append('"');
+        }
+    }
+
+    /** 属性值转义：引号必须转，否则可以闭合属性再接事件处理器 */
+    private static String htmlAttrEscape(String v) {
+        if (v == null) return "";
+        return v.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace("\"", "&quot;").replace("'", "&#39;");
+    }
+
+    /**
      * 清洗解析出的课程数据
-     * 教务页面底部有些文字（如“XX课程实习”）会被误解析成课程，行号会跑到 1-5 之外，
+     * 教务页面底部有些文字（如“XX课程实习”）会被误解析成课程，行号会跑到网格之外，
      * 这里统一丢弃行号越界与无课名的条目，避免脏数据写进存储。
+     *
+     * v1.5.2：上限由硬编码的 5 改为 MAX_RENDER_ROWS（=8）。
+     * 石大一天是 9 节、夜里还有 10-11 节，原来写死 5 会把第 6 大节起的所有课程静默丢掉，
+     * 表现就是「教务系统里有这门课，App 里没有」，而不是报错——用户根本察觉不到。
      */
     private static JSONArray sanitizeCourses(JSONArray in) {
         if (in == null) return null;
@@ -2919,7 +3148,7 @@ public class MainActivity extends AppCompatActivity {
             if (c == null) continue;
             int day = c.optInt("day", 0);
             int row = c.optInt("row", 0);
-            if (day < 1 || day > 7 || row < 1 || row > 5) continue;
+            if (day < 1 || day > 7 || row < 1 || row > MAX_RENDER_ROWS) continue;
             String name = c.optString("name", "").trim();
             if (name.isEmpty()) continue;
             out.put(c);
@@ -4318,17 +4547,25 @@ public class MainActivity extends AppCompatActivity {
                     StringBuilder keysB = new StringBuilder();
                     for (int k = 0; k < arr.length(); k++) {
                         if (k > 0) keysB.append(";;;");
-                        String ck = courseKey(arr.optJSONObject(k));
-                        keysB.append(ck.replace("'", "\\'"));
+                        keysB.append(courseKey(arr.optJSONObject(k)));
                     }
                     // 与教务课程位置冲突的自定义课：整格描红边，并在右下角挂一个感叹号
+                    //
+                    // v1.5.2：detail / keys 改用**双引号属性 + HTML 实体转义**。
+                    // 原来是 data-detail='…' 单引号属性，转义只用 \\'：
+                    //   1) \\' 只在 JS 字符串里有效，HTML 属性里反斜杠不会保护引号，
+                    //      课程名/教师/地点里只要有一个 ' 就能闭合属性；
+                    //   2) 闭合之后剩下的内容会被当标签解析，等于教务数据可以重建 DOM。
+                    // 改走 htmlAttrEscape 后，JSON 里的 " 变成 &quot;，浏览器解析时还原，
+                    // getAttribute 拿到的仍是原始 JSON。
                     sb.append("<div class='course")
                       .append(clash ? " conflict" : (overlap ? " overlap" : ""))
                       .append("' style='--cc:").append(color)
                       // --cc-rgb 给深色边缘光用：rgba() 只能吃分量，hex 无法带透明度
                       .append(";--cc-rgb:").append(ccRgb(color))
-                      .append(";background:var(--cc)' data-detail='")
-                      .append(detail).append("' data-keys='").append(keysB).append("' data-day='").append(d).append("' data-row='").append(row).append("'>");
+                      .append(";background:var(--cc)' data-detail=\"")
+                      .append(htmlAttrEscape(detail)).append("\" data-keys=\"")
+                      .append(htmlAttrEscape(keysB.toString())).append("\" data-day='").append(d).append("' data-row='").append(row).append("'>");
                     if (clash) sb.append("<div class='clash-mark'>!</div>");
                     // 显示所有课程名（多门用换行分隔）
                     for (int k = 0; k < arr.length(); k++) {
@@ -5502,8 +5739,12 @@ public class MainActivity extends AppCompatActivity {
         sb.append("function openClassroomQuery(){openPage('pageClassroom');");
         sb.append("  if(window.Android&&Android.onClassroomQueryOpened)Android.onClassroomQueryOpened();}");
         // ===== 查询教室：表单渲染（数据由 Java 侧的隐藏 WebView 从教务取回）=====
+        // v1.5.2：除 & < > 之外必须转义引号。
+        // 数据来源是教务页面，会直接塞进 value='…' / title="…" 这类属性里；
+        // 只要值里有一个单引号就能闭合属性、在后面接事件处理器（教室名/楼名都是可被写入的）。
         sb.append("function crEsc(s){return String(s==null?'':s).replace(/&/g,'&amp;')");
-        sb.append("  .replace(/</g,'&lt;').replace(/>/g,'&gt;');}");
+        sb.append("  .replace(/</g,'&lt;').replace(/>/g,'&gt;')");
+        sb.append("  .replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}");
         sb.append("function crFill(id,arr,ph){var s=document.getElementById(id);if(!s)return;");
         sb.append("  var h=ph?\"<option value=''>\"+crEsc(ph)+\"</option>\":'';");
         sb.append("  for(var i=0;i<(arr||[]).length;i++){h+=\"<option value='\"+crEsc(arr[i].v)+\"'>\"+crEsc(arr[i].t)+\"</option>\";}");
@@ -5819,7 +6060,8 @@ public class MainActivity extends AppCompatActivity {
         sb.append("function copyTxt(t){if(window.Android&&Android.onCopy)Android.onCopy(t);}");
         // ===== 检查更新页 =====
         // 公告/更新日志里的【前缀】着色（任务书第五章：前缀可加粗或着色）
-        sb.append("function upEsc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}");
+        sb.append("function upEsc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')");
+        sb.append("  .replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}");
         sb.append("function upSize(n){");
         sb.append("  if(n>=1048576)return (n/1048576).toFixed(1)+' MB';");
         sb.append("  if(n>=1024)return (n/1024).toFixed(0)+' KB';");
@@ -5829,7 +6071,10 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  var out='';");
         sb.append("  for(var i=0;i<lines.length;i++){");
         sb.append("    var m=lines[i].match(/^(\\[[^\\]\\n]{1,12}\\])([\\s\\S]*)$/);");
-        sb.append("    if(m){out+='<b class=\"up-tag\">'+m[1]+'</b>'+upEsc(m[2]);}");
+        // v1.5.2：m[1]（方括号前缀）来自服务端 changelog，必须转义后再拼 innerHTML。
+        // 原实现直接拼原文，只要 changelog 里写 [<img src=x onerror=...>] 就能
+        // 借着这段 innerHTML 在设置了 Android 桥的页面上执行脚本。
+        sb.append("    if(m){out+='<b class=\"up-tag\">'+upEsc(m[1])+'</b>'+upEsc(m[2]);}");
         sb.append("    else{out+=upEsc(lines[i]);}");
         sb.append("    if(i<lines.length-1)out+='<br>';}");
         sb.append("  return out;}");
@@ -6012,6 +6257,14 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /** 该格所有课程的详情数组（同一时段可能重叠多门课） */
+    /**
+     * 构造格内所有课程的详情 JSON（供 data-detail 属性承载）。
+     *
+     * v1.5.2：不再对结果做 replace("'", "\\'")。
+     * 调用方现在用双引号属性 + HTML 实体转义承载这段 JSON，
+     * 在这里做 JS 反斜杠转义反而会污染数据（用户看到的课名里冒出反斜杠），
+     * 而且那种转义本来就挡不住 HTML 解析。
+     */
     private String buildCourseDetailArray(JSONArray arr, int week, String periodLabel,
                                           String periodTime, String color, boolean clash) {
         JSONArray out = new JSONArray();
@@ -6021,14 +6274,30 @@ public class MainActivity extends AppCompatActivity {
             // 冲突提示只在第一门课里出现一次，避免同一格重复刷 3 条同样的提示
             out.put(buildCourseDetailObj(c, week, periodLabel, periodTime, color, clash && i == 0));
         }
-        return out.toString().replace("'", "\\'");
+        return out.toString();
     }
 
     /** 是否为本校受信任地址（*.shzu.edu.cn） */
+    /**
+     * 是否属于「可以交给 WebView 导航」的可信地址。
+     *
+     * 安全边界说明：这个判断同时被 shouldOverrideUrlLoading、SSL 错误处理、
+     * 以及若干处 loadUrl 前的检查复用，所以口径必须严格。
+     *
+     * 曾经把 javascript: / about: / data: 也返回 true —— 那是个真实漏洞：
+     *  1) javascript: 根本不是"地址"，把它当可信等于允许任意脚本在
+     *     持有 Android 注入对象的页面上执行；
+     *  2) data: 可以承载完整 HTML，且其内嵌脚本与当前页面同源，
+     *     一旦某个上游链接被替换成 data: URL，注入对象就落到攻击者手里；
+     *  3) about: 只用于内部空白页，不该出现在"可信导航"的语义里。
+     * 这三者现在一律返回 false；内部确实需要的 about:blank 由调用方
+     * 单独处理，不混进可信判断。
+     */
     private static boolean isTrustedUrl(String url) {
         if (url == null || url.isEmpty()) return false;
         String u = url.trim().toLowerCase();
-        if (u.startsWith("javascript:") || u.startsWith("about:") || u.startsWith("data:")) return true;
+        // 非 http(s) 协议一律不可信
+        if (!u.startsWith("http://") && !u.startsWith("https://")) return false;
         String host;
         try {
             host = android.net.Uri.parse(u).getHost();

@@ -89,6 +89,19 @@ public class UpdateManager {
     private static final int DOWNLOAD_TIMEOUT_MIN = 120000;
     private static final int BUFFER = 8192;
     private static final int MAX_RETRY = 3;
+
+    /**
+     * 最近一次 installApk 被身份校验拦下的原因（null 表示没有失败）。
+     * 上层据此给出准确提示，而不是笼统的「安装失败」。
+     */
+    private String lastInstallError;
+
+    /** 取走（并清空）上一次安装被拦下的原因，供 UI 提示 */
+    public String takeInstallError() {
+        String s = lastInstallError;
+        lastInstallError = null;
+        return s;
+    }
     /** 重定向最大跳数（服务端可能 301 到 https） */
     private static final int MAX_REDIRECTS = 3;
 
@@ -343,6 +356,15 @@ public class UpdateManager {
                         return;
                     }
                     if (sha256Matches(dest, info.sha256)) {
+                        // 哈希只证明「内容和声明一致」，但声明本身也来自同一条 HTTP 响应，
+                        // 所以还要再做一次无法伪造的身份校验：包名 + 签名证书。
+                        final String bad = verifyApkIdentity(dest);
+                        if (bad != null) {
+                            //noinspection ResultOfMethodCallIgnored
+                            dest.delete();
+                            post(listener, l -> l.onFailed(bad));
+                            return;
+                        }
                         post(listener, l -> l.onFinished(dest));
                         return;
                     }
@@ -482,14 +504,30 @@ public class UpdateManager {
         }
     }
 
-    /** 字节数比对：服务端没给 size（0）时跳过，避免误判 */
+    /**
+     * 字节数比对。
+     *
+     * 原本是「服务端没给 size（<=0）就跳过」，等于把校验交给攻击者决定：
+     * 中间人只要在响应里把 size 字段删掉，这条校验就自动失效。
+     * 现在改为**失败关闭**：没有期望值即视为校验不通过。
+     */
     private static boolean sizeMatches(File f, long expect) {
-        return expect <= 0 || f.length() == expect;
+        return expect > 0 && f.length() == expect;
     }
 
-    /** SHA-256 比对；服务端没给校验值（空串）时放行，但调用方应提示风险 */
+    /**
+     * SHA-256 比对。
+     *
+     * 同样改为失败关闭：服务端没给哈希时**不再放行**。
+     * 理由：校验值的意义在于「下载内容与发布方声明的一致」，
+     * 若允许缺失即通过，攻击者篡改 APK 的同时删掉 sha256 字段即可绕过，
+     * 双重校验会退化为零校验。
+     */
     private boolean sha256Matches(File f, String expect) {
-        if (expect == null || expect.trim().isEmpty()) return true;
+        if (expect == null || expect.trim().isEmpty()) {
+            Log.w(TAG, "sha256 missing in update info, refuse to trust");
+            return false;
+        }
         try {
             String actual = sha256Of(f);
             return expect.trim().toLowerCase(Locale.US).equals(actual);
@@ -497,6 +535,100 @@ public class UpdateManager {
             Log.e(TAG, "sha256 compute error", e);
             return false;
         }
+    }
+
+    /**
+     * 安装前校验安装包身份：包名必须与本应用一致，签名证书必须与本机已装版本一致。
+     *
+     * 为什么必须做：Android 只在「同包名 + 同签名」时才把新包当成升级。
+     * 如果中间人投递一个**不同包名**的 APK，系统不会拒绝，而是把它当作
+     * 一个全新的应用装上 —— 用户点了"更新"，实际多装了一个陌生应用。
+     * 只校验哈希挡不住这条路径（哈希本身就来自同一条 HTTP 响应）。
+     * 签名比对是唯一无法伪造的一环：攻击者没有发布者的私钥。
+     *
+     * @return null 表示通过；否则返回给用户看的原因
+     */
+    private String verifyApkIdentity(File apk) {
+        try {
+            PackageManager pm = ctx.getPackageManager();
+            String selfPkg = ctx.getPackageName();
+
+            // 先取安装包内的包名与签名摘要
+            android.content.pm.PackageInfo archive = archiveInfo(pm, apk);
+            if (archive == null) {
+                return "安装包无法解析，已取消安装";
+            }
+            if (archive.packageName == null || !selfPkg.equals(archive.packageName)) {
+                Log.w(TAG, "apk package mismatch: " + archive.packageName);
+                return "安装包包名不符，已取消安装";
+            }
+
+            // 再取本机已安装版本的签名摘要，两者必须完全一致
+            android.content.pm.PackageInfo installed = installedInfo(pm, selfPkg);
+            if (installed == null) {
+                // 理论上不会发生（自己就在运行），保守起见不放行
+                return "无法读取本应用签名，已取消安装";
+            }
+            java.util.Set<String> apkSigs = signatureDigests(archive);
+            java.util.Set<String> selfSigs = signatureDigests(installed);
+            if (apkSigs.isEmpty() || selfSigs.isEmpty()) {
+                return "安装包缺少签名信息，已取消安装";
+            }
+            if (!apkSigs.equals(selfSigs)) {
+                Log.w(TAG, "apk signature mismatch");
+                return "安装包签名与本应用不一致，已取消安装";
+            }
+            return null;
+        } catch (Exception e) {
+            Log.e(TAG, "verify apk identity error", e);
+            return "安装包校验异常，已取消安装";
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private static android.content.pm.PackageInfo archiveInfo(PackageManager pm, File apk) {
+        if (Build.VERSION.SDK_INT >= 28) {
+            return pm.getPackageArchiveInfo(apk.getAbsolutePath(),
+                    PackageManager.GET_SIGNING_CERTIFICATES);
+        }
+        return pm.getPackageArchiveInfo(apk.getAbsolutePath(), PackageManager.GET_SIGNATURES);
+    }
+
+    @SuppressWarnings("deprecation")
+    private static android.content.pm.PackageInfo installedInfo(PackageManager pm, String pkg)
+            throws Exception {
+        if (Build.VERSION.SDK_INT >= 28) {
+            return pm.getPackageInfo(pkg, PackageManager.GET_SIGNING_CERTIFICATES);
+        }
+        return pm.getPackageInfo(pkg, PackageManager.GET_SIGNATURES);
+    }
+
+    /** 把 PackageInfo 里的签名统一转成 SHA-256 摘要字符串集合，便于跨 API 版本比对 */
+    @SuppressWarnings("deprecation")
+    private static java.util.Set<String> signatureDigests(android.content.pm.PackageInfo pi) {
+        java.util.Set<String> out = new java.util.HashSet<>();
+        try {
+            android.content.pm.Signature[] sigs = null;
+            if (Build.VERSION.SDK_INT >= 28 && pi.signingInfo != null) {
+                sigs = pi.signingInfo.hasMultipleSigners()
+                        ? pi.signingInfo.getApkContentsSigners()
+                        : pi.signingInfo.getSigningCertificateHistory();
+            }
+            if (sigs == null) sigs = pi.signatures;
+            if (sigs == null) return out;
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            for (android.content.pm.Signature s : sigs) {
+                if (s == null) continue;
+                md.reset();
+                byte[] d = md.digest(s.toByteArray());
+                StringBuilder sb = new StringBuilder();
+                for (byte b : d) sb.append(String.format(Locale.US, "%02x", b));
+                out.add(sb.toString());
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "signature digest error", e);
+        }
+        return out;
     }
 
     private static String sha256Of(File f) throws Exception {
@@ -519,6 +651,16 @@ public class UpdateManager {
      */
     public boolean installApk(File apk) {
         try {
+            // 唤起系统安装器之前再验一次身份。下载流程已经验过，
+            // 但这里也覆盖「复用上次缓存的安装包」这条路径：
+            // 缓存文件放在应用私有目录，仍不应无条件信任，
+            // 多算一次 SHA-256 摘要（几 MB 的 APK，毫秒级）换掉整条投递链的风险是值得的。
+            String bad = verifyApkIdentity(apk);
+            if (bad != null) {
+                Log.w(TAG, "install aborted: " + bad);
+                lastInstallError = bad;
+                return false;
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 PackageManager pm = ctx.getPackageManager();
                 if (!pm.canRequestPackageInstalls()) {
